@@ -122,13 +122,6 @@ async fn run_daemon() -> Result<()> {
         }
     });
 
-    // Start timer tick task
-    let event_tx_for_timer = event_tx.clone();
-    tokio::spawn(core_loop::timer_tick_loop(
-        event_tx_for_timer,
-        config.timer_poll_interval,
-    ));
-
     // Start HTTP server
     let router = http_server::create_router(event_tx.clone(), database.clone());
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;

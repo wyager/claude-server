@@ -94,4 +94,3 @@ All endpoints have CORS enabled (permissive). The chat UI uses these directly.
 | `CLAUDE_SERVER_DEPLOYMENT_CONTEXT` | (none) | Deployment context file |
 | `CLAUDE_SERVER_CONTEXT_WINDOW` | `200000` | Model context window size |
 | `CLAUDE_SERVER_MAX_TOKENS` | `16384` | Max output tokens per turn |
-| `CLAUDE_SERVER_TIMER_INTERVAL` | `1` | Timer poll interval (seconds) |

@@ -400,6 +400,18 @@ impl TimerManager {
     pub fn list(&self) -> &[Timer] {
         &self.timers
     }
+
+    /// Returns the earliest time any timer is scheduled to fire,
+    /// or None if there are no timers.
+    pub fn next_deadline(&self) -> Option<DateTime<Utc>> {
+        self.timers
+            .iter()
+            .map(|t| match &t.schedule {
+                TimerSchedule::OneShot { at } => *at,
+                TimerSchedule::Recurring { next_fire, .. } => *next_fire,
+            })
+            .min()
+    }
 }
 
 // ---- Process Management ----

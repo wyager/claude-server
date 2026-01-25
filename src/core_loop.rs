@@ -23,7 +23,6 @@ pub enum HarnessEvent {
         user: String,
         content: String,
     },
-    TimerTick,
     Process(ProcessEvent),
     Shutdown,
 }
@@ -63,6 +62,7 @@ impl CoreLoop {
 
     pub async fn run(&mut self) -> Result<()> {
         println!("[core] Agent loop started");
+        let mut idle = false;
 
         loop {
             // Drain any pending events
@@ -80,24 +80,46 @@ impl CoreLoop {
                     .trigger(&mut self.state, self.config.compaction_target_ratio);
             }
 
-            // If work queue is empty, wait for an event
+            // If work queue is empty, block until an event arrives or a timer fires
             if self.state.work_queue.is_empty() {
-                println!("[core] Work queue empty, waiting for events...");
-                match self.event_rx.recv().await {
-                    Some(event) => {
-                        if matches!(event, HarnessEvent::Shutdown) {
-                            println!("[core] Shutdown requested");
-                            break;
-                        }
-                        self.apply_event(event);
+                if !idle {
+                    println!("[core] Idle, waiting for events...");
+                    idle = true;
+                }
+
+                // Sleep until the next timer deadline, or a long time if no timers
+                let timer_sleep = match self.state.timer_manager.next_deadline() {
+                    Some(deadline) => {
+                        let duration = (deadline - Utc::now())
+                            .to_std()
+                            .unwrap_or(Duration::ZERO);
+                        tokio::time::sleep(duration)
                     }
-                    None => {
-                        println!("[core] Event channel closed, shutting down");
-                        break;
+                    None => tokio::time::sleep(Duration::from_secs(86400)),
+                };
+
+                tokio::select! {
+                    event = self.event_rx.recv() => {
+                        match event {
+                            Some(HarnessEvent::Shutdown) => {
+                                println!("[core] Shutdown requested");
+                                break;
+                            }
+                            Some(event) => self.apply_event(event),
+                            None => {
+                                println!("[core] Event channel closed, shutting down");
+                                break;
+                            }
+                        }
+                    }
+                    _ = timer_sleep => {
+                        self.check_timers();
                     }
                 }
                 continue;
             }
+
+            idle = false;
 
             // Run a turn
             if let Err(e) = self.run_turn().await {
@@ -242,9 +264,6 @@ impl CoreLoop {
                         content,
                     },
                 });
-            }
-            HarnessEvent::TimerTick => {
-                self.check_timers();
             }
             HarnessEvent::Process(pe) => match pe {
                 ProcessEvent::Completed { pid, exit_code } => {
@@ -485,16 +504,3 @@ impl CoreLoop {
     }
 }
 
-/// Run the timer tick loop. Sends TimerTick events periodically.
-pub async fn timer_tick_loop(
-    event_tx: mpsc::UnboundedSender<HarnessEvent>,
-    interval: Duration,
-) {
-    let mut ticker = tokio::time::interval(interval);
-    loop {
-        ticker.tick().await;
-        if event_tx.send(HarnessEvent::TimerTick).is_err() {
-            break; // channel closed
-        }
-    }
-}

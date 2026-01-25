@@ -1,6 +1,5 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
@@ -16,7 +15,6 @@ pub struct Config {
     pub system_prompt_path: PathBuf,
     pub deployment_context_path: Option<PathBuf>,
     pub listen_addr: SocketAddr,
-    pub timer_poll_interval: Duration,
     pub compaction_ratio: f64,
     pub compaction_target_ratio: f64,
     pub render_config: RenderConfig,
@@ -64,13 +62,6 @@ impl Config {
             .parse()
             .context("Invalid listen address")?;
 
-        let timer_poll_interval = Duration::from_secs(
-            std::env::var("CLAUDE_SERVER_TIMER_INTERVAL")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1),
-        );
-
         Ok(Self {
             model,
             api_key,
@@ -81,7 +72,6 @@ impl Config {
             system_prompt_path,
             deployment_context_path,
             listen_addr,
-            timer_poll_interval,
             compaction_ratio: 0.8,
             compaction_target_ratio: 0.5,
             render_config: RenderConfig::default(),
