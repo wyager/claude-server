@@ -3,6 +3,36 @@
 Claude Server is a harness for Claude focused on long-running instances
 that need to autonomously manage complex systems.
 
+## Quick Start
+
+```bash
+# Install dependencies: Rust toolchain, Python 3.13+
+
+# Build
+make build
+
+# Run the daemon (requires API key)
+export ANTHROPIC_API_KEY=sk-ant-...
+make
+
+# In another terminal, open the chat UI
+make chat
+```
+
+The chat UI opens at http://127.0.0.1:8080 and connects to the daemon API on port 3000.
+
+You can also interact with the daemon directly:
+
+```bash
+# Send a message
+curl -X POST http://127.0.0.1:3000/message \
+  -H 'Content-Type: application/json' \
+  -d '{"user":"you@example.com","content":"Hello Claude!"}'
+
+# Check for responses
+curl http://127.0.0.1:3000/messages/<chat_id>
+```
+
 ## Architecture Overview
 
 Claude Server is a Rust program that drives Claude through a work-queue-based loop.
@@ -1239,3 +1269,109 @@ or a fixed set of standard library only.
 How are images (e.g. camera frames from `show_in_context()`) embedded in the
 API call? They would be `image` content blocks in the user message, which
 costs tokens. Need to decide on resolution limits, max images per turn, etc.
+
+
+## Implementation
+
+### Source Files
+
+```
+claude-server/
+  Cargo.toml              -- Dependencies: pyo3, rusqlite, reqwest, tokio, axum, chrono, serde
+  build.rs                -- Discovers Python LIBDIR, bakes rpath into binary
+  Makefile                -- make (run daemon), make chat (run chat UI), make build
+  system_prompt.txt       -- System prompt sent to Claude on every API call
+  src/
+    main.rs               -- CLI dispatch: default=daemon, chat=web UI
+    types.rs              -- Core types (WorkQueue, EventHistory, Timers, Processes, Memory, API types)
+    config.rs             -- Configuration from environment variables
+    core_loop.rs          -- Main event loop (drain events → render → API → execute → apply)
+    python.rs             -- PyO3 executor (#[pyclass] wrappers, SideEffectCollector, stdout capture)
+    renderer.rs           -- Serialize HarnessState into XML context text for the API call
+    api_client.rs         -- Claude Messages API client (reqwest, retry, tool_use extraction)
+    db.rs                 -- SQLite persistence (state JSON blob, process output, messages)
+    process.rs            -- Tokio process spawning/monitoring (output capture, completion events)
+    compaction.rs         -- Compaction state machine (trigger, script accumulation, execution)
+    http_server.rs        -- Axum HTTP API (POST /message, GET /status, GET /messages/:chat_id)
+    chat.rs               -- Chat UI subcommand (serves embedded HTML)
+    chat.html             -- Single-file HTML/CSS/JS chat interface
+```
+
+### Key Implementation Details
+
+**Side effect collection**: Python scripts don't execute side effects directly.
+All mutations (memory writes, timer creates, message sends, process spawns) are
+collected into a `SideEffectCollector` during execution. If the script crashes,
+nothing is applied. On success, the core loop applies them atomically.
+
+**Synchronous ID assignment**: The `SideEffectCollector` owns the `IdGenerator`
+during Python execution. When Claude calls `timers.add()` or `shell_exec()`,
+the `#[pyclass]` method calls `id_gen.next()` synchronously and returns the hex
+ID string. After execution, the updated generator is moved back into state.
+
+**Fresh Python namespace per turn**: PyO3 initializes the interpreter once at
+startup. Each turn creates a fresh `PyDict` as globals/locals. No state leaks
+between turns.
+
+**Concurrency**: The core loop owns all mutable state. External events arrive
+via tokio mpsc channels. No shared-state concurrency. The Python executor runs
+synchronously inside `Python::with_gil`.
+
+### Chat UI
+
+The `chat` subcommand starts a lightweight web server serving an embedded HTML
+chat interface:
+
+```bash
+claude-server chat                    # default: port 8080, API at localhost:3000
+claude-server chat --port 9090        # custom port
+claude-server chat --api-url http://myhost:4000  # custom API URL
+```
+
+The chat UI:
+- Generates a stable UUID chat_id per browser session
+- Sends messages via POST /message to the daemon API
+- Polls GET /messages/:chat_id every 1.5s for agent responses
+- Tracks seen message IDs to avoid duplicates
+- Auto-scrolls on new messages
+
+### HTTP API
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/message` | POST | Send a user message `{ chat_id?, user, content }` |
+| `/status` | GET | Health check `{ status, model }` |
+| `/messages/:chat_id` | GET | Get agent responses for a chat `{ messages: [...] }` |
+| `/shutdown` | POST | Graceful shutdown |
+
+All endpoints have CORS enabled (permissive).
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ANTHROPIC_API_KEY` | (required) | Anthropic API key |
+| `CLAUDE_SERVER_MODEL` | `claude-opus-4-5-20251101` | Model to use |
+| `CLAUDE_SERVER_LISTEN` | `127.0.0.1:3000` | API listen address |
+| `CLAUDE_SERVER_DB` | `claude-server.db` | SQLite database path |
+| `CLAUDE_SERVER_SYSTEM_PROMPT` | `system_prompt.txt` | System prompt file |
+| `CLAUDE_SERVER_DEPLOYMENT_CONTEXT` | (none) | Deployment context file |
+| `CLAUDE_SERVER_CONTEXT_WINDOW` | `200000` | Model context window size |
+| `CLAUDE_SERVER_MAX_TOKENS` | `16384` | Max output tokens per turn |
+
+### Building
+
+Requires Rust toolchain and Python 3.13+ with a shared library (`libpython3.13.dylib`).
+
+```bash
+cargo build                           # build
+cargo test -- --test-threads=1        # run tests (single-threaded for PyO3 GIL)
+```
+
+The `build.rs` script auto-discovers the Python library directory and bakes the
+rpath into the binary, so no `DYLD_LIBRARY_PATH` is needed at runtime. To
+target a specific Python installation:
+
+```bash
+PYO3_PYTHON=/path/to/python3 cargo build
+```
