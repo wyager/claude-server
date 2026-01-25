@@ -36,6 +36,7 @@ pub struct CoreLoop {
     compaction: CompactionManager,
     event_rx: mpsc::UnboundedReceiver<HarnessEvent>,
     deployment_context: String,
+    dump_turns: bool,
 }
 
 impl CoreLoop {
@@ -47,6 +48,7 @@ impl CoreLoop {
         process_supervisor: ProcessSupervisor,
         event_rx: mpsc::UnboundedReceiver<HarnessEvent>,
         deployment_context: String,
+        dump_turns: bool,
     ) -> Self {
         Self {
             state,
@@ -57,6 +59,7 @@ impl CoreLoop {
             compaction: CompactionManager::new(),
             event_rx,
             deployment_context,
+            dump_turns,
         }
     }
 
@@ -167,6 +170,14 @@ impl CoreLoop {
             self.state.work_queue.len()
         );
 
+        if self.dump_turns {
+            println!("\n{}", "=".repeat(80));
+            println!("CONTEXT SENT TO MODEL ({} chars)", rendered.text.len());
+            println!("{}\n", "=".repeat(80));
+            println!("{}", rendered.text);
+            println!("{}\n", "-".repeat(80));
+        }
+
         // Call Claude API
         let api_result = self.api_client.call(&rendered).await?;
 
@@ -177,6 +188,14 @@ impl CoreLoop {
             api_result.cache_creation_tokens,
             api_result.cache_read_tokens
         );
+
+        if self.dump_turns {
+            println!("\n{}", "=".repeat(80));
+            println!("AGENT RESPONSE (Python code)");
+            println!("{}\n", "=".repeat(80));
+            println!("{}", api_result.code);
+            println!("{}\n", "-".repeat(80));
+        }
 
         // Update token tracking
         self.state.last_input_tokens = api_result.input_tokens;

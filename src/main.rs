@@ -21,11 +21,14 @@ fn main() {
     match args.get(1).map(|s| s.as_str()) {
         Some("chat") => chat::run_chat_server(&args[2..]),
         Some("--help") | Some("-h") => {
-            println!("Usage: claude-server [COMMAND]");
+            println!("Usage: claude-server [OPTIONS] [COMMAND]");
             println!();
             println!("Commands:");
             println!("  (default)   Start the agent daemon");
             println!("  chat        Start the chat web UI");
+            println!();
+            println!("Options (daemon mode):");
+            println!("  --dump-turns   Print the full context and agent response each turn");
             println!();
             println!("Environment variables:");
             println!("  ANTHROPIC_API_KEY             API key (required for daemon)");
@@ -36,8 +39,9 @@ fn main() {
             println!("  CLAUDE_SERVER_DEPLOYMENT_CONTEXT Deployment context file");
         }
         _ => {
+            let dump_turns = args.iter().any(|a| a == "--dump-turns");
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-            if let Err(e) = rt.block_on(run_daemon()) {
+            if let Err(e) = rt.block_on(run_daemon(dump_turns)) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -45,7 +49,7 @@ fn main() {
     }
 }
 
-async fn run_daemon() -> Result<()> {
+async fn run_daemon(dump_turns: bool) -> Result<()> {
     let config = Arc::new(config::Config::from_env()?);
 
     println!("Claude Server starting...");
@@ -107,6 +111,7 @@ async fn run_daemon() -> Result<()> {
         process_supervisor,
         event_rx,
         deployment_context,
+        dump_turns,
     );
 
     // Forward process events to the main event channel

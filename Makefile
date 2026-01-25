@@ -1,10 +1,13 @@
-.PHONY: run chat build
+.PHONY: run run-dump chat build
 
 CHAT_PORT ?= 8080
 API_ADDR ?= 127.0.0.1:3000
 
 run: build
 	CLAUDE_SERVER_LISTEN=$(API_ADDR) ./target/debug/claude-server
+
+run-dump: build
+	CLAUDE_SERVER_LISTEN=$(API_ADDR) ./target/debug/claude-server --dump-turns
 
 chat: build
 	@echo "Opening http://127.0.0.1:$(CHAT_PORT) ..."
