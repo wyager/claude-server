@@ -1,4 +1,5 @@
 mod api_client;
+mod chat;
 mod compaction;
 mod config;
 mod core_loop;
@@ -14,9 +15,37 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Parse config
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    match args.get(1).map(|s| s.as_str()) {
+        Some("chat") => chat::run_chat_server(&args[2..]),
+        Some("--help") | Some("-h") => {
+            println!("Usage: claude-server [COMMAND]");
+            println!();
+            println!("Commands:");
+            println!("  (default)   Start the agent daemon");
+            println!("  chat        Start the chat web UI");
+            println!();
+            println!("Environment variables:");
+            println!("  ANTHROPIC_API_KEY             API key (required for daemon)");
+            println!("  CLAUDE_SERVER_MODEL            Model name (default: claude-opus-4-5-20251101)");
+            println!("  CLAUDE_SERVER_LISTEN           API listen address (default: 127.0.0.1:3000)");
+            println!("  CLAUDE_SERVER_DB               SQLite path (default: claude-server.db)");
+            println!("  CLAUDE_SERVER_SYSTEM_PROMPT     System prompt file (default: system_prompt.txt)");
+            println!("  CLAUDE_SERVER_DEPLOYMENT_CONTEXT Deployment context file");
+        }
+        _ => {
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+            if let Err(e) = rt.block_on(run_daemon()) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+async fn run_daemon() -> Result<()> {
     let config = Arc::new(config::Config::from_env()?);
 
     println!("Claude Server starting...");
@@ -117,6 +146,8 @@ async fn main() -> Result<()> {
         config.listen_addr
     );
     println!("    -d '{{\"user\":\"you@example.com\",\"content\":\"Hello Claude!\"}}'");
+    println!();
+    println!("Or start the chat UI with: claude-server chat");
     println!();
 
     // Run core loop (blocks until shutdown)

@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, post};
 use axum::Router;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tower_http::cors::CorsLayer;
 
 use crate::core_loop::HarnessEvent;
 use crate::db::Database;
@@ -117,6 +118,7 @@ pub fn create_router(
         .route("/messages/{chat_id}", get(handle_get_messages))
         .route("/shutdown", post(handle_shutdown))
         .with_state(state)
+        .layer(CorsLayer::permissive())
 }
 
 fn rand_id() -> u32 {
