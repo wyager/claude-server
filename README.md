@@ -21,6 +21,12 @@ provides commands which are run inside a python interpreter. All
 interaction with users and systems, Work Queue operations,
 setting timers, etc. is done via this python interpreter.
 
+The Harness is a Rust program, which invokes a Python interpreter every time the Agent performs an action.
+
+The Python interpreter is either initialized fresh every time the agent does something (and hydrated from serialized data from the Harness)
+or kept running in the background, communicating with the Harness via FFI or IPC. We'll start with the simpler
+fresh-interpreter-every-agent-action approach.
+
 ### The Agent's View Of the World
 
 At every turn, the agent sees a context consisting of
@@ -764,3 +770,68 @@ Unique IDs available for memories, timers, etc.: 4d66, 093d, 77cf, 8a3b
 ```
 
 And the cycle continues.
+
+
+## Implementation details
+
+
+### Queue Sorting
+
+Queue is sorted first by priority (ranging from 0-10, with 10 reserved for system events like compaction) and then by time (ascending).
+
+
+### Ensuring Context Fit
+
+Every history item has a maximum character and line length it will display before truncating.
+Claude can extract bits of larger messages across multiple history events.
+
+The work queue will only show a maximum number of items at once. Each item has a maximum character and line length before truncation
+of the work queue preview. The first few events get a longer preview, reducing the probability that the agent has to perform a python query
+to examine the top-priority events.
+
+Because Claude can manipulate the Work Queue in python, if something happens e.g. resulting in Claude getting thousands of spam messages,
+it can figure out the format of the spam from a few visible examples and write a filter removing the spam from the work queue automatically.
+We can even allow Claude to register e.g. filter regexes agains the work queue that filter out spam before they ever have a chance to displace other
+things from the queue.
+
+### Compaction
+
+Claude can delete stuff from its very recent event history, but we don't let it delete substantially older stuff arbitrarily because it would
+create a new conversation prefix that wouldn't be cached.
+
+Claude can delete whatever it wants, as far back as it wants, during compaction, but it has to do it all in one shot with a script.
+We can run the script against the context and tell Claude "this saved X tokens" or "this crashed" or whatever, because that's cheap,
+but we only want to actually re-ingest the trimmed context once.
+
+### Background commands.
+
+Claude has a function `shell_exec(cmd : str, args : list[str], env: dict[str,str], alert_timer: timedelta, success_prio : Priority, fail_prio : Priority) -> pid`.
+
+It can use this to kick off background tasks. It has to specify an alert_timer duration, where if the command is still running
+after that duration, the timer fires, alerting claude to check the command. If the command finishes or fails, an alert gets placed in the
+work queue at the specified `success_prio` or `fail_prio`.
+
+Claude has various functions to inspect and modify processes using their `pid`.
+
+### Item IDs
+
+In our Rust harness, we can identify items (e.g. history events) however we like (UUID, ordinal index, whatever).
+
+However, for the agent, we always give it short-form IDs that it can easily write out. This mapping should be stable such that
+when we re-render the context every time we invoke the agent, the generated prompt prefixes are stable. In fact, we should probably
+never change event IDs so that if the agent references an event ID in a text document or something (outside of the management of the harness),
+that reference is stable. We probably don't want to expose an incrementing counter to the agent, because that makes substitution errors too easy,
+but maybe we generate 40-bit bitcoin-style word-based IDs or something, so the agent sees IDs like "moon-banana-rock-super", with some
+kind of bijective shuffle applied to the underlying integer counter or something, so the names are random-looking to the agent.
+
+TODO: get rid of the `Unique IDs available` thing and replace it with a `gen_unique_id()` function.
+
+### Timers
+
+Claude can interact with timers via a `timers` object available in its interpreter.
+
+## Questions
+
+### Should we put an event in the history log when e.g. the top priority task changes out from under Claude?
+
+### How do we want Claude to be able to customize its interpreter environment? Pip commands?
