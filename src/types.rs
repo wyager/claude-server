@@ -1,7 +1,36 @@
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+// ---- Serde helpers ----
+
+mod duration_secs {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        d.as_secs().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        Ok(Duration::from_secs(u64::deserialize(d)?))
+    }
+}
+
+mod option_duration_secs {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(d: &Option<Duration>, s: S) -> Result<S::Ok, S::Error> {
+        d.map(|d| d.as_secs()).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
+        Ok(Option::<u64>::deserialize(d)?.map(Duration::from_secs))
+    }
+}
 
 // ---- IDs ----
 
@@ -10,9 +39,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AgentId(pub String);
 
+impl std::fmt::Display for AgentId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Internal counter for generating AgentIds.
 /// Persisted to SQLite so IDs remain unique across daemon restarts.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct IdGenerator {
     counter: u64,
 }
@@ -27,7 +62,6 @@ impl IdGenerator {
     pub fn next(&mut self) -> AgentId {
         let n = self.counter;
         self.counter += 1;
-        // Simple bijective shuffle: multiply by a large odd number, take lower 16 bits
         let shuffled = n.wrapping_mul(0x9E3779B97F4A7C15) & 0xFFFF;
         AgentId(format!("{:04x}", shuffled))
     }
@@ -44,7 +78,7 @@ pub enum WorkItemType {
     },
     TimerFired {
         timer_id: AgentId,
-        /// For recurring timers
+        #[serde(with = "option_duration_secs")]
         every: Option<Duration>,
         description: String,
     },
@@ -65,8 +99,8 @@ pub enum WorkItemType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkItem {
     pub id: AgentId,
-    pub priority: u8, // 0-10, 10 = system
-    pub time: SystemTime,
+    pub priority: u8,
+    pub time: DateTime<Utc>,
     pub item_type: WorkItemType,
 }
 
@@ -80,7 +114,6 @@ pub struct QueueFilter {
 pub struct WorkQueue {
     /// Sorted by (priority DESC, time ASC)
     items: Vec<WorkItem>,
-    /// Persistent filters applied to incoming items
     filters: Vec<QueueFilter>,
 }
 
@@ -95,7 +128,6 @@ impl WorkQueue {
     /// Insert a work item, maintaining sort order.
     /// Returns false if the item was filtered out.
     pub fn push(&mut self, item: WorkItem) -> bool {
-        // Check against filters
         if let WorkItemType::UserMessage { ref content, .. } = item.item_type {
             for filter in &self.filters {
                 if let Ok(re) = regex::Regex::new(&filter.regex) {
@@ -106,16 +138,13 @@ impl WorkQueue {
             }
         }
 
-        // Insert in sorted position: priority DESC, then time ASC
-        let pos = self
-            .items
-            .partition_point(|existing| {
-                if existing.priority != item.priority {
-                    existing.priority > item.priority
-                } else {
-                    existing.time <= item.time
-                }
-            });
+        let pos = self.items.partition_point(|existing| {
+            if existing.priority != item.priority {
+                existing.priority > item.priority
+            } else {
+                existing.time <= item.time
+            }
+        });
         self.items.insert(pos, item);
         true
     }
@@ -144,6 +173,10 @@ impl WorkQueue {
         self.items.len()
     }
 
+    pub fn items(&self) -> &[WorkItem] {
+        &self.items
+    }
+
     pub fn get(&self, index: usize) -> Option<&WorkItem> {
         self.items.get(index)
     }
@@ -155,30 +188,31 @@ impl WorkQueue {
     pub fn remove_filter(&mut self, name: &str) {
         self.filters.retain(|f| f.name != name);
     }
+
+    pub fn filters(&self) -> &[QueueFilter] {
+        &self.filters
+    }
 }
 
 // ---- Event History ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HistoryEntry {
-    /// A Python script execution and its output
     Execution {
         id: AgentId,
-        time: SystemTime,
+        time: DateTime<Utc>,
         code: String,
         output: String,
         is_error: bool,
     },
-    /// A summary replacing one or more older entries
     Summary {
         id: AgentId,
-        time: SystemTime,
+        time: DateTime<Utc>,
         description: String,
     },
-    /// A system alert (e.g. priority change notification)
     SystemAlert {
         id: AgentId,
-        time: SystemTime,
+        time: DateTime<Utc>,
         message: String,
     },
 }
@@ -192,7 +226,7 @@ impl HistoryEntry {
         }
     }
 
-    pub fn time(&self) -> SystemTime {
+    pub fn time(&self) -> DateTime<Utc> {
         match self {
             HistoryEntry::Execution { time, .. } => *time,
             HistoryEntry::Summary { time, .. } => *time,
@@ -204,9 +238,8 @@ impl HistoryEntry {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EventHistory {
     entries: Vec<HistoryEntry>,
-    /// Number of recent entries the agent is allowed to modify (replace/delete).
-    /// Older entries are read-only until compaction.
-    pub modification_window: usize, // typically 5
+    /// Number of recent entries the agent can modify (replace/delete).
+    pub modification_window: usize,
 }
 
 impl EventHistory {
@@ -217,8 +250,6 @@ impl EventHistory {
         }
     }
 
-    /// Returns the ID of the earliest entry the agent can modify,
-    /// or None if there are no entries.
     pub fn modification_boundary(&self) -> Option<&AgentId> {
         let len = self.entries.len();
         if len == 0 {
@@ -228,7 +259,6 @@ impl EventHistory {
         Some(self.entries[start].id())
     }
 
-    /// Whether the given entry is within the modification window.
     pub fn is_modifiable(&self, id: &AgentId) -> bool {
         let len = self.entries.len();
         let start = len.saturating_sub(self.modification_window);
@@ -276,17 +306,18 @@ pub struct Timer {
     pub description: String,
     pub priority: u8,
     pub schedule: TimerSchedule,
-    pub created_at: SystemTime,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TimerSchedule {
-    /// Fire once at a specific time
-    OneShot { at: SystemTime },
-    /// Fire repeatedly at an interval
+    OneShot {
+        at: DateTime<Utc>,
+    },
     Recurring {
+        #[serde(with = "duration_secs")]
         every: Duration,
-        next_fire: SystemTime,
+        next_fire: DateTime<Utc>,
     },
 }
 
@@ -314,11 +345,9 @@ impl TimerManager {
         }
     }
 
-    /// Check for timers that should fire at or before `now`.
-    /// Returns fired timer events and advances recurring timers.
     pub fn check_and_fire(
         &mut self,
-        now: SystemTime,
+        now: DateTime<Utc>,
         id_gen: &mut IdGenerator,
     ) -> Vec<WorkItem> {
         let mut fired = Vec::new();
@@ -353,7 +382,9 @@ impl TimerManager {
                                 description: timer.description.clone(),
                             },
                         });
-                        *next_fire = now + *every;
+                        *next_fire = now
+                            + chrono::Duration::from_std(*every)
+                                .unwrap_or(chrono::Duration::seconds(1));
                     }
                 }
             }
@@ -392,11 +423,11 @@ pub struct ManagedProcess {
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub status: ProcessStatus,
+    #[serde(with = "duration_secs")]
     pub alert_timer: Duration,
     pub success_prio: u8,
     pub fail_prio: u8,
-    pub started_at: SystemTime,
-    /// OS-level PID for the actual process
+    pub started_at: DateTime<Utc>,
     pub os_pid: Option<u32>,
 }
 
@@ -424,38 +455,41 @@ impl ProcessManager {
         self.processes.iter_mut().find(|p| &p.id == id)
     }
 
-    /// Check for processes that have exceeded their alert_timer.
     pub fn check_timeouts(
         &self,
-        now: SystemTime,
+        now: DateTime<Utc>,
         id_gen: &mut IdGenerator,
     ) -> Vec<WorkItem> {
         let mut alerts = Vec::new();
 
         for process in &self.processes {
             if matches!(process.status, ProcessStatus::Running) {
-                if let Ok(elapsed) = now.duration_since(process.started_at) {
-                    if elapsed >= process.alert_timer {
-                        alerts.push(WorkItem {
-                            id: id_gen.next(),
-                            priority: process.fail_prio,
-                            time: now,
-                            item_type: WorkItemType::ProcessTimeout {
-                                pid: process.id.clone(),
-                            },
-                        });
-                    }
+                let elapsed = now - process.started_at;
+                let alert_dur = chrono::Duration::from_std(process.alert_timer)
+                    .unwrap_or(chrono::Duration::MAX);
+                if elapsed >= alert_dur {
+                    alerts.push(WorkItem {
+                        id: id_gen.next(),
+                        priority: process.fail_prio,
+                        time: now,
+                        item_type: WorkItemType::ProcessTimeout {
+                            pid: process.id.clone(),
+                        },
+                    });
                 }
             }
         }
 
         alerts
     }
+
+    pub fn processes(&self) -> &[ManagedProcess] {
+        &self.processes
+    }
 }
 
 // ---- Memory ----
 
-/// Simple persistent key-value store.
 pub type Memory = HashMap<String, String>;
 
 // ---- Harness State ----
@@ -470,12 +504,8 @@ pub struct HarnessState {
     pub process_manager: ProcessManager,
     pub memory: Memory,
     pub id_generator: IdGenerator,
-
-    /// Last input_tokens from API response, for compaction decisions
     pub last_input_tokens: u64,
-    /// Context window size for the current model
     pub context_window: u64,
-    /// max_tokens setting for API calls
     pub max_tokens: u64,
 }
 
@@ -494,8 +524,6 @@ impl HarnessState {
         }
     }
 
-    /// Whether compaction should be triggered.
-    /// True when input_tokens > 80% of (context_window - max_tokens).
     pub fn should_compact(&self) -> bool {
         let available = self.context_window.saturating_sub(self.max_tokens);
         let threshold = (available as f64 * 0.8) as u64;
@@ -505,20 +533,13 @@ impl HarnessState {
 
 // ---- Context Rendering ----
 
-/// Configuration for how context is rendered into the user message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderConfig {
-    /// Max chars per history entry before truncation
     pub history_entry_max_chars: usize,
-    /// Max lines per history entry before truncation
     pub history_entry_max_lines: usize,
-
-    /// Max chars for work queue item content, by position
-    pub work_queue_content_limits: Vec<usize>, // [500, 500, 500, 200, 200, ...]
-    /// Default limit for items beyond the explicit list
-    pub work_queue_default_limit: usize,       // 80
-    /// Max number of work items to display
-    pub work_queue_max_display: usize,         // 20
+    pub work_queue_content_limits: Vec<usize>,
+    pub work_queue_default_limit: usize,
+    pub work_queue_max_display: usize,
 }
 
 impl Default for RenderConfig {
@@ -535,25 +556,18 @@ impl Default for RenderConfig {
 
 // ---- Deployment Plugin ----
 
-/// Trait for deployment-specific behavior.
-/// Each deployment (home automation, DevOps, etc.) implements this.
 pub trait DeploymentPlugin: Send + Sync {
-    /// The deployment context text shown to the agent each turn.
     fn deployment_context(&self) -> String;
-
-    /// Python preamble: source code defining deployment-specific objects
-    /// (e.g. `camera_tool`, `home`, etc.) that are available in the interpreter.
     fn python_preamble(&self) -> String;
-
-    /// Handle a deployment-specific command from the Python interpreter.
-    /// Called synchronously during script execution for read operations
-    /// (e.g. camera_tool.get_interesting_frames).
-    fn handle_call(&self, function: &str, args: &serde_json::Value) -> Result<serde_json::Value, String>;
+    fn handle_call(
+        &self,
+        function: &str,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, String>;
 }
 
 // ---- API Types ----
 
-/// The API request we send to Claude.
 #[derive(Debug, Serialize)]
 pub struct ApiRequest {
     pub model: String,
@@ -566,7 +580,7 @@ pub struct ApiRequest {
 #[derive(Debug, Serialize)]
 pub struct SystemBlock {
     #[serde(rename = "type")]
-    pub block_type: String, // always "text"
+    pub block_type: String,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
@@ -575,7 +589,7 @@ pub struct SystemBlock {
 #[derive(Debug, Serialize)]
 pub struct CacheControl {
     #[serde(rename = "type")]
-    pub control_type: String, // always "ephemeral"
+    pub control_type: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -617,20 +631,17 @@ pub enum ContentBlock {
         is_error: Option<bool>,
     },
     #[serde(rename = "image")]
-    Image {
-        source: ImageSource,
-    },
+    Image { source: ImageSource },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ImageSource {
     #[serde(rename = "type")]
-    pub source_type: String, // "base64"
-    pub media_type: String,  // "image/png", "image/jpeg"
-    pub data: String,        // base64-encoded
+    pub source_type: String,
+    pub media_type: String,
+    pub data: String,
 }
 
-/// The API response from Claude.
 #[derive(Debug, Deserialize)]
 pub struct ApiResponse {
     pub content: Vec<ContentBlock>,
