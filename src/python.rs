@@ -9,6 +9,21 @@ use pyo3::types::PyDict;
 
 use crate::types::*;
 
+// ---- Helpers ----
+
+/// Extract a duration in seconds from either a number or a datetime.timedelta.
+fn extract_seconds(val: &Bound<'_, PyAny>) -> PyResult<f64> {
+    if let Ok(f) = val.extract::<f64>() {
+        return Ok(f);
+    }
+    if let Ok(ts) = val.call_method0("total_seconds") {
+        return ts.extract::<f64>();
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "expected a number (seconds) or datetime.timedelta",
+    ))
+}
+
 // ---- Side Effect Collection ----
 
 /// Collects all mutations and side effects from a Python script execution.
@@ -363,19 +378,23 @@ struct PyTimerManager {
 #[pymethods]
 impl PyTimerManager {
     #[pyo3(signature = (*, every=None, at=None, priority=5, description="".to_string()))]
-    fn add(
+    fn add<'py>(
         &self,
-        every: Option<f64>,
+        every: Option<&Bound<'py, PyAny>>,
         at: Option<String>,
         priority: u8,
         description: String,
     ) -> PyResult<String> {
+        let every_secs = match every {
+            Some(val) => Some(extract_seconds(val)? as u64),
+            None => None,
+        };
         let mut col = self.collector.lock().unwrap();
         let id = col.id_gen.next();
         let id_str = id.0.clone();
         col.timer_adds.push(TimerAddRequest {
             id,
-            every_secs: every.map(|s| s as u64),
+            every_secs,
             at_timestamp: at,
             priority,
             description,
@@ -479,16 +498,20 @@ impl PyHarness {
         Ok(())
     }
 
-    #[pyo3(signature = (cmd, args=vec![], env=HashMap::new(), alert_timer=300.0, success_prio=5, fail_prio=7))]
-    fn shell_exec(
+    #[pyo3(signature = (cmd, args=vec![], env=HashMap::new(), alert_timer=None, success_prio=5, fail_prio=7))]
+    fn shell_exec<'py>(
         &self,
         cmd: String,
         args: Vec<String>,
         env: HashMap<String, String>,
-        alert_timer: f64,
+        alert_timer: Option<&Bound<'py, PyAny>>,
         success_prio: u8,
         fail_prio: u8,
     ) -> PyResult<String> {
+        let alert_secs = match alert_timer {
+            Some(val) => extract_seconds(val)? as u64,
+            None => 300,
+        };
         let mut col = self.collector.lock().unwrap();
         let id = col.id_gen.next();
         let id_str = id.0.clone();
@@ -497,7 +520,7 @@ impl PyHarness {
             cmd,
             args,
             env,
-            alert_timer_secs: alert_timer as u64,
+            alert_timer_secs: alert_secs,
             success_prio,
             fail_prio,
         });
@@ -918,5 +941,36 @@ memory["my_pid"] = pid
         assert!(!result.is_error, "Error: {}", result.error_text);
         assert_eq!(result.side_effects.messages.len(), 1);
         assert_eq!(result.side_effects.messages[0].chat_id, "chat1");
+    }
+
+    #[test]
+    fn test_timedelta_in_timer_and_shell_exec() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        let result = execute(
+            &state,
+            r#"
+# timedelta should work in timers.add
+tid = timers.add(every=timedelta(seconds=30), priority=6, description="test")
+print(tid)
+
+# timedelta should work in shell_exec
+pid = shell_exec("echo", ["hi"], alert_timer=timedelta(minutes=5))
+print(pid)
+
+# plain numbers should still work too
+tid2 = timers.add(every=60, priority=5, description="numeric")
+pid2 = shell_exec("echo", ["hi"], alert_timer=300)
+"#,
+            false,
+            &HashMap::new(),
+        );
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert_eq!(result.side_effects.timer_adds.len(), 2);
+        assert_eq!(result.side_effects.timer_adds[0].every_secs, Some(30));
+        assert_eq!(result.side_effects.timer_adds[1].every_secs, Some(60));
+        assert_eq!(result.side_effects.process_starts.len(), 2);
+        assert_eq!(result.side_effects.process_starts[0].alert_timer_secs, 300);
+        assert_eq!(result.side_effects.process_starts[1].alert_timer_secs, 300);
     }
 }
