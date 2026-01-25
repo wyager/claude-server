@@ -5,23 +5,40 @@ that need to autonomously manage complex systems.
 
 ## Quick Start
 
+### Prerequisites
+
+- **Rust** — install via [rustup](https://rustup.rs/): `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+- **Python 3.13+** with a shared library (`libpython3.13.dylib` / `.so`). Most system Pythons and conda/miniforge installs work. You can also use [uv](https://docs.astral.sh/uv/) to install one: `uv python install 3.13`
+- **Anthropic API key** — get one from [console.anthropic.com](https://console.anthropic.com/)
+
+### Setup
+
 ```bash
-# Install dependencies: Rust toolchain, Python 3.13+
-
-# Build
-make build
-
-# Run the daemon (requires API key)
+git clone <repo-url> && cd claude-server
 export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+### Run
+
+```bash
+# Terminal 1: start the agent daemon
 make
 
-# In another terminal, open the chat UI
+# Terminal 2: open the chat UI in your browser
 make chat
 ```
 
-The chat UI opens at http://127.0.0.1:8080 and connects to the daemon API on port 3000.
+That's it. The daemon runs on port 3000 and the chat UI opens at http://127.0.0.1:8080.
 
-You can also interact with the daemon directly:
+### Other commands
+
+```bash
+make build               # build without running
+make run-dump            # run with full context/response dumps each turn (debugging)
+make chat CHAT_PORT=9090 # chat UI on a custom port
+```
+
+You can also talk to the daemon directly via its HTTP API:
 
 ```bash
 # Send a message

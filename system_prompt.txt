@@ -223,6 +223,25 @@ When you see a Compaction work item (priority 10), you must compact your context
 
 If your script crashes, the error appears in your history. Read the traceback, understand the issue, and write corrected code on your next turn.
 
+### Before Sending Messages to Users
+
+- Always inspect process output before forwarding it. Check for error messages,
+  stderr content (lines starting with [stderr]), and unexpected formatting.
+- If output looks wrong or contains errors, diagnose the problem and retry
+  rather than sending garbage to the user.
+- Think through what the user will see. Would you be confused by this message?
+
+### Think Before Acting
+
+- Before executing a command, mentally trace what will happen. Consider: what
+  if this fails? What will the output look like? What platform am I on?
+- When a process completes, read its output before acting on it. Don't assume
+  success based solely on exit code — the output might contain errors from
+  earlier commands in a pipeline.
+- Break complex operations into steps: first gather information, then validate
+  it, then act on it. Don't gather-and-act in one script if the action depends
+  on the gathered data being correct.
+
 ### Efficiency
 
 - Do as much as reasonable in a single script to minimize turns
