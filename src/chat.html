@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Server Chat</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #1a1a2e;
+    color: #eee;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+#header {
+    padding: 12px 20px;
+    background: #16213e;
+    border-bottom: 1px solid #333;
+    font-size: 14px;
+    color: #888;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+#header .title { color: #ccc; font-weight: 600; }
+#status { font-size: 12px; }
+#status.connected { color: #4ade80; }
+#status.error { color: #f87171; }
+#messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+.msg {
+    max-width: 75%;
+    padding: 10px 14px;
+    border-radius: 12px;
+    font-size: 14px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+.msg.user {
+    align-self: flex-end;
+    background: #2563eb;
+    color: #fff;
+    border-bottom-right-radius: 4px;
+}
+.msg.agent {
+    align-self: flex-start;
+    background: #374151;
+    color: #e5e7eb;
+    border-bottom-left-radius: 4px;
+}
+.msg .meta {
+    font-size: 11px;
+    color: rgba(255,255,255,0.5);
+    margin-top: 4px;
+}
+#input-area {
+    padding: 16px 20px;
+    background: #16213e;
+    border-top: 1px solid #333;
+    display: flex;
+    gap: 10px;
+}
+#input {
+    flex: 1;
+    padding: 10px 14px;
+    border: 1px solid #444;
+    border-radius: 8px;
+    background: #1a1a2e;
+    color: #eee;
+    font-size: 14px;
+    font-family: inherit;
+    outline: none;
+    resize: none;
+}
+#input:focus { border-color: #2563eb; }
+#send {
+    padding: 10px 20px;
+    background: #2563eb;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 500;
+}
+#send:hover { background: #1d4ed8; }
+#send:disabled { background: #555; cursor: not-allowed; }
+</style>
+</head>
+<body>
+<div id="header">
+    <span class="title">Claude Server Chat</span>
+    <span id="status">connecting...</span>
+</div>
+<div id="messages"></div>
+<div id="input-area">
+    <textarea id="input" rows="1" placeholder="Type a message..." autofocus></textarea>
+    <button id="send" onclick="sendMessage()">Send</button>
+</div>
+
+<script>
+const API_URL = "{{API_URL}}";
+const CHAT_ID = crypto.randomUUID();
+const seenIds = new Set();
+let pollTimer = null;
+let lastNewMsg = 0;
+let polling = false;
+
+const messagesEl = document.getElementById("messages");
+const inputEl = document.getElementById("input");
+const statusEl = document.getElementById("status");
+
+// Auto-resize textarea
+inputEl.addEventListener("input", () => {
+    inputEl.style.height = "auto";
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + "px";
+});
+
+// Enter to send (Shift+Enter for newline)
+inputEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+    }
+});
+
+// Check API connectivity
+async function checkStatus() {
+    try {
+        const res = await fetch(`${API_URL}/status`);
+        if (res.ok) {
+            statusEl.textContent = "connected";
+            statusEl.className = "connected";
+        } else {
+            statusEl.textContent = "server error";
+            statusEl.className = "error";
+        }
+    } catch {
+        statusEl.textContent = "disconnected";
+        statusEl.className = "error";
+    }
+}
+
+function appendMessage(role, content, time) {
+    const div = document.createElement("div");
+    div.className = `msg ${role}`;
+    div.textContent = content;
+    if (time) {
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        meta.textContent = time;
+        div.appendChild(meta);
+    }
+    messagesEl.appendChild(div);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+async function sendMessage() {
+    const content = inputEl.value.trim();
+    if (!content) return;
+
+    appendMessage("user", content);
+    inputEl.value = "";
+    inputEl.style.height = "auto";
+
+    try {
+        await fetch(`${API_URL}/message`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                chat_id: CHAT_ID,
+                user: "chat-ui",
+                content: content
+            })
+        });
+        startPolling();
+    } catch (err) {
+        appendMessage("agent", `[Error sending message: ${err.message}]`);
+    }
+}
+
+async function poll() {
+    try {
+        const res = await fetch(`${API_URL}/messages/${CHAT_ID}`);
+        const data = await res.json();
+        let hasNew = false;
+
+        for (const msg of data.messages) {
+            if (!seenIds.has(msg.id)) {
+                seenIds.add(msg.id);
+                appendMessage("agent", msg.content, msg.created_at);
+                hasNew = true;
+            }
+        }
+
+        if (hasNew) {
+            lastNewMsg = Date.now();
+        } else if (Date.now() - lastNewMsg > 30000 && polling) {
+            stopPolling();
+        }
+    } catch {
+        // silently retry next interval
+    }
+}
+
+function startPolling() {
+    if (pollTimer) clearInterval(pollTimer);
+    polling = true;
+    lastNewMsg = Date.now();
+    pollTimer = setInterval(poll, 1500);
+    poll(); // immediate first poll
+}
+
+function stopPolling() {
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = null;
+    polling = false;
+}
+
+// Initial status check
+checkStatus();
+setInterval(checkStatus, 10000);
+</script>
+</body>
+</html>
