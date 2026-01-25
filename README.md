@@ -3,6 +3,29 @@
 Claude Server is a harness for Claude focused on long-running instances
 that need to autonomously manage complex systems.
 
+## How it's Different
+
+We don't use the traditional conversation architecture.
+
+Instead, we provide the agent with:
+
+* An event history
+* A work queue
+* Misc tools like a memory system, async shell commands, etc.
+
+and it interacts with *all of* those systems *entirely* through python scripting.
+
+Our (Rust) harness has an embedded Python interpreter.
+At every single turn, the agent is just writing a short python script.
+
+Even context compaction is done via python scripting!
+
+## Caveat Emptor
+
+I came up with the initial spec for this
+(mostly consisting of example context windows and API calls I wrote out by hand)
+but then I had fennec actually write everything, so I cannot attest to the quality of the code.
+
 ## Quick Start
 
 ### Prerequisites
