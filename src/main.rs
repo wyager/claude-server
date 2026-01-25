@@ -1,22 +1,36 @@
+mod api_client;
+mod compaction;
 mod config;
+mod core_loop;
 mod db;
+mod http_server;
+mod process;
 mod python;
 mod renderer;
 mod types;
 
-use anyhow::Result;
+use std::sync::Arc;
 
-fn main() -> Result<()> {
-    let config = config::Config::from_env()?;
+use anyhow::Result;
+use tokio::sync::mpsc;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Parse config
+    let config = Arc::new(config::Config::from_env()?);
 
     println!("Claude Server starting...");
     println!("  Model: {}", config.model);
     println!("  Listen: {}", config.listen_addr);
     println!("  DB: {:?}", config.db_path);
 
-    // Load system prompt
-    let system_prompt = config.load_system_prompt()?;
-    println!("  System prompt: {} chars", system_prompt.len());
+    // Initialize Python
+    python::initialize_python();
+    println!("  Python initialized");
+
+    // Open database
+    let database = Arc::new(db::Database::open(&config.db_path)?);
+    println!("  Database opened");
 
     // Load deployment context
     let deployment_context = config.load_deployment_context()?;
@@ -24,15 +38,16 @@ fn main() -> Result<()> {
         println!("  Deployment context: {} chars", deployment_context.len());
     }
 
-    // Open database
-    let database = db::Database::open(&config.db_path)?;
-    println!("  Database opened");
-
     // Load or create state
     let state = match database.load_state()? {
         Some(s) => {
-            println!("  Resumed existing state (queue: {} items, history: {} entries)",
-                s.work_queue.len(), s.event_history.entries().len());
+            println!(
+                "  Resumed state (queue: {}, history: {}, memory: {} keys, timers: {})",
+                s.work_queue.len(),
+                s.event_history.entries().len(),
+                s.memory.len(),
+                s.timer_manager.list().len()
+            );
             s
         }
         None => {
@@ -43,17 +58,73 @@ fn main() -> Result<()> {
         }
     };
 
-    // Test rendering
-    let rendered = renderer::render_context(
-        &state,
-        &deployment_context,
-        None,
-        &config.render_config,
-    );
-    println!("  Context renders to {} chars", rendered.text.len());
+    // Create event channels
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (process_event_tx, mut process_event_rx) = mpsc::unbounded_channel();
 
-    println!("Foundation + persistence + rendering verified.");
-    println!("Full runtime not yet implemented.");
+    // Create API client
+    let api_client = api_client::ApiClient::new(config.clone())?;
+    println!("  API client ready");
+
+    // Create process supervisor
+    let process_supervisor = process::ProcessSupervisor::new(process_event_tx, database.clone());
+
+    // Create core loop
+    let mut core = core_loop::CoreLoop::new(
+        state,
+        config.clone(),
+        database.clone(),
+        api_client,
+        process_supervisor,
+        event_rx,
+        deployment_context,
+    );
+
+    // Forward process events to the main event channel
+    let event_tx_for_process = event_tx.clone();
+    tokio::spawn(async move {
+        while let Some(pe) = process_event_rx.recv().await {
+            if event_tx_for_process
+                .send(core_loop::HarnessEvent::Process(pe))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // Start timer tick task
+    let event_tx_for_timer = event_tx.clone();
+    tokio::spawn(core_loop::timer_tick_loop(
+        event_tx_for_timer,
+        config.timer_poll_interval,
+    ));
+
+    // Start HTTP server
+    let router = http_server::create_router(event_tx.clone(), database.clone());
+    let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
+    println!("  HTTP server listening on {}", config.listen_addr);
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, router).await {
+            eprintln!("[http] Server error: {}", e);
+        }
+    });
+
+    println!("Claude Server ready.\n");
+    println!("Send messages with:");
+    println!(
+        "  curl -X POST http://{}/message -H 'Content-Type: application/json' \\",
+        config.listen_addr
+    );
+    println!("    -d '{{\"user\":\"you@example.com\",\"content\":\"Hello Claude!\"}}'");
+    println!();
+
+    // Run core loop (blocks until shutdown)
+    core.run().await?;
+
+    // Save final state
+    database.save_state(&core.state)?;
+    println!("State saved. Goodbye.");
 
     Ok(())
 }

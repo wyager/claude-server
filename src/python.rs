@@ -764,9 +764,13 @@ pub fn execute(
             side_effects,
         },
         Err(e) => {
-            let error_text = Python::with_gil(|py| e.traceback(py)
-                .map(|tb| tb.format().unwrap_or_else(|_| format!("{}", e)))
-                .unwrap_or_else(|| format!("{}", e)));
+            let error_text = Python::with_gil(|py| {
+                let tb_str = e
+                    .traceback(py)
+                    .map(|tb| tb.format().unwrap_or_default())
+                    .unwrap_or_default();
+                format!("{}{}", tb_str, e)
+            });
             ExecutionResult {
                 stdout,
                 is_error: true,
@@ -875,7 +879,11 @@ work_queue.pop_front()
         let state = HarnessState::new(200_000, 16384);
         let result = execute(&state, "undefined_variable", false, &HashMap::new());
         assert!(result.is_error);
-        assert!(result.error_text.contains("NameError"));
+        assert!(
+            result.error_text.contains("NameError"),
+            "Expected NameError in: '{}'",
+            result.error_text,
+        );
     }
 
     #[test]
