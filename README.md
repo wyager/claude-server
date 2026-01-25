@@ -3,835 +3,1184 @@
 Claude Server is a harness for Claude focused on long-running instances
 that need to autonomously manage complex systems.
 
-## Harness Architecture
+## Architecture Overview
 
-The Harness is based around the idea of the "Work Queue",
-a single priority-based queue of work for Claude to do.
-
-When the Work Queue is empty, the agent sleeps.
-When the Work Queue has items in it, the agent is
-invoked repeatedly until the Work Queue is empty.
-
-Besides the Work Queue, the agent also sees an Event History,
-a chronological history of events related to the agent's work.
-
-The agent has a single API by which to interact with the Work Queue,
-the Event History, and the wider world: at every turn, the agent
-provides commands which are run inside a python interpreter. All
-interaction with users and systems, Work Queue operations,
-setting timers, etc. is done via this python interpreter.
-
-The Harness is a Rust program, which invokes a Python interpreter every time the Agent performs an action.
-
-The Python interpreter is either initialized fresh every time the agent does something (and hydrated from serialized data from the Harness)
-or kept running in the background, communicating with the Harness via FFI or IPC. We'll start with the simpler
-fresh-interpreter-every-agent-action approach.
-
-### The Agent's View Of the World
-
-At every turn, the agent sees a context consisting of
+Claude Server is a Rust program that drives Claude through a work-queue-based loop.
+The agent interacts with the world exclusively through Python scripts, executed in
+a fresh Python interpreter on every turn.
 
 ```
-{system prompt}
-{deployment-specific context}
-{event history}
-{work queue}
-{helpful context}
-{agent prompt tag}
+                     +-----------------+
+                     | External Events |
+                     | (users, timers, |
+                     |  processes)     |
+                     +--------+--------+
+                              |
+                              v
++------------------------------------------------------------+
+|                      Rust Harness                          |
+|                                                            |
+|  +------------+  +---------+  +--------+  +-------------+ |
+|  | Work Queue |  | Event   |  | Timer  |  | Process     | |
+|  | (priority) |  | History |  | Manager|  | Manager     | |
+|  +------+-----+  +----+----+  +----+---+  +------+------+ |
+|         |              |           |              |        |
+|  +------+--------------+-----------+--------------+------+ |
+|  |              Context Renderer                         | |
+|  |  Serializes harness state into a text prompt          | |
+|  +---------------------------+---------------------------+ |
+|                              |                             |
+|  +---------------------------v---------------------------+ |
+|  |                   API Client                          | |
+|  |  - Sends single-message request to Claude API         | |
+|  |  - Defines `execute` tool for Python output           | |
+|  |  - Receives tool_use response                         | |
+|  +---------------------------+---------------------------+ |
+|                              |                             |
+|  +---------------------------v---------------------------+ |
+|  |              Python Executor                          | |
+|  |  - Fresh interpreter per turn                         | |
+|  |  - Loads serialized harness state                     | |
+|  |  - Runs Claude's script                               | |
+|  |  - Side effects execute immediately                   | |
+|  |  - Returns stdout + modified state                    | |
+|  +-------------------------------------------------------+ |
++------------------------------------------------------------+
 ```
 
-TODO wyager: What's the best way to "prompt" claude to write Python given this context via the API?
-Not sure if we actually need an open tag at the bottom there or if we can just call the API in "give me python"
-mode or something.
+### Core Loop
 
-#### System Prompt
+```
+1. Wait for work queue to be non-empty
+2. Render full context (deployment + history + queue + metadata) into text
+3. Call Claude API with rendered context as single user message
+4. Extract Python code from Claude's tool_use response
+5. Execute code in fresh Python interpreter
+6. Record code + output in event history
+7. Apply any state changes (timers, memory, queue ops, messages)
+8. If work queue is still non-empty, go to 2
+9. If work queue is empty, go to 1 (sleep)
+```
 
-The System Prompt contains general instructions for Claude, including Claude's job
-(to manage items in the Work Queue) and details about the harness (what standard functions/objects
-are available to it in the pyhton intepreter).
+When the work queue is empty, the agent sleeps. External events (user messages,
+timer firings, process completions) add items to the work queue, waking the agent.
 
-#### Deployment-specific Context
+## API Integration
 
-This varies per Claude Server, and contains information about systems, tools, users, etc.
-that exist in this particular environment but are not general to all Claude Server instances.
+### Messages API Call Format
 
-#### Event History
+Each turn is a single API call. The harness constructs the request as follows:
 
-This is a history consisting of:
+```json
+{
+  "model": "claude-opus-4-5-20251101",
+  "max_tokens": 16384,
+  "system": [
+    {
+      "type": "text",
+      "text": "<system prompt text>",
+      "cache_control": { "type": "ephemeral" }
+    }
+  ],
+  "tools": [
+    {
+      "name": "execute",
+      "description": "Execute a Python script in the agent environment. You have access to the work queue, memory, timers, event history, and deployment-specific tools. Use this tool to perform all actions.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Python code to execute"
+          }
+        },
+        "required": ["code"]
+      }
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": "<rendered context>"
+    }
+  ]
+}
+```
 
-1. The Python scripts that Claude runs and their outputs
-2. Certain system alert messages (e.g. top-priority task changed)
-3. Anything Claude chooses to insert during compaction
+The model is configurable (default: `claude-opus-4-5-20251101`).
 
-Claude can trim 
+### Why tool_use Instead of Raw Text
+
+Claude outputs its Python code via a structured `tool_use` block rather than raw text.
+This eliminates parsing ambiguity: the `input.code` field contains exactly the Python
+to run, with no risk of Claude including explanation text, closing code fences early, etc.
+
+### Prompt Caching
+
+The system prompt has `cache_control: { "type": "ephemeral" }` applied.
+Since the system prompt is identical across turns, this gives automatic caching on every call.
+
+The rendered context (the user message) changes each turn, but the top of it
+(deployment-specific context) is stable and may benefit from prefix caching.
+
+### Token Usage Tracking
+
+The API response includes `usage.input_tokens`. The harness tracks this value
+and triggers compaction when it exceeds 80% of (context_window - max_tokens).
+
+
+## The Agent's View of the World
+
+Each turn, Claude sees a single user message containing the full rendered context:
+
+```
+<deployment_context>
+{deployment-specific information about this Claude Server instance}
+</deployment_context>
+<event_history>
+{chronological history of past actions and their outputs}
+</event_history>
+<work_queue>
+{priority-ordered queue of pending work items}
+</work_queue>
+<context>
+{current time, token usage, compaction state if applicable}
+</context>
+```
+
+Claude responds by using the `execute` tool to run a Python script.
+
+### Deployment Context
+
+Varies per Claude Server instance. Contains information about systems, tools, users,
+etc. that exist in this particular environment. For example, a home automation deployment
+might describe available cameras, smart home APIs, and authorized users.
+
+### Event History
+
+A chronological log consisting of:
+
+1. Python scripts Claude has run and their outputs (stdout + return values)
+2. System alert messages (e.g. "high-priority task preempted your current work")
+3. Compaction summaries (agent-written descriptions replacing older history)
+
+Each history entry has a stable short hex ID assigned by the harness (e.g. `3a6f`).
+IDs never change once assigned, so the agent can reference them in memories or documents.
+
+History entries are truncated at a maximum character/line length for display.
+Claude can retrieve full content by printing it in a script (e.g. `print(history["3a6f"].full_output)`).
+
+Claude can manipulate recent history entries (replace with descriptions, delete)
+to manage context size. Older entries can only be modified during compaction.
+
+### Work Queue
+
+A priority-ordered queue of tasks. Priority ranges from 0-10, with 10 reserved
+for system events (compaction). Within the same priority, items are sorted by time (ascending).
+
+Work item types:
+
+| Type | Description | Typical Priority |
+|------|-------------|-----------------|
+| `UserMessage` | Message from a user | 9 |
+| `TimerFired` | A recurring or one-shot timer fired | Set by Claude |
+| `ProcessCompleted` | A background shell command finished | Set by Claude |
+| `ProcessFailed` | A background shell command failed | Set by Claude |
+| `ProcessTimeout` | A background command exceeded its alert_timer | Set by Claude |
+| `Compaction` | System-triggered context compaction | 10 |
+
+The work queue display is truncated to fit in context:
+- First 3 items: up to 500 chars each
+- Items 4-10: up to 200 chars each
+- Items 11+: type, priority, time, and first 80 chars only
+
+Claude can read full item content in Python (e.g. `print(work_queue[0].content)`).
+
+### Context Metadata
+
+A short block of current state:
+
+```xml
+<context>
+Current time: 2026-02-01 08:35:26 PST
+Last turn input tokens: 14832
+Compaction threshold: 150000 tokens
+</context>
+```
+
+During compaction, additional fields appear (see Compaction section).
+
+
+## Python Interpreter Environment
+
+Each turn, Claude's script runs in a fresh Python 3 interpreter.
+The harness serializes its state as JSON, loads it into the interpreter as
+pre-defined objects, runs Claude's script, then deserializes the modified state back.
+
+Side effects (sending messages, starting processes) execute immediately during
+script execution.
+
+### Available Objects and Functions
 
 #### Work Queue
 
-This is a priority-ordered queue of tasks for Claude to complete.
+```python
+work_queue: WorkQueue
 
-This can include:
+# Indexing
+work_queue[0]              # First (highest priority) item
+work_queue[0].content      # Full content of the item
+work_queue[0].id           # Item's hex ID
+work_queue[0].priority     # Priority (0-10)
+work_queue[0].type         # "UserMessage", "TimerFired", etc.
+work_queue[0].time         # Timestamp string
+work_queue[0].chat_id      # For UserMessage: the conversation ID
+work_queue[0].user         # For UserMessage: the sender
+work_queue[0].timer_id     # For TimerFired: the timer's ID
+work_queue[0].pid          # For Process*: the process ID
 
-1. System messages (e.g. context compaction request)
-2. User messages (e.g. requests to do something)
-3. Async tool usage results (e.g. spawned process completed)
-4. Timer Events
+# Manipulation
+work_queue.pop_front()     # Remove highest-priority item
+work_queue.remove(id)      # Remove item by ID
+len(work_queue)            # Number of items
 
-#### Helpful Context
+# Filtering (returns new WorkQueue, does not modify original)
+work_queue.filter(lambda item: item.type != "TimerFired")
 
-A short sequence of information about the current state of the harness
-
-### Example Agent Session
-
-The agent is not invoked until the Work Queue is non-empty. Let's say
-we have a fresh agent with no event history and it gets a message from a user. It would
-"wake up" with:
-
-
-#### Turn 1
+# Persistent filters (applied to incoming items before they enter the queue)
+work_queue.add_filter(name="spam_filter", regex=r"^spam:.*")
+work_queue.remove_filter(name="spam_filter")
 ```
-{system prompt}
-{deployment-specific context}
+
+#### Memory
+
+```python
+memory: dict[str, str]
+
+memory["key"] = "value"        # Store a memory
+del memory["key"]              # Delete a memory
+print(memory["key"])           # Read a memory
+"key" in memory                # Check existence
+```
+
+Memory is persistent across turns and survives compaction. Use it for information
+that must not be lost (ongoing tasks, user preferences, important state).
+
+#### Timers
+
+```python
+timers: TimerManager
+
+# Create a recurring timer (returns the assigned hex ID)
+timer_id = timers.add(
+    every=timedelta(seconds=30),
+    priority=6,
+    description="Check driveway camera for contractor vans"
+)
+
+# Create a one-shot timer
+timer_id = timers.add(
+    at=datetime(2026, 2, 1, 17, 0, 0),
+    priority=8,
+    description="Remind Steve about dinner reservation"
+)
+
+# Manage timers
+timers.cancel(timer_id)        # Cancel a timer
+timers.list()                  # List all active timers
+```
+
+When a timer fires, a `TimerFired` work item is added to the queue.
+Recurring timers keep firing until cancelled.
+
+#### Event History
+
+```python
+history: HistoryManager
+
+# Read history
+history[id].code               # The Python code that was run
+history[id].output             # stdout from execution
+history[id].full_output        # Un-truncated output
+history[id].time               # Timestamp
+
+# Manipulate recent history (within deletion window)
+history.replace_with_description(id, "Short summary of what happened")
+history.remove(id)
+
+# During compaction only: manipulate any history
+history.add("Summary text to insert as a new history entry")
+```
+
+#### Communication
+
+```python
+# Send a text message to a user
+send_message(chat_id="81d4", content="I see a white van in the driveway!")
+
+# Send an image to a user
+send_image(chat_id="81d4", image=frame_data, caption="Driveway camera")
+```
+
+#### Process Management
+
+```python
+# Start a background process
+pid = shell_exec(
+    cmd="ffmpeg",
+    args=["-i", "input.mp4", "-vf", "scale=640:480", "output.mp4"],
+    env={"PATH": "/usr/bin"},
+    alert_timer=timedelta(minutes=5),   # Alert if still running after 5 min
+    success_prio=5,                     # Work queue priority on success
+    fail_prio=7                         # Work queue priority on failure
+)
+
+# Inspect processes
+shell_status(pid)        # Returns: "running", "completed", "failed"
+shell_output(pid)        # Returns recent stdout/stderr (last 100 lines)
+shell_kill(pid)          # Kill the process
+```
+
+#### Context Management
+
+```python
+# Add data to be shown in the next turn's context (e.g. images)
+show_in_context(data)
+
+# Standard output is captured and shown in history
+print("This appears in the history output")
+```
+
+#### Deployment-Specific Tools
+
+Each deployment provides additional Python objects. For example, a home automation
+deployment might provide:
+
+```python
+camera_tool.get_interesting_frames(camera="driveway", max_frames=5, from_time=..., to_time=...)
+home.set_thermostat(temperature=72)
+home.lock_door("front")
+```
+
+These are documented in the deployment context section of each turn's prompt.
+
+
+## Example Agent Session
+
+The agent is not invoked until the work queue is non-empty. Let's say
+we have a fresh agent with no event history and it gets a message from a user.
+It would "wake up" with:
+
+
+### Turn 1
+
+**Claude sees** (rendered as the user message in the API call):
+
+```xml
+<deployment_context>
+Home automation system for 123 Oak Street.
+Cameras: driveway, front_door, backyard.
+Users: steve@example.com (owner).
+Tools: camera_tool, home (see system prompt for API details).
+</deployment_context>
+<event_history>
+</event_history>
 <work_queue>
-<work_item id=1f13>
+<work_item id="1f13">
 priority: 9
 time: 2026-02-01 08:35:24 PST
 type: UserMessage
 chat_id: 81d4
 user: steve@example.com
-content: "Hello Claude, could you pl" <truncated>
-</work_item id=1f13>
+content: "Hello Claude, could you pl" [truncated, 184 chars]
+</work_item>
 </work_queue>
 <context>
 Current time: 2026-02-01 08:35:26 PST
-Unique IDs available for memories, timers, etc.: f73c, 982a, 4d66, 093d
-Can delete events starting from: 3a6f
+Last turn input tokens: 0
+Compaction threshold: 150000 tokens
 </context>
-<agent_commands>
 ```
 
-At every turn, the agent submits a Python script to be run against the current interpreter context.
+**Claude responds** with a `tool_use` block:
 
-In this case, the agent might submit
-
-```python
-print(work_queue[0].content)
+```json
+{
+  "type": "tool_use",
+  "id": "toolu_01A",
+  "name": "execute",
+  "input": {
+    "code": "print(work_queue[0].content)"
+  }
+}
 ```
 
-This is evaluated in an interpreter with access to variables representing the task queue,
-work history, etc. Claude generally has high flexibility to manipulate the contents of the harness.
+**Harness executes** the Python in a fresh interpreter, capturing stdout:
 
-TODO wyager: Do we want a fresh interpreter at every step? Or do we want a long-lived REPL?
-  Having a fresh interpreter sounds kind of easier for the moment, because we can just JSON-dump
-  the relevant stuff from the harness (e.g. timers and work queues), load them in during python setup,
-  run Claude's commands, JSON-dump them again at the end, and then load them back into rust. This will
-  be slow but it's probably easiest for an MVP.
+```
+Hello Claude, could you please keep an eye out for
+any vehicles coming up the driveway today and let me know if
+you see a contractor van?
+```
+
+This code + output is recorded as history entry `3a6f`.
 
 
-#### Turn 2
+### Turn 2
 
 Claude sees the result of the command it just ran:
 
-```
-{system prompt}
-{deployment-specific context}
-<history id=3a6f>
+```xml
+<deployment_context>
+Home automation system for 123 Oak Street.
+Cameras: driveway, front_door, backyard.
+Users: steve@example.com (owner).
+Tools: camera_tool, home (see system prompt for API details).
+</deployment_context>
+<event_history>
+<entry id="3a6f">
 time: 2026-02-01 08:35:27 PST
-agent ran:
+code:
   print(work_queue[0].content)
 output:
   Hello Claude, could you please keep an eye out for
   any vehicles coming up the driveway today and let me know if
   you see a contractor van?
-</history id=3a6f>
+</entry>
+</event_history>
 <work_queue>
-<work_item id=1f13>
+<work_item id="1f13">
 priority: 9
 time: 2026-02-01 08:35:24 PST
 type: UserMessage
 chat_id: 81d4
 user: steve@example.com
-content: "Hello Claude, could you pl" <truncated>
-</work_item id=1f13>
+content: "Hello Claude, could you pl" [truncated, 184 chars]
+</work_item>
 </work_queue>
 <context>
 Current time: 2026-02-01 08:35:40 PST
-Unique IDs available for memories, timers, etc.: f73c, 982a, 4d66, 093d
-Can delete events starting from: 3a6f
+Last turn input tokens: 1205
+Compaction threshold: 150000 tokens
 </context>
-<agent_commands>
 ```
 
 Claude decides to set up a memory and a timer:
 
-```python
-  memory["f73c"] = """
-  Need to alert Steve (steve@example.com) if a contractor van comes up
-  the driveway on 2026-02-01. chat_id 81d4. Checking recent footage every 30s
-  """
-  timers.add(
-    Timer(
-      start=datetime.now(),
-      every=timedelta(seconds=30),
-      priority=6,
-      description="Check driveway camera for contractor vans. See memory f73c",
-      id="982a"
-    )
-  )
+```json
+{
+  "type": "tool_use",
+  "id": "toolu_01B",
+  "name": "execute",
+  "input": {
+    "code": "timer_id = timers.add(\n    every=timedelta(seconds=30),\n    priority=6,\n    description=\"Check driveway camera for contractor vans\"\n)\nmemory[\"watch_driveway\"] = (\n    f\"Alert Steve (steve@example.com, chat 81d4) if contractor van on driveway. \"\n    f\"Timer: {timer_id}. Checking every 30s.\"\n)"
+  }
+}
 ```
 
-#### Turn 3
+The harness executes this. `timers.add()` returns harness-assigned ID `982a`.
+The memory is stored. Recorded as history entry `e7a1`.
 
-While Claude was writing that script, another message came in from Steve.
 
-```
-{system prompt}
-{deployment-specific context}
-<history id=3a6f>
+### Turn 3
+
+While Claude was running Turn 2, another message came in from Steve.
+
+```xml
+<deployment_context>
+Home automation system for 123 Oak Street.
+Cameras: driveway, front_door, backyard.
+Users: steve@example.com (owner).
+Tools: camera_tool, home (see system prompt for API details).
+</deployment_context>
+<event_history>
+<entry id="3a6f">
 time: 2026-02-01 08:35:27 PST
-agent ran:
+code:
   print(work_queue[0].content)
 output:
   Hello Claude, could you please keep an eye out for
   any vehicles coming up the driveway today and let me know if
   you see a contractor van?
-</history id=3a6f>
-<history id=e7a1>
-time: 2026-02-01 08:35:29 PST
-agent ran:
-  memory["f73c"] = """
-  Need to alert Steve (steve@example.com) if a contractor van comes up
-  the driveway on 2026-02-01. chat_id 81d4. Checking recent footage every 30s
-  """
-  timers.add(
-    Timer(
-      start=datetime.now(),
+</entry>
+<entry id="e7a1">
+time: 2026-02-01 08:35:41 PST
+code:
+  timer_id = timers.add(
       every=timedelta(seconds=30),
       priority=6,
-      description="Check driveway camera for contractor vans. See memory f73c"
-    )
+      description="Check driveway camera for contractor vans"
+  )
+  memory["watch_driveway"] = (
+      f"Alert Steve (steve@example.com, chat 81d4) if contractor van on driveway. "
+      f"Timer: {timer_id}. Checking every 30s."
   )
 output:
-</history id=e7a1>
+</entry>
+</event_history>
 <work_queue>
-<work_item id=1f13>
+<work_item id="1f13">
 priority: 9
 time: 2026-02-01 08:35:24 PST
 type: UserMessage
 chat_id: 81d4
 user: steve@example.com
-content: "Hello Claude, could you pl" <truncated>
-</work_item id=1f13>
-<work_item id=dd31>
+content: "Hello Claude, could you pl" [truncated, 184 chars]
+</work_item>
+<work_item id="dd31">
 priority: 9
 time: 2026-02-01 08:35:39 PST
 type: UserMessage
 chat_id: 81d4
 user: steve@example.com
-content: "Oh and I forgot to mentio" <truncated>
-</work_item id=dd31>
+content: "Oh and I forgot to mentio" [truncated, 62 chars]
+</work_item>
 </work_queue>
 <context>
-Current time: 2026-02-01 08:35:40 PST
-Unique IDs available for memories, timers, etc.: 4d66, 093d, 77cf, 8a3b
-Can delete events starting from: 3a6f
+Current time: 2026-02-01 08:35:42 PST
+Last turn input tokens: 1580
+Compaction threshold: 150000 tokens
 </context>
-<agent_commands>
 ```
 
-Claude:
+Claude pops the first message and reads the second:
 
-```python
-work_queue.pop_front()
-print(work_queue[0])
+```json
+{
+  "type": "tool_use",
+  "id": "toolu_01C",
+  "name": "execute",
+  "input": {
+    "code": "work_queue.pop_front()\nprint(work_queue[0].content)"
+  }
+}
 ```
 
-Note that Claude's python execution context always receives exactly the state that Claude
-saw, so it's not accidentally e.g. popping a newer higher-priority message that came in.
+Note that Claude's Python execution context always receives exactly the state that Claude
+saw, so it's not accidentally popping a newer higher-priority message that came in.
 If any events happen while Claude is working, those events are applied to the state *after*
 Claude is done processing it.
 
-
-#### Turn 4
+Stdout:
 
 ```
-{system prompt}
-{deployment-specific context}
-<history id=3a6f>
+Oh and I forgot to mention, ignore the red van, that's the electrician
+```
+
+Recorded as history entry `4481`.
+
+
+### Turn 4
+
+```xml
+<deployment_context>
+Home automation system for 123 Oak Street.
+Cameras: driveway, front_door, backyard.
+Users: steve@example.com (owner).
+Tools: camera_tool, home (see system prompt for API details).
+</deployment_context>
+<event_history>
+<entry id="3a6f">
 time: 2026-02-01 08:35:27 PST
-agent ran:
+code:
   print(work_queue[0].content)
 output:
   Hello Claude, could you please keep an eye out for
   any vehicles coming up the driveway today and let me know if
   you see a contractor van?
-</history id=3a6f>
-<history id=e7a1>
-time: 2026-02-01 08:35:29 PST
-agent ran:
-  memory["f73c"] = """
-  Need to alert Steve (steve@example.com) if a contractor van comes up
-  the driveway on 2026-02-01. chat_id 81d4. Checking recent footage every 30s.
-  """
-  timers.add(
-    Timer(
-      start=datetime.now(),
+</entry>
+<entry id="e7a1">
+time: 2026-02-01 08:35:41 PST
+code:
+  timer_id = timers.add(
       every=timedelta(seconds=30),
       priority=6,
-      description="Check driveway camera for contractor vans. See memory f73c"
-    )
+      description="Check driveway camera for contractor vans"
+  )
+  memory["watch_driveway"] = (
+      f"Alert Steve (steve@example.com, chat 81d4) if contractor van on driveway. "
+      f"Timer: {timer_id}. Checking every 30s."
   )
 output:
-</history id=e7a1>
-<history id=4481>
-agent ran:
+</entry>
+<entry id="4481">
+time: 2026-02-01 08:35:43 PST
+code:
   work_queue.pop_front()
   print(work_queue[0].content)
 output:
   Oh and I forgot to mention, ignore the red van, that's the electrician
-</history id=4481>
+</entry>
+</event_history>
 <work_queue>
-<work_item id=dd31>
+<work_item id="dd31">
 priority: 9
 time: 2026-02-01 08:35:39 PST
 type: UserMessage
 chat_id: 81d4
 user: steve@example.com
-content: "Oh and I forgot to mentio" <truncated>
-</work_item id=dd31>
+content: "Oh and I forgot to mentio" [truncated, 62 chars]
+</work_item>
 </work_queue>
 <context>
-Current time: 2026-02-01 08:35:40 PST
-Unique IDs available for memories, timers, etc.: 4d66, 093d, 77cf, 8a3b
-Can delete events starting from: 3a6f
+Current time: 2026-02-01 08:35:44 PST
+Last turn input tokens: 1930
+Compaction threshold: 150000 tokens
 </context>
-<agent_commands>
 ```
 
-Claude:
+Claude updates its memory and clears the queue:
 
-```python
-memory["f73c"] += " Ignore the red van (electrician)."
-work_queue.pop_front()
+```json
+{
+  "type": "tool_use",
+  "id": "toolu_01D",
+  "name": "execute",
+  "input": {
+    "code": "memory[\"watch_driveway\"] += \" Ignore the red van (electrician).\"\nwork_queue.pop_front()"
+  }
+}
 ```
 
-Because the Work Queue is now empty, Claude is not invoked until some external event happens.
+Because the work queue is now empty, Claude is not invoked until some external event happens.
+Recorded as history entry `3881`.
 
-#### Turn 5
 
-```
-{system prompt}
-{deployment-specific context}
-<history id=3a6f>
+### Turn 5
+
+30 seconds pass. The timer fires, adding a `TimerFired` item to the work queue.
+
+```xml
+<deployment_context>
+Home automation system for 123 Oak Street.
+Cameras: driveway, front_door, backyard.
+Users: steve@example.com (owner).
+Tools: camera_tool, home (see system prompt for API details).
+</deployment_context>
+<event_history>
+<entry id="3a6f">
 time: 2026-02-01 08:35:27 PST
-agent ran:
+code:
   print(work_queue[0].content)
 output:
   Hello Claude, could you please keep an eye out for
   any vehicles coming up the driveway today and let me know if
   you see a contractor van?
-</history id=3a6f>
-<history id=e7a1>
-time: 2026-02-01 08:35:29 PST
-agent ran:
-  memory["f73c"] = """
-  Need to alert Steve (steve@example.com) if a contractor van comes up
-  the driveway on 2026-02-01. chat_id 81d4. Checking recent footage every 30s.
-  """
-  timers.add(
-    Timer(
-      start=datetime.now(),
+</entry>
+<entry id="e7a1">
+time: 2026-02-01 08:35:41 PST
+code:
+  timer_id = timers.add(
       every=timedelta(seconds=30),
       priority=6,
-      description="Check driveway camera for contractor vans. See memory f73c"
-    )
+      description="Check driveway camera for contractor vans"
+  )
+  memory["watch_driveway"] = (
+      f"Alert Steve (steve@example.com, chat 81d4) if contractor van on driveway. "
+      f"Timer: {timer_id}. Checking every 30s."
   )
 output:
-</history id=e7a1>
-<history id=4481>
-agent ran:
+</entry>
+<entry id="4481">
+time: 2026-02-01 08:35:43 PST
+code:
   work_queue.pop_front()
   print(work_queue[0].content)
 output:
   Oh and I forgot to mention, ignore the red van, that's the electrician
-</history id=4481>
-<history id=3881>
-agent ran:
-  memory["f73c"] += " Ignore the red van (electrician)."
+</entry>
+<entry id="3881">
+time: 2026-02-01 08:35:45 PST
+code:
+  memory["watch_driveway"] += " Ignore the red van (electrician)."
   work_queue.pop_front()
 output:
-</history id=3881>
+</entry>
+</event_history>
 <work_queue>
-<work_item id=f02c>
+<work_item id="f02c">
 priority: 6
-time: 2026-02-01 08:35:59 PST
+time: 2026-02-01 08:36:11 PST
 type: TimerFired
 every: 30s
 timer_id: 982a
-description: "Check driveway camera for contractor vans. See memory f73c"
-</work_item id=f02c>
+description: "Check driveway camera for contractor vans"
+</work_item>
 </work_queue>
 <context>
-Current time: 2026-02-01 08:36:00 PST
-Unique IDs available for memories, timers, etc.: 4d66, 093d, 77cf, 8a3b
-Can delete events starting from: 3a6f
+Current time: 2026-02-01 08:36:12 PST
+Last turn input tokens: 2100
+Compaction threshold: 150000 tokens
 </context>
-<agent_commands>
 ```
 
-Claude:
-```python
-frames = camera_tool.get_interesting_frames(
-  camera="driveway",
-  max_frames=5,
-  from="2026-02-01 08:35:29",
-  to="2026-02-01 08:35:59")
-show_in_context(frames)
+Claude checks the camera:
+
+```json
+{
+  "type": "tool_use",
+  "id": "toolu_01E",
+  "name": "execute",
+  "input": {
+    "code": "frames = camera_tool.get_interesting_frames(\n    camera=\"driveway\",\n    max_frames=5,\n    from_time=\"2026-02-01 08:35:41\",\n    to_time=\"2026-02-01 08:36:11\")\nshow_in_context(frames)\nwork_queue.pop_front()"
+  }
+}
 ```
 
+This is executed. `camera_tool.get_interesting_frames()` runs synchronously and returns
+frame data. `show_in_context(frames)` tells the harness to include the frames in the
+next turn's context (as image content blocks in the API call).
+Recorded as history entry `d7ea`.
 
 
-#### Turn 5
+### Turn 6
 
-```
-{system prompt}
-{deployment-specific context}
-<history id=3a6f>
+The camera frames appear in the context. Claude can see the images and reason about them.
+
+```xml
+<deployment_context>
+Home automation system for 123 Oak Street.
+Cameras: driveway, front_door, backyard.
+Users: steve@example.com (owner).
+Tools: camera_tool, home (see system prompt for API details).
+</deployment_context>
+<event_history>
+<entry id="3a6f">
 time: 2026-02-01 08:35:27 PST
-agent ran:
+code:
   print(work_queue[0].content)
 output:
   Hello Claude, could you please keep an eye out for
   any vehicles coming up the driveway today and let me know if
   you see a contractor van?
-</history id=3a6f>
-<history id=e7a1>
-time: 2026-02-01 08:35:29 PST
-agent ran:
-  memory["f73c"] = """
-  Need to alert Steve (steve@example.com) if a contractor van comes up
-  the driveway on 2026-02-01. chat_id 81d4. Checking recent footage every 30s.
-  """
-  timers.add(
-    Timer(
-      start=datetime.now(),
+</entry>
+<entry id="e7a1">
+time: 2026-02-01 08:35:41 PST
+code:
+  timer_id = timers.add(
       every=timedelta(seconds=30),
       priority=6,
-      description="Check driveway camera for contractor vans. See memory f73c"
-    )
+      description="Check driveway camera for contractor vans"
+  )
+  memory["watch_driveway"] = (
+      f"Alert Steve (steve@example.com, chat 81d4) if contractor van on driveway. "
+      f"Timer: {timer_id}. Checking every 30s."
   )
 output:
-</history id=e7a1>
-<history id=4481>
-agent ran:
+</entry>
+<entry id="4481">
+time: 2026-02-01 08:35:43 PST
+code:
   work_queue.pop_front()
   print(work_queue[0].content)
 output:
   Oh and I forgot to mention, ignore the red van, that's the electrician
-</history id=4481>
-<history id=3881>
-agent ran:
-  memory["f73c"] += " Ignore the red van (electrician)."
+</entry>
+<entry id="3881">
+time: 2026-02-01 08:35:45 PST
+code:
+  memory["watch_driveway"] += " Ignore the red van (electrician)."
   work_queue.pop_front()
 output:
-</history id=3881>
-<history id=d7ea>
-time: 2026-01-01 08:36:00 PST
-agent ran:
+</entry>
+<entry id="d7ea">
+time: 2026-02-01 08:36:13 PST
+code:
   frames = camera_tool.get_interesting_frames(
-    camera="driveway",
-    max_frames=5,
-    from="2026-02-01 08:35:29",
-    to="2026-02-01 08:35:59")
+      camera="driveway",
+      max_frames=5,
+      from_time="2026-02-01 08:35:41",
+      to_time="2026-02-01 08:36:11")
   show_in_context(frames)
+  work_queue.pop_front()
 output:
   1 frame:
-  {embedded image representation}
-</history id=d7ea>
+  {embedded image}
+</entry>
+</event_history>
 <work_queue>
-<work_item id=f02c>
+</work_queue>
+<context>
+Current time: 2026-02-01 08:36:14 PST
+Last turn input tokens: 3500
+Compaction threshold: 150000 tokens
+</context>
+```
+
+Claude sees nothing interesting, replaces the image-heavy history entry with a
+short description to save context:
+
+```json
+{
+  "type": "tool_use",
+  "id": "toolu_01F",
+  "name": "execute",
+  "input": {
+    "code": "# Nothing interesting in that frame, just a bird. No contractor yet.\nhistory.replace_with_description(\"d7ea\", \"Checked driveway camera: bird, no vehicles\")"
+  }
+}
+```
+
+Work queue is empty, so the agent sleeps again until the next timer firing.
+Recorded as history entry `a3f1`.
+
+
+### Turn 7: Compaction
+
+To demonstrate how compaction works, we'll trigger a mandatory context compaction.
+(In reality this would happen after many more turns, once `input_tokens` exceeds
+80% of the compaction threshold. We're triggering it early here to show the mechanics.)
+
+Claude is able to directly manipulate its own context. We require Claude to write
+a script which compacts the entire context at once, so we don't have to repeatedly
+re-ingest long contexts as Claude does gradual cleanup.
+
+```xml
+<deployment_context>
+Home automation system for 123 Oak Street.
+Cameras: driveway, front_door, backyard.
+Users: steve@example.com (owner).
+Tools: camera_tool, home (see system prompt for API details).
+</deployment_context>
+<event_history>
+<entry id="3a6f">
+time: 2026-02-01 08:35:27 PST
+code:
+  print(work_queue[0].content)
+output:
+  Hello Claude, could you please keep an eye out for
+  any vehicles coming up the driveway today and let me know if
+  you see a contractor van?
+</entry>
+<entry id="e7a1">
+time: 2026-02-01 08:35:41 PST
+code:
+  timer_id = timers.add(
+      every=timedelta(seconds=30),
+      priority=6,
+      description="Check driveway camera for contractor vans"
+  )
+  memory["watch_driveway"] = (
+      f"Alert Steve (steve@example.com, chat 81d4) if contractor van on driveway. "
+      f"Timer: {timer_id}. Checking every 30s."
+  )
+output:
+</entry>
+<entry id="4481">
+time: 2026-02-01 08:35:43 PST
+code:
+  work_queue.pop_front()
+  print(work_queue[0].content)
+output:
+  Oh and I forgot to mention, ignore the red van, that's the electrician
+</entry>
+<entry id="3881">
+time: 2026-02-01 08:35:45 PST
+code:
+  memory["watch_driveway"] += " Ignore the red van (electrician)."
+  work_queue.pop_front()
+output:
+</entry>
+<entry id="d7ea">
+summary: Checked driveway camera: bird, no vehicles
+</entry>
+<entry id="a3f1">
+time: 2026-02-01 08:36:15 PST
+code:
+  # Nothing interesting in that frame, just a bird. No contractor yet.
+  history.replace_with_description("d7ea", "Checked driveway camera: bird, no vehicles")
+output:
+</entry>
+</event_history>
+<work_queue>
+<work_item id="373a">
+priority: 10
+time: 2026-02-01 08:36:20 PST
+type: Compaction
+description: "You must compact your context."
+</work_item>
+</work_queue>
+<context>
+Current time: 2026-02-01 08:36:20 PST
+Last turn input tokens: 3800
+Compaction threshold: 150000 tokens
+COMPACTION MODE:
+  Current usage: 3800 tokens
+  Target usage: 2000 tokens
+  Estimated usage after compaction_script: 3800 tokens
+  compaction_script:
+    # Empty - build this up, then call compact()
+</context>
+```
+
+Claude writes a compaction script:
+
+```json
+{
+  "type": "tool_use",
+  "id": "toolu_01G",
+  "name": "execute",
+  "input": {
+    "code": "compaction_script += \"\"\"\nfor id in [\"3a6f\", \"e7a1\", \"4481\", \"3881\", \"d7ea\", \"a3f1\"]:\n    history.remove(id)\nhistory.add(\n    \"Set up driveway cam watch for non-red contractor vans \"\n    \"for steve@example.com (chat 81d4). Timer 982a, memory watch_driveway. \"\n    \"First camera check: just a bird.\")\n\"\"\""
+  }
+}
+```
+
+
+### Turn 8
+
+The harness has dry-run the compaction script and shows the estimated savings:
+
+```xml
+<deployment_context>
+Home automation system for 123 Oak Street.
+Cameras: driveway, front_door, backyard.
+Users: steve@example.com (owner).
+Tools: camera_tool, home (see system prompt for API details).
+</deployment_context>
+<event_history>
+<entry id="3a6f">
+time: 2026-02-01 08:35:27 PST
+code:
+  print(work_queue[0].content)
+output:
+  Hello Claude, could you please keep an eye out for
+  any vehicles coming up the driveway today and let me know if
+  you see a contractor van?
+</entry>
+<entry id="e7a1">
+time: 2026-02-01 08:35:41 PST
+code:
+  timer_id = timers.add(
+      every=timedelta(seconds=30),
+      priority=6,
+      description="Check driveway camera for contractor vans"
+  )
+  memory["watch_driveway"] = (
+      f"Alert Steve (steve@example.com, chat 81d4) if contractor van on driveway. "
+      f"Timer: {timer_id}. Checking every 30s."
+  )
+output:
+</entry>
+<entry id="4481">
+time: 2026-02-01 08:35:43 PST
+code:
+  work_queue.pop_front()
+  print(work_queue[0].content)
+output:
+  Oh and I forgot to mention, ignore the red van, that's the electrician
+</entry>
+<entry id="3881">
+time: 2026-02-01 08:35:45 PST
+code:
+  memory["watch_driveway"] += " Ignore the red van (electrician)."
+  work_queue.pop_front()
+output:
+</entry>
+<entry id="d7ea">
+summary: Checked driveway camera: bird, no vehicles
+</entry>
+<entry id="a3f1">
+time: 2026-02-01 08:36:15 PST
+code:
+  # Nothing interesting in that frame, just a bird. No contractor yet.
+  history.replace_with_description("d7ea", "Checked driveway camera: bird, no vehicles")
+output:
+</entry>
+</event_history>
+<work_queue>
+<work_item id="373a">
+priority: 10
+time: 2026-02-01 08:36:20 PST
+type: Compaction
+description: "You must compact your context."
+</work_item>
+</work_queue>
+<context>
+Current time: 2026-02-01 08:36:21 PST
+Last turn input tokens: 4100
+Compaction threshold: 150000 tokens
+COMPACTION MODE:
+  Current usage: 3800 tokens
+  Target usage: 2000 tokens
+  Estimated usage after compaction_script: 1200 tokens
+  compaction_script:
+    for id in ["3a6f", "e7a1", "4481", "3881", "d7ea", "a3f1"]:
+        history.remove(id)
+    history.add(
+        "Set up driveway cam watch for non-red contractor vans "
+        "for steve@example.com (chat 81d4). Timer 982a, memory watch_driveway. "
+        "First camera check: just a bird.")
+</context>
+```
+
+The estimated usage (1200) is below the target (2000), so Claude executes:
+
+```json
+{
+  "type": "tool_use",
+  "id": "toolu_01H",
+  "name": "execute",
+  "input": {
+    "code": "compact()"
+  }
+}
+```
+
+The harness runs the compaction script, removes the Compaction work item
+automatically, and the agent continues with the reduced context.
+
+
+### Turn 9
+
+Post-compaction. The old history entries have been replaced with a summary.
+The next timer firing wakes the agent up.
+
+```xml
+<deployment_context>
+Home automation system for 123 Oak Street.
+Cameras: driveway, front_door, backyard.
+Users: steve@example.com (owner).
+Tools: camera_tool, home (see system prompt for API details).
+</deployment_context>
+<event_history>
+<entry id="c4a1">
+summary: Set up driveway cam watch for non-red contractor vans for steve@example.com (chat 81d4). Timer 982a, memory watch_driveway. First camera check: just a bird.
+</entry>
+</event_history>
+<work_queue>
+<work_item id="ee6f">
 priority: 6
-time: 2026-02-01 08:35:59 PST
+time: 2026-02-01 08:36:41 PST
 type: TimerFired
 every: 30s
-description: "Check driveway camera for contractor vans. See memory f73c"
-</work_item id=f02c>
+timer_id: 982a
+description: "Check driveway camera for contractor vans"
+</work_item>
 </work_queue>
 <context>
-Current time: 2026-02-01 08:36:00 PST
-Unique IDs available for memories, timers, etc.: 4d66, 093d, 77cf, 8a3b
-Can delete events starting from: 3a6f
+Current time: 2026-02-01 08:36:41 PST
+Last turn input tokens: 1200
+Compaction threshold: 150000 tokens
 </context>
-<agent_commands>
-```
-
-Claude:
-```python
-# Nothing interesting in that frame, just a bird. No contractor yet.
-history.replace_with_description("d7ea", "Got a picture of a bird from driveway camera")
-work_queue.pop_front()
-```
-
-#### Turn 6
-
-To demonstrate how compaction works in this setting, we'll trigger a mandatory context compaction.
-
-Note that Claude is able to directly manipulate its own context. We require Claude to write a script
-which compacts the entire context at once, so we don't have to repeatedly re-ingest long contexts
-as Claude does gradual cleanup.
-
-```
-{system prompt}
-{deployment-specific context}
-<history id=3a6f>
-time: 2026-02-01 08:35:27 PST
-agent ran:
-  print(work_queue[0].content)
-output:
-  Hello Claude, could you please keep an eye out for
-  any vehicles coming up the driveway today and let me know if
-  you see a contractor van?
-</history id=3a6f>
-<history id=e7a1>
-time: 2026-02-01 08:35:29 PST
-agent ran:
-  memory["f73c"] = """
-  Need to alert Steve (steve@example.com) if a contractor van comes up
-  the driveway on 2026-02-01. chat_id 81d4. Checking recent footage every 30s.
-  """
-  timers.add(
-    Timer(
-      start=datetime.now(),
-      every=timedelta(seconds=30),
-      priority=6,
-      description="Check driveway camera for contractor vans. See memory f73c"
-    )
-  )
-output:
-</history id=e7a1>
-<history id=4481>
-agent ran:
-  work_queue.pop_front()
-  print(work_queue[0].content)
-output:
-  Oh and I forgot to mention, ignore the red van, that's the electrician
-</history id=4481>
-<history id=3881>
-agent ran:
-  memory["f73c"] += " Ignore the red van (electrician)."
-  work_queue.pop_front()
-output:
-</history id=3881>
-<history id=d7ea>
-agent replacement description:
-  Got a picture of a bird from driveway camera
-</history id=d7ea>
-<work_queue>
-<work_item id=373a>
-priority: 10
-time: 2026-02-01 08:36:07 PST
-type: Compaction
-description: "You must compact your context."
-</work_item id=373a>
-</work_queue>
-<context>
-Current time: 2026-02-01 08:36:07 PST
-Unique IDs available for memories, timers, etc.: 4d66, 093d, 77cf, 8a3b
-Can delete any events
-Current context usage: 2000 tokens
-Target context usage: 1000 tokens
-Context usage after running current compaction_script: 1000 tokens
-Agent should modify this `compaction_script` string,
-which will be run as a python script against the current context.
-When the script is good enough to bring us to or below the Target context usage,
-run `compact()`.
-Current compaction_script = """
-# Modify me
-"""
-</context>
-<agent_commands>
-```
-
-Claude:
-
-```python
-compaction_script += """
-for id in ["3a6f", "e7a1", "4481", "3881"]:
-  history.remove(id)
-history.add(
-  "Compacted info about watching driveway cam for " +
-  "non-red contractor vans for steve@example.com. " +
-  "On timer 982a, memory f73c")
-"""
-```
-
-
-#### Turn 7
-
-
-```
-{system prompt}
-{deployment-specific context}
-<history id=3a6f>
-time: 2026-02-01 08:35:27 PST
-agent ran:
-  print(work_queue[0].content)
-output:
-  Hello Claude, could you please keep an eye out for
-  any vehicles coming up the driveway today and let me know if
-  you see a contractor van?
-</history id=3a6f>
-<history id=e7a1>
-time: 2026-02-01 08:35:29 PST
-agent ran:
-  memory["f73c"] = """
-  Need to alert Steve (steve@example.com) if a contractor van comes up
-  the driveway on 2026-02-01. chat_id 81d4. Checking recent footage every 30s.
-  """
-  timers.add(
-    Timer(
-      start=datetime.now(),
-      every=timedelta(seconds=30),
-      priority=6,
-      description="Check driveway camera for contractor vans. See memory f73c"
-    )
-  )
-output:
-</history id=e7a1>
-<history id=4481>
-agent ran:
-  work_queue.pop_front()
-  print(work_queue[0].content)
-output:
-  Oh and I forgot to mention, ignore the red van, that's the electrician
-</history id=4481>
-<history id=3881>
-agent ran:
-  memory["f73c"] += " Ignore the red van (electrician)."
-  work_queue.pop_front()
-output:
-</history id=3881>
-<history id=d7ea>
-agent replacement description:
-  Got a picture of a bird from driveway camera
-</history id=d7ea>
-<work_queue>
-<work_item id=373a>
-priority: 10
-time: 2026-02-01 08:36:07 PST
-type: Compaction
-description: "You must compact your context."
-</work_item id=373a>
-</work_queue>
-<context>
-Current time: 2026-02-01 08:36:08 PST
-Unique IDs available for memories, timers, etc.: 4d66, 093d, 77cf, 8a3b
-Can delete any events
-Current context usage: 2000 tokens
-Target context usage: 1000 tokens
-Context usage after running current compaction_script: 300 tokens
-Agent should modify this `compaction_script` string,
-which will be run as a python script against the current context.
-When the script is good enough to bring us to or below the Target context usage,
-run `compact()`.
-Current compaction_script = """
-# Modify me
-for id in ["3a6f", "e7a1", "4481", "3881"]:
-  history.remove(id)
-history.add(
-  "Compacted info about watching driveway cam for " +
-  "non-red contractor vans for steve@example.com. " +
-  "On timer 982a, memory f73c")
-"""
-</context>
-<agent_commands>
-```
-
-Claude:
-
-```python
-compact()
-```
-
-#### Turn 8
-
-
-```
-{system prompt}
-{deployment-specific context}
-<history id=3a6f>
-time: 2026-02-01 08:35:27 PST
-agent ran:
-  print(work_queue[0].content)
-output:
-  Hello Claude, could you please keep an eye out for
-  any vehicles coming up the driveway today and let me know if
-  you see a contractor van?
-</history id=3a6f>
-<history id=e7a1>
-time: 2026-02-01 08:35:29 PST
-agent ran:
-  memory["f73c"] = """
-  Need to alert Steve (steve@example.com) if a contractor van comes up
-  the driveway on 2026-02-01. chat_id 81d4. Checking recent footage every 30s.
-  """
-  timers.add(
-    Timer(
-      start=datetime.now(),
-      every=timedelta(seconds=30),
-      priority=6,
-      description="Check driveway camera for contractor vans. See memory f73c"
-    )
-  )
-output:
-</history id=e7a1>
-<history id=4481>
-agent ran:
-  work_queue.pop_front()
-  print(work_queue[0].content)
-output:
-  Oh and I forgot to mention, ignore the red van, that's the electrician
-</history id=4481>
-<history id=3881>
-agent ran:
-  memory["f73c"] += " Ignore the red van (electrician)."
-  work_queue.pop_front()
-output:
-</history id=3881>
-<history id=d7ea>
-agent replacement description:
-  Got a picture of a bird from driveway camera
-</history id=d7ea>
-<work_queue>
-<work_item id=373a>
-priority: 10
-time: 2026-02-01 08:36:07 PST
-type: Compaction
-description: "You must compact your context."
-</work_item id=373a>
-</work_queue>
-<context>
-Current time: 2026-02-01 08:36:09 PST
-Unique IDs available for memories, timers, etc.: 4d66, 093d, 77cf, 8a3b
-Can delete any events
-Current context usage: 2000 tokens
-Target context usage: 1000 tokens
-Context usage after running current compaction_script: 300 tokens
-Agent should modify this `compaction_script` string,
-which will be run as a python script against the current context.
-When the script is good enough to bring us to or below the Target context usage,
-run `compact()`.
-Current compaction_script = """
-# Modify me
-for id in ["3a6f", "e7a1", "4481", "3881"]:
-  history.remove(id)
-history.add(
-  "Compacted info about watching driveway cam for " +
-  "non-red contractor vans for steve@example.com. " +
-  "On timer 982a, memory f73c")
-"""
-</context>
-<agent_commands>
-```
-
-Claude:
-
-```python
-compact()
-```
-
-
-#### Turn 9
-
-Note that the agent didn't remove the compaction item from its work queue. It would have been permitted to do so,
-but it neglected to. We're allowed to do our own modifications to the work queue after the agent does its own,
-so we can remove it after the compact.
-
-```
-{system prompt}
-{deployment-specific context}
-<history id=3a6f>
-agent description:
-  Compacted info about watching driveway cam for non-red contractor vans for steve@example.com. On timer 982a, memory f73c
-</history id=d7ea>
-<work_queue>
-<work_item id=ee6f>
-priority: 6
-time: 2026-02-01 08:36:29 PST
-type: TimerFired
-every: 30s
-description: "Check driveway camera for contractor vans. See memory f73c"
-</work_item id=ee6f>
-</work_queue>
-<context>
-Current time: 2026-02-01 08:36:29 PST
-Unique IDs available for memories, timers, etc.: 4d66, 093d, 77cf, 8a3b
-</context>
-<agent_commands>
 ```
 
 And the cycle continues.
 
 
-## Implementation details
+## Implementation Details
 
+### Compaction
 
-### Queue Sorting
+When the harness detects that `input_tokens` exceeds 80% of the compaction threshold,
+it inserts a `Compaction` work item at priority 10 (highest).
 
-Queue is sorted first by priority (ranging from 0-10, with 10 reserved for system events like compaction) and then by time (ascending).
+During compaction, the context metadata includes additional fields showing the
+current `compaction_script` (initially empty), the estimated token savings from
+running it, and the target usage. Claude builds up the script incrementally,
+checking estimated savings each turn, and calls `compact()` when satisfied.
 
+**Compaction rules:**
+
+- Claude can remove or replace any history entry during compaction
+- Memory survives compaction (it's separate from history)
+- Timer state survives compaction
+- The compaction script runs against the current context state
+- If the script crashes, the error is shown and Claude can fix it
+- The harness auto-removes the Compaction work item on success
+- Compaction is atomic: either the full script succeeds or nothing changes
+
+**Why script-based compaction:** We require Claude to compact everything in a
+single script execution rather than doing gradual cleanup, because each change
+to older history entries invalidates the prompt cache prefix. By doing it all
+at once, we only pay for one cache miss instead of many.
 
 ### Ensuring Context Fit
 
 Every history item has a maximum character and line length it will display before truncating.
 Claude can extract bits of larger messages across multiple history events.
 
-The work queue will only show a maximum number of items at once. Each item has a maximum character and line length before truncation
-of the work queue preview. The first few events get a longer preview, reducing the probability that the agent has to perform a python query
+The work queue will only show a maximum number of items at once. Each item has a maximum
+character and line length before truncation of the work queue preview. The first few events
+get a longer preview, reducing the probability that the agent has to perform a Python query
 to examine the top-priority events.
 
-Because Claude can manipulate the Work Queue in python, if something happens e.g. resulting in Claude getting thousands of spam messages,
-it can figure out the format of the spam from a few visible examples and write a filter removing the spam from the work queue automatically.
-We can even allow Claude to register e.g. filter regexes agains the work queue that filter out spam before they ever have a chance to displace other
-things from the queue.
+Because Claude can manipulate the work queue in Python, if something happens resulting in
+Claude getting thousands of spam messages, it can figure out the format of the spam from
+a few visible examples and write a filter removing the spam from the work queue automatically.
 
-### Compaction
+### Queue Sorting
 
-Claude can delete stuff from its very recent event history, but we don't let it delete substantially older stuff arbitrarily because it would
-create a new conversation prefix that wouldn't be cached.
+Sorted first by priority (0-10, descending) then by time (ascending).
+Priority 10 is reserved for system events.
 
-Claude can delete whatever it wants, as far back as it wants, during compaction, but it has to do it all in one shot with a script.
-We can run the script against the context and tell Claude "this saved X tokens" or "this crashed" or whatever, because that's cheap,
-but we only want to actually re-ingest the trimmed context once.
+### Background Processes
 
-### Background commands.
+```python
+pid = shell_exec(
+    cmd="long_running_task",
+    args=["--flag"],
+    alert_timer=timedelta(minutes=5),
+    success_prio=5,
+    fail_prio=7
+)
+```
 
-Claude has a function `shell_exec(cmd : str, args : list[str], env: dict[str,str], alert_timer: timedelta, success_prio : Priority, fail_prio : Priority) -> pid`.
+- `alert_timer`: If the process is still running after this duration, a `ProcessTimeout`
+  work item is added at the process's `fail_prio`, alerting Claude to check on it.
+- When the process completes, a `ProcessCompleted` item is added at `success_prio`.
+- When the process fails, a `ProcessFailed` item is added at `fail_prio`.
 
-It can use this to kick off background tasks. It has to specify an alert_timer duration, where if the command is still running
-after that duration, the timer fires, alerting claude to check the command. If the command finishes or fails, an alert gets placed in the
-work queue at the specified `success_prio` or `fail_prio`.
+### Concurrent Modifications
 
-Claude has various functions to inspect and modify processes using their `pid`.
+Claude's Python execution receives a snapshot of the work queue as it was when
+the context was rendered. If new events arrive during Claude's turn, they are
+applied to the authoritative state after Claude's modifications are processed.
+This prevents Claude from accidentally operating on items it hasn't seen.
 
 ### Item IDs
 
-In our Rust harness, we can identify items (e.g. history events) however we like (UUID, ordinal index, whatever).
+The harness internally uses whatever ID scheme it likes (UUIDs, counters, etc.).
+For the agent, all IDs are short hex strings (e.g. `3a6f`, `982a`) assigned by
+the harness at creation time. Functions that create new objects (timers.add,
+shell_exec, etc.) return the harness-assigned ID.
 
-However, for the agent, we always give it short-form IDs that it can easily write out. This mapping should be stable such that
-when we re-render the context every time we invoke the agent, the generated prompt prefixes are stable. In fact, we should probably
-never change event IDs so that if the agent references an event ID in a text document or something (outside of the management of the harness),
-that reference is stable. We probably don't want to expose an incrementing counter to the agent, because that makes substitution errors too easy,
-but maybe we generate 40-bit bitcoin-style word-based IDs or something, so the agent sees IDs like "moon-banana-rock-super", with some
-kind of bijective shuffle applied to the underlying integer counter or something, so the names are random-looking to the agent.
+IDs are stable: once assigned, an ID never changes. IDs are generated from an
+internal counter with a bijective shuffle applied, so they appear random to the
+agent (preventing off-by-one or sequential substitution errors).
 
-TODO: get rid of the `Unique IDs available` thing and replace it with a `gen_unique_id()` function.
+### Error Handling
 
-### Timers
+If Claude's Python script raises an exception, the traceback is recorded in event
+history like any other execution output. Claude sees it on the next turn and can
+decide how to handle it.
 
-Claude can interact with timers via a `timers` object available in its interpreter.
+```xml
+<entry id="b1c2">
+time: 2026-02-01 09:12:03 PST
+code:
+  prnt(work_queue[0].content)
+output: [ERROR]
+  Traceback (most recent call last):
+    File "<agent>", line 1, in <module>
+  NameError: name 'prnt' is not defined
+</entry>
+```
 
-## Questions
 
-### Should we put an event in the history log when e.g. the top priority task changes out from under Claude?
+## Open Design Questions
 
-### How do we want Claude to be able to customize its interpreter environment? Pip commands?
+### Priority change notifications
+Should we put an event in the history log when the top priority task changes
+out from under Claude? (E.g. a priority-9 user message arrives while Claude is
+working on a priority-6 timer check.)
+
+### Interpreter customization
+How should Claude be able to customize its interpreter environment?
+Options: pip install support, pre-loaded deployment-specific packages,
+or a fixed set of standard library only.
+
+### Image handling
+How are images (e.g. camera frames from `show_in_context()`) embedded in the
+API call? They would be `image` content blocks in the user message, which
+costs tokens. Need to decide on resolution limits, max images per turn, etc.
