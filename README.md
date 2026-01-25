@@ -170,24 +170,29 @@ IDs never change once assigned, so the agent can reference them in memories or d
 History entries are truncated at a maximum character/line length for display.
 Claude can retrieve full content by printing it in a script (e.g. `print(history["3a6f"].full_output)`).
 
-Claude can manipulate recent history entries (replace with descriptions, delete)
-to manage context size. Older entries can only be modified during compaction.
+Claude can replace or delete its most recent history entries (typically the last ~5)
+to manage context size. The context metadata tells Claude which entries are within
+the modification window (e.g. "Can modify entries from: a3f1"). Older entries
+can only be modified during compaction — Claude doesn't need to aggressively
+clean up old history, since compaction provides a dedicated opportunity for that.
 
 ### Work Queue
 
 A priority-ordered queue of tasks. Priority ranges from 0-10, with 10 reserved
 for system events (compaction). Within the same priority, items are sorted by time (ascending).
 
-Work item types:
+Work item types (each has different fields):
 
-| Type | Description | Typical Priority |
+**All items share:** `id` (hex), `priority` (0-10), `time` (timestamp), `type` (string)
+
+| Type | Extra Fields | Typical Priority |
 |------|-------------|-----------------|
-| `UserMessage` | Message from a user | 9 |
-| `TimerFired` | A recurring or one-shot timer fired | Set by Claude |
-| `ProcessCompleted` | A background shell command finished | Set by Claude |
-| `ProcessFailed` | A background shell command failed | Set by Claude |
-| `ProcessTimeout` | A background command exceeded its alert_timer | Set by Claude |
-| `Compaction` | System-triggered context compaction | 10 |
+| `UserMessage` | `chat_id`, `user`, `content` | 9 |
+| `TimerFired` | `timer_id`, `every` (interval or None), `description` | Set by Claude |
+| `ProcessCompleted` | `pid`, `exit_code` | Set by Claude |
+| `ProcessFailed` | `pid`, `error` | Set by Claude |
+| `ProcessTimeout` | `pid` | Set by Claude |
+| `Compaction` | `description` | 10 |
 
 The work queue display is truncated to fit in context:
 - First 3 items: up to 500 chars each
@@ -205,8 +210,14 @@ A short block of current state:
 Current time: 2026-02-01 08:35:26 PST
 Last turn input tokens: 14832
 Compaction threshold: 150000 tokens
+Can modify entries from: a3f1
 </context>
 ```
+
+The "Can modify entries from" field tells Claude which history entries are
+within the modification window (typically the most recent ~5). Entries at
+or after this ID can be replaced or removed. Older entries are read-only
+until compaction.
 
 During compaction, additional fields appear (see Compaction section).
 
@@ -220,6 +231,12 @@ pre-defined objects, runs Claude's script, then deserializes the modified state 
 Side effects (sending messages, starting processes) execute immediately during
 script execution.
 
+**Non-blocking rule:** All Python scripts must execute within a few milliseconds.
+The agent has no access to blocking operations (no sleep, no waiting on I/O,
+no blocking on network requests). All long-lived operations are managed
+asynchronously through the work queue: start a process with `shell_exec()`,
+set a timer, and handle the result when it arrives as a work queue item.
+
 ### Available Objects and Functions
 
 #### Work Queue
@@ -227,25 +244,48 @@ script execution.
 ```python
 work_queue: WorkQueue
 
-# Indexing
-work_queue[0]              # First (highest priority) item
-work_queue[0].content      # Full content of the item
-work_queue[0].id           # Item's hex ID
-work_queue[0].priority     # Priority (0-10)
-work_queue[0].type         # "UserMessage", "TimerFired", etc.
-work_queue[0].time         # Timestamp string
-work_queue[0].chat_id      # For UserMessage: the conversation ID
-work_queue[0].user         # For UserMessage: the sender
-work_queue[0].timer_id     # For TimerFired: the timer's ID
-work_queue[0].pid          # For Process*: the process ID
+# All items share these fields:
+item = work_queue[0]       # First (highest priority) item
+item.id                    # Hex ID (e.g. "3a6f")
+item.priority              # 0-10
+item.time                  # Timestamp string
+item.type                  # "UserMessage", "TimerFired", etc.
+```
 
-# Manipulation
+Different item types have different fields:
+
+```python
+# UserMessage
+item.chat_id               # Conversation ID — use this to reply
+item.user                  # Sender email (e.g. "steve@example.com")
+item.content               # Message text (may be truncated in rendered view)
+
+# TimerFired
+item.timer_id              # Hex ID of the timer that fired
+item.every                 # Interval string (e.g. "30s") or None for one-shot
+item.description           # Description from when the timer was created
+
+# ProcessCompleted
+item.pid                   # Hex ID of the process
+item.exit_code             # Exit code (0 = success)
+
+# ProcessFailed
+item.pid                   # Hex ID of the process
+item.error                 # Error message string
+
+# ProcessTimeout
+item.pid                   # Hex ID of the process
+
+# Compaction
+item.description           # "You must compact your context."
+```
+
+Queue operations:
+
+```python
 work_queue.pop_front()     # Remove highest-priority item
 work_queue.remove(id)      # Remove item by ID
 len(work_queue)            # Number of items
-
-# Filtering (returns new WorkQueue, does not modify original)
-work_queue.filter(lambda item: item.type != "TimerFired")
 
 # Persistent filters (applied to incoming items before they enter the queue)
 work_queue.add_filter(name="spam_filter", regex=r"^spam:.*")
@@ -324,8 +364,12 @@ send_image(chat_id="81d4", image=frame_data, caption="Driveway camera")
 
 #### Process Management
 
+All process operations are non-blocking. `shell_exec` starts a process and
+immediately returns a hex ID string. The agent cannot wait on or interact with
+the process in the same script — results arrive asynchronously via work queue items.
+
 ```python
-# Start a background process
+# Start a background process (returns immediately with a hex ID string)
 pid = shell_exec(
     cmd="ffmpeg",
     args=["-i", "input.mp4", "-vf", "scale=640:480", "output.mp4"],
@@ -334,8 +378,10 @@ pid = shell_exec(
     success_prio=5,                     # Work queue priority on success
     fail_prio=7                         # Work queue priority on failure
 )
+# pid is just a string like "4d66" — store it in memory if needed
+memory["ffmpeg_job"] = pid
 
-# Inspect processes
+# These can be called on FUTURE turns to check on a process:
 shell_status(pid)        # Returns: "running", "completed", "failed"
 shell_output(pid)        # Returns recent stdout/stderr (last 100 lines)
 shell_kill(pid)          # Kill the process
@@ -711,6 +757,7 @@ description: "Check driveway camera for contractor vans"
 Current time: 2026-02-01 08:36:12 PST
 Last turn input tokens: 2100
 Compaction threshold: 150000 tokens
+Can modify entries from: 3a6f
 </context>
 ```
 
@@ -804,6 +851,7 @@ output:
 Current time: 2026-02-01 08:36:14 PST
 Last turn input tokens: 3500
 Compaction threshold: 150000 tokens
+Can modify entries from: 3881
 </context>
 ```
 
@@ -1069,6 +1117,13 @@ And the cycle continues.
 
 
 ## Implementation Details
+
+### Persistence
+
+The work queue, event history, memory, timers, and process state are persisted
+to a SQLite database. If the daemon restarts (crash, reboot, deploy), it loads
+state from SQLite and picks up where it left off. Any recurring timers that
+should have fired during downtime are caught up on restart.
 
 ### Compaction
 
