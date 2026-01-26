@@ -15,8 +15,10 @@ pub struct Config {
     pub system_prompt_path: PathBuf,
     pub deployment_context_path: Option<PathBuf>,
     pub listen_addr: SocketAddr,
-    pub compaction_ratio: f64,
-    pub compaction_target_ratio: f64,
+    /// Compaction triggers when input_tokens exceeds this value
+    pub compact_at: u64,
+    /// Target token count after compaction
+    pub compact_target: u64,
     pub render_config: RenderConfig,
 }
 
@@ -35,12 +37,12 @@ impl Config {
         let api_base_url = std::env::var("CLAUDE_SERVER_API_URL")
             .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
 
-        let max_tokens = std::env::var("CLAUDE_SERVER_MAX_TOKENS")
+        let max_tokens: u64 = std::env::var("CLAUDE_SERVER_MAX_TOKENS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(16384);
 
-        let context_window = std::env::var("CLAUDE_SERVER_CONTEXT_WINDOW")
+        let context_window: u64 = std::env::var("CLAUDE_SERVER_CONTEXT_WINDOW")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(200_000);
@@ -62,6 +64,17 @@ impl Config {
             .parse()
             .context("Invalid listen address")?;
 
+        let available = context_window.saturating_sub(max_tokens);
+        let compact_at = std::env::var("CLAUDE_SERVER_COMPACT_AT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| (available as f64 * 0.8) as u64);
+
+        let compact_target = std::env::var("CLAUDE_SERVER_COMPACT_TARGET")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| (available as f64 * 0.5) as u64);
+
         Ok(Self {
             model,
             api_key,
@@ -72,20 +85,10 @@ impl Config {
             system_prompt_path,
             deployment_context_path,
             listen_addr,
-            compaction_ratio: 0.8,
-            compaction_target_ratio: 0.5,
+            compact_at,
+            compact_target,
             render_config: RenderConfig::default(),
         })
-    }
-
-    pub fn compaction_threshold(&self) -> u64 {
-        let available = self.context_window.saturating_sub(self.max_tokens);
-        (available as f64 * self.compaction_ratio) as u64
-    }
-
-    pub fn compaction_target(&self) -> u64 {
-        let available = self.context_window.saturating_sub(self.max_tokens);
-        (available as f64 * self.compaction_target_ratio) as u64
     }
 
     pub fn load_system_prompt(&self) -> Result<String> {

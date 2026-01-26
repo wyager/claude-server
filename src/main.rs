@@ -56,6 +56,7 @@ async fn run_daemon(dump_turns: bool) -> Result<()> {
     println!("  Model: {}", config.model);
     println!("  Listen: {}", config.listen_addr);
     println!("  DB: {:?}", config.db_path);
+    println!("  Compact at: {} tokens, target: {} tokens", config.compact_at, config.compact_target);
 
     // Initialize Python
     python::initialize_python();

@@ -76,11 +76,12 @@ impl CoreLoop {
 
             // Check if compaction needed
             if !self.compaction.active
-                && CompactionManager::should_trigger(&self.state, self.config.compaction_ratio)
+                && CompactionManager::should_trigger(&self.state, self.config.compact_at)
             {
-                println!("[core] Triggering compaction");
+                println!("[core] Triggering compaction (input_tokens {} > threshold {})",
+                    self.state.last_input_tokens, self.config.compact_at);
                 self.compaction
-                    .trigger(&mut self.state, self.config.compaction_target_ratio);
+                    .trigger(&mut self.state, self.config.compact_target);
             }
 
             // If work queue is empty, block until an event arrives or a timer fires
@@ -162,6 +163,7 @@ impl CoreLoop {
             &self.deployment_context,
             compaction_state.as_ref(),
             &self.config.render_config,
+            self.config.compact_at,
         );
 
         println!(

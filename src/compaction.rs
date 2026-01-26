@@ -17,19 +17,15 @@ impl CompactionManager {
     }
 
     /// Check if compaction should be triggered.
-    pub fn should_trigger(state: &HarnessState, compaction_ratio: f64) -> bool {
-        let available = state.context_window.saturating_sub(state.max_tokens);
-        let threshold = (available as f64 * compaction_ratio) as u64;
-        state.last_input_tokens > threshold
+    pub fn should_trigger(state: &HarnessState, compact_at: u64) -> bool {
+        state.last_input_tokens > compact_at
     }
 
     /// Insert a Compaction work item and activate compaction mode.
-    pub fn trigger(&mut self, state: &mut HarnessState, target_ratio: f64) {
+    pub fn trigger(&mut self, state: &mut HarnessState, compact_target: u64) {
         self.active = true;
         self.script.clear();
-
-        let available = state.context_window.saturating_sub(state.max_tokens);
-        self.target_usage = (available as f64 * target_ratio) as u64;
+        self.target_usage = compact_target;
 
         let id = state.id_generator.next();
         state.work_queue.push(WorkItem {
@@ -51,7 +47,8 @@ impl CompactionManager {
         // Clone state and simulate the compaction
         // For MVP, just estimate based on the current rendered size minus
         // a rough estimate of what the script would remove
-        let rendered = renderer::render_context(state, deployment_context, None, config);
+        // Use a large threshold since we're just estimating size, not displaying it
+        let rendered = renderer::render_context(state, deployment_context, None, config, u64::MAX);
         (rendered.text.len() as u64) / 4
     }
 

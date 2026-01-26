@@ -22,6 +22,7 @@ pub fn render_context(
     deployment_context: &str,
     compaction: Option<&CompactionState>,
     config: &RenderConfig,
+    compact_at: u64,
 ) -> RenderedContext {
     let mut out = String::with_capacity(8192);
 
@@ -35,7 +36,7 @@ pub fn render_context(
     render_work_queue(&mut out, &state.work_queue, config);
 
     // Context metadata
-    render_context_metadata(&mut out, state, compaction);
+    render_context_metadata(&mut out, state, compaction, compact_at);
 
     RenderedContext { text: out }
 }
@@ -187,6 +188,7 @@ fn render_context_metadata(
     out: &mut String,
     state: &HarnessState,
     compaction: Option<&CompactionState>,
+    compact_at: u64,
 ) {
     out.push_str("<context>\n");
 
@@ -200,8 +202,6 @@ fn render_context_metadata(
         state.last_input_tokens
     ));
 
-    let threshold = state.context_window.saturating_sub(state.max_tokens);
-    let compact_at = (threshold as f64 * 0.8) as u64;
     out.push_str(&format!("Compaction threshold: {} tokens\n", compact_at));
 
     // Modification boundary
@@ -332,7 +332,7 @@ mod tests {
     fn test_render_produces_expected_structure() {
         let state = make_test_state();
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "Test deployment.", None, &config);
+        let rendered = render_context(&state, "Test deployment.", None, &config, 150_000);
 
         assert!(rendered.text.contains("<deployment_context>"));
         assert!(rendered.text.contains("Test deployment."));
@@ -359,7 +359,7 @@ mod tests {
     fn test_render_empty_state() {
         let state = HarnessState::new(200_000, 16384);
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config);
+        let rendered = render_context(&state, "", None, &config, 150_000);
 
         assert!(rendered.text.contains("<deployment_context>\n</deployment_context>"));
         assert!(rendered.text.contains("<event_history>\n</event_history>"));
@@ -376,7 +376,7 @@ mod tests {
             compaction_script: String::new(),
             estimated_post_compaction: 142000,
         };
-        let rendered = render_context(&state, "", Some(&compaction), &config);
+        let rendered = render_context(&state, "", Some(&compaction), &config, 150_000);
 
         assert!(rendered.text.contains("COMPACTION MODE:"));
         assert!(rendered.text.contains("Current usage: 142000 tokens"));
