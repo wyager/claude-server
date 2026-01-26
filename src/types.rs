@@ -502,7 +502,7 @@ impl ProcessManager {
 
 // ---- Memory ----
 
-pub type Memory = HashMap<String, String>;
+pub type Memory = HashMap<String, serde_json::Value>;
 
 // ---- Harness State ----
 

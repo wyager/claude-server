@@ -31,7 +31,7 @@ fn extract_seconds(val: &Bound<'_, PyAny>) -> PyResult<f64> {
 #[derive(Debug, Default)]
 pub struct SideEffectCollector {
     pub id_gen: IdGenerator,
-    pub memory_sets: Vec<(String, String)>,
+    pub memory_sets: Vec<(String, serde_json::Value)>,
     pub memory_deletes: Vec<String>,
     pub queue_removes: Vec<String>,
     pub timer_adds: Vec<TimerAddRequest>,
@@ -328,41 +328,58 @@ impl PyWorkQueue {
 
 #[pyclass]
 struct PyMemory {
-    data: HashMap<String, String>,
+    data: HashMap<String, serde_json::Value>,
     collector: Collector,
+}
+
+impl PyMemory {
+    /// Convert a serde_json::Value back to a Python object via json.loads
+    fn value_to_py<'py>(py: Python<'py>, value: &serde_json::Value) -> PyResult<PyObject> {
+        let json_str = serde_json::to_string(value).unwrap();
+        let json_mod = py.import("json")?;
+        Ok(json_mod.call_method1("loads", (json_str,))?.unbind())
+    }
+
+    /// Convert a Python object to serde_json::Value via json.dumps
+    fn py_to_value<'py>(py: Python<'py>, value: &Bound<'py, PyAny>) -> PyResult<serde_json::Value> {
+        let json_mod = py.import("json")?;
+        let json_str: String = json_mod.call_method1("dumps", (value,))?.extract()?;
+        serde_json::from_str(&json_str)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("cannot serialize: {}", e)))
+    }
 }
 
 #[pymethods]
 impl PyMemory {
-    fn __getitem__(&self, key: &str) -> PyResult<String> {
-        self.data
-            .get(key)
-            .cloned()
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))
+    fn __getitem__<'py>(&self, py: Python<'py>, key: &str) -> PyResult<PyObject> {
+        let value = self.data.get(key)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))?;
+        Self::value_to_py(py, value)
     }
 
-    fn __setitem__(&mut self, key: String, value: String) -> PyResult<()> {
-        self.data.insert(key.clone(), value.clone());
-        self.collector
-            .lock()
-            .unwrap()
-            .memory_sets
-            .push((key, value));
+    fn __setitem__<'py>(&mut self, py: Python<'py>, key: String, value: &Bound<'py, PyAny>) -> PyResult<()> {
+        let serde_val = Self::py_to_value(py, value)?;
+        self.data.insert(key.clone(), serde_val.clone());
+        self.collector.lock().unwrap().memory_sets.push((key, serde_val));
         Ok(())
     }
 
     fn __delitem__(&mut self, key: &str) -> PyResult<()> {
         self.data.remove(key);
-        self.collector
-            .lock()
-            .unwrap()
-            .memory_deletes
-            .push(key.to_string());
+        self.collector.lock().unwrap().memory_deletes.push(key.to_string());
         Ok(())
     }
 
     fn __contains__(&self, key: &str) -> bool {
         self.data.contains_key(key)
+    }
+
+    #[pyo3(signature = (key, default=None))]
+    fn get<'py>(&self, py: Python<'py>, key: &str, default: Option<PyObject>) -> PyResult<PyObject> {
+        match self.data.get(key) {
+            Some(value) => Self::value_to_py(py, value),
+            None => Ok(default.unwrap_or_else(|| py.None().into())),
+        }
     }
 
     fn __repr__(&self) -> String {
@@ -844,7 +861,7 @@ mod tests {
     fn test_memory_operations() {
         init();
         let mut state = HarnessState::new(200_000, 16384);
-        state.memory.insert("key1".to_string(), "val1".to_string());
+        state.memory.insert("key1".to_string(), serde_json::json!("val1"));
 
         let result = execute(
             &state,
@@ -860,7 +877,43 @@ print("ok")
         assert_eq!(result.stdout.trim(), "ok");
         assert_eq!(result.side_effects.memory_sets.len(), 1);
         assert_eq!(result.side_effects.memory_sets[0].0, "key2");
-        assert_eq!(result.side_effects.memory_sets[0].1, "val2");
+        assert_eq!(result.side_effects.memory_sets[0].1, serde_json::json!("val2"));
+    }
+
+    #[test]
+    fn test_memory_structured_values() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        let result = execute(
+            &state,
+            r#"
+# Store various types
+memory["s"] = "hello"
+memory["n"] = 42
+memory["d"] = {"pid": "abc", "chat_id": "xyz"}
+memory["l"] = ["a", "b", "c"]
+memory["b"] = True
+
+# Read them back and verify types
+assert memory["s"] == "hello"
+assert memory["n"] == 42
+assert memory["d"]["pid"] == "abc"
+assert memory["l"][1] == "b"
+assert memory["b"] == True
+
+# Test .get()
+assert memory.get("s") == "hello"
+assert memory.get("missing") is None
+assert memory.get("missing", "fallback") == "fallback"
+
+print("all passed")
+"#,
+            false,
+            &HashMap::new(),
+        );
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert_eq!(result.stdout.trim(), "all passed");
+        assert_eq!(result.side_effects.memory_sets.len(), 5);
     }
 
     #[test]

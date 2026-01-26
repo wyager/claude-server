@@ -95,13 +95,21 @@ Content fields may be truncated in the rendered view. Use `print(work_queue[i].c
 
 ### memory
 
-A persistent key-value store that survives across turns and compaction. Use it for anything that must not be lost.
+A persistent key-value store that survives across turns and compaction. Use it for
+anything that must not be lost. Keys are strings. Values can be any JSON-serializable
+type: strings, numbers, booleans, lists, or dicts. Values are preserved exactly as
+stored — a dict comes back as a dict, a string comes back as a string.
 
 ```python
-memory["key"] = "value"
-print(memory["key"])
-del memory["key"]
-"key" in memory
+memory["name"] = "Steve"                   # string
+memory["count"] = 42                       # number
+memory["prefs"] = {"theme": "dark"}        # dict
+memory["tags"] = ["urgent", "home"]        # list
+print(memory["prefs"]["theme"])            # "dark"
+print(memory.get("missing"))              # None
+print(memory.get("missing", "fallback"))  # "fallback"
+del memory["name"]
+"count" in memory                          # True
 ```
 
 ### timers
