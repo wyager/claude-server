@@ -11,7 +11,7 @@ Instead, we provide the agent with:
 
 * An event history
 * A work queue
-* Misc tools like a memory system, async shell commands, etc.
+* Misc tools like a memory system, async shell commands, sending/receiving DMs, etc.
 
 and it interacts with *all of* those systems *entirely* through python scripting.
 
