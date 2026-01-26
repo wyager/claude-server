@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+
+use crate::python;
 use crate::renderer;
 use crate::types::*;
 
@@ -37,18 +40,48 @@ impl CompactionManager {
     }
 
     /// Estimate token usage after running the compaction script.
-    /// Uses a char-based estimate (chars / 4 ≈ tokens).
+    /// Dry-runs the script against a cloned state, applies history side effects,
+    /// re-renders, and estimates tokens as chars/4.
     pub fn estimate_post_compaction(
         &self,
         state: &HarnessState,
         deployment_context: &str,
         config: &RenderConfig,
+        compact_at: u64,
     ) -> u64 {
-        // Clone state and simulate the compaction
-        // For MVP, just estimate based on the current rendered size minus
-        // a rough estimate of what the script would remove
-        // Use a large threshold since we're just estimating size, not displaying it
-        let rendered = renderer::render_context(state, deployment_context, None, config, u64::MAX);
+        if self.script.is_empty() {
+            let rendered =
+                renderer::render_context(state, deployment_context, None, config, compact_at);
+            return (rendered.text.len() as u64) / 4;
+        }
+
+        // Clone state and dry-run the compaction script
+        let mut clone = state.clone();
+        let result = python::execute(&clone, &self.script, true, &HashMap::new());
+
+        if !result.is_error {
+            // Apply history side effects to the clone
+            for id in result.side_effects.history_removes {
+                clone.event_history.remove(&AgentId(id));
+            }
+            for (id, desc) in result.side_effects.history_replaces {
+                clone
+                    .event_history
+                    .replace_with_summary(&AgentId(id), desc);
+            }
+            for text in result.side_effects.history_adds {
+                let id = clone.id_generator.next();
+                clone.event_history.push(HistoryEntry::Summary {
+                    id,
+                    time: chrono::Utc::now(),
+                    description: text,
+                });
+            }
+        }
+
+        // Re-render and estimate
+        let rendered =
+            renderer::render_context(&clone, deployment_context, None, config, compact_at);
         (rendered.text.len() as u64) / 4
     }
 
@@ -58,7 +91,7 @@ impl CompactionManager {
             current_usage,
             target_usage: self.target_usage,
             compaction_script: self.script.clone(),
-            estimated_post_compaction: current_usage, // Will be updated by estimate
+            estimated_post_compaction: current_usage,
         }
     }
 

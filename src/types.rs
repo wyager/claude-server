@@ -110,7 +110,7 @@ pub struct QueueFilter {
     pub regex: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkQueue {
     /// Sorted by (priority DESC, time ASC)
     items: Vec<WorkItem>,
@@ -235,7 +235,7 @@ impl HistoryEntry {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventHistory {
     entries: Vec<HistoryEntry>,
     /// Number of recent entries the agent can modify (replace/delete).
@@ -321,7 +321,7 @@ pub enum TimerSchedule {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimerManager {
     timers: Vec<Timer>,
 }
@@ -428,7 +428,7 @@ pub enum ProcessStatus {
     Failed { error: String },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagedProcess {
     pub id: AgentId,
     pub cmd: String,
@@ -443,7 +443,7 @@ pub struct ManagedProcess {
     pub os_pid: Option<u32>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessManager {
     processes: Vec<ManagedProcess>,
 }
@@ -508,7 +508,7 @@ pub type Memory = HashMap<String, serde_json::Value>;
 
 /// The complete state of the harness, minus deployment-specific config.
 /// Persisted to SQLite so the daemon can restart and pick up where it left off.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HarnessState {
     pub work_queue: WorkQueue,
     pub event_history: EventHistory,

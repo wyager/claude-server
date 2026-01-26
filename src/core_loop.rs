@@ -151,6 +151,7 @@ impl CoreLoop {
                 &self.state,
                 &self.deployment_context,
                 &self.config.render_config,
+                self.config.compact_at,
             );
             Some(cs)
         } else {
