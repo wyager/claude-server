@@ -187,11 +187,35 @@ to run, with no risk of Claude including explanation text, closing code fences e
 
 ### Prompt Caching
 
-The system prompt has `cache_control: { "type": "ephemeral" }` applied.
-Since the system prompt is identical across turns, this gives automatic caching on every call.
+The context is deliberately structured so that the bulk of each API call is a
+stable, cacheable prefix that grows monotonically over the agent's lifetime.
 
-The rendered context (the user message) changes each turn, but the top of it
-(deployment-specific context) is stable and may benefit from prefix caching.
+**System prompt**: Has `cache_control: { "type": "ephemeral" }` applied. Identical
+across all turns, so it's always a cache hit after the first call.
+
+**User message** (the rendered context): Structured as:
+
+```
+<deployment_context>STABLE — never changes</deployment_context>
+<event_history>
+  <entry ...>FROZEN — old entries never change</entry>
+  <entry ...>FROZEN</entry>
+  ... hundreds of frozen entries over time ...
+  <entry ...>modifiable (last ~5 entries)</entry>
+</event_history>
+<work_queue>changes every turn</work_queue>
+<context>changes every turn</context>
+```
+
+The deployment context and all history entries outside the modification window
+(the most recent ~5) form an immutable, monotonically growing prefix. New entries
+are appended and eventually age out of the modification window, at which point
+they become permanently frozen. The API caches this entire prefix, so each turn
+only pays for the new tail (recent history + work queue + metadata).
+
+The only event that disrupts the cache prefix is **compaction**, which rewrites
+old history entries. This is why compaction is done in a single atomic script
+rather than incrementally — one cache miss instead of many.
 
 ### Token Usage Tracking
 
