@@ -127,6 +127,14 @@ async fn run_daemon(dump_turns: bool) -> Result<()> {
         }
     });
 
+    // Graceful shutdown on Ctrl+C
+    let event_tx_for_signal = event_tx.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        println!("\n[signal] Ctrl+C received, shutting down...");
+        let _ = event_tx_for_signal.send(core_loop::HarnessEvent::Shutdown);
+    });
+
     // Start HTTP server
     let router = http_server::create_router(event_tx.clone(), database.clone());
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;

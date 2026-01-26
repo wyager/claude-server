@@ -369,8 +369,13 @@ impl CoreLoop {
                         + chrono::Duration::from_std(Duration::from_secs(secs))
                             .unwrap_or(chrono::Duration::seconds(1)),
                 }
+            } else if let Some(epoch) = req.at_epoch {
+                // One-shot at a specific time
+                let at = chrono::DateTime::from_timestamp(epoch as i64, 0)
+                    .unwrap_or_else(|| Utc::now() + chrono::Duration::minutes(1));
+                TimerSchedule::OneShot { at }
             } else {
-                // One-shot: parse timestamp or default to 1 min from now
+                // No schedule specified — default to 1 min from now
                 let at = Utc::now() + chrono::Duration::minutes(1);
                 TimerSchedule::OneShot { at }
             };

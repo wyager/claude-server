@@ -53,7 +53,8 @@ pub struct SideEffectCollector {
 pub struct TimerAddRequest {
     pub id: AgentId,
     pub every_secs: Option<u64>,
-    pub at_timestamp: Option<String>,
+    /// Epoch seconds for one-shot timers (from datetime objects or numeric timestamps)
+    pub at_epoch: Option<f64>,
     pub priority: u8,
     pub description: String,
 }
@@ -381,12 +382,27 @@ impl PyTimerManager {
     fn add<'py>(
         &self,
         every: Option<&Bound<'py, PyAny>>,
-        at: Option<String>,
+        at: Option<&Bound<'py, PyAny>>,
         priority: u8,
         description: String,
     ) -> PyResult<String> {
         let every_secs = match every {
             Some(val) => Some(extract_seconds(val)? as u64),
+            None => None,
+        };
+        // Extract epoch seconds from datetime objects or numeric timestamps
+        let at_epoch = match at {
+            Some(val) => {
+                if let Ok(ts) = val.call_method0("timestamp") {
+                    Some(ts.extract::<f64>()?)
+                } else if let Ok(f) = val.extract::<f64>() {
+                    Some(f)
+                } else {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(
+                        "expected a datetime object or numeric epoch for 'at'",
+                    ));
+                }
+            }
             None => None,
         };
         let mut col = self.collector.lock().unwrap();
@@ -395,7 +411,7 @@ impl PyTimerManager {
         col.timer_adds.push(TimerAddRequest {
             id,
             every_secs,
-            at_timestamp: at,
+            at_epoch,
             priority,
             description,
         });
@@ -941,6 +957,28 @@ memory["my_pid"] = pid
         assert!(!result.is_error, "Error: {}", result.error_text);
         assert_eq!(result.side_effects.messages.len(), 1);
         assert_eq!(result.side_effects.messages[0].chat_id, "chat1");
+    }
+
+    #[test]
+    fn test_one_shot_timer_with_datetime() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        let result = execute(
+            &state,
+            r#"
+tid = timers.add(at=datetime(2026, 2, 1, 17, 0, 0), priority=8, description="dinner reminder")
+print(tid)
+"#,
+            false,
+            &HashMap::new(),
+        );
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert_eq!(result.side_effects.timer_adds.len(), 1);
+        assert!(result.side_effects.timer_adds[0].at_epoch.is_some());
+        assert!(result.side_effects.timer_adds[0].every_secs.is_none());
+        // datetime(2026, 2, 1, 17, 0, 0) should be a reasonable epoch
+        let epoch = result.side_effects.timer_adds[0].at_epoch.unwrap();
+        assert!(epoch > 1_700_000_000.0, "epoch {} too small", epoch);
     }
 
     #[test]
