@@ -434,6 +434,7 @@ pub struct ManagedProcess {
     pub cmd: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
+    pub description: String,
     pub status: ProcessStatus,
     #[serde(with = "duration_secs")]
     pub alert_timer: Duration,

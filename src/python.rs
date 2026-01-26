@@ -71,6 +71,7 @@ pub struct ProcessStartRequest {
     pub cmd: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
+    pub description: String,
     pub alert_timer_secs: u64,
     pub success_prio: u8,
     pub fail_prio: u8,
@@ -518,6 +519,8 @@ struct PyHarness {
     collector: Collector,
     process_outputs: HashMap<String, String>,
     process_statuses: HashMap<String, String>,
+    /// (pid, cmd, description, status) for all tracked processes
+    process_info: Vec<(String, String, String, String)>,
 }
 
 #[pymethods]
@@ -531,12 +534,13 @@ impl PyHarness {
         Ok(())
     }
 
-    #[pyo3(signature = (cmd, args=vec![], env=HashMap::new(), alert_timer=None, success_prio=5, fail_prio=7))]
+    #[pyo3(signature = (cmd, args=vec![], env=HashMap::new(), description="".to_string(), alert_timer=None, success_prio=5, fail_prio=7))]
     fn shell_exec<'py>(
         &self,
         cmd: String,
         args: Vec<String>,
         env: HashMap<String, String>,
+        description: String,
         alert_timer: Option<&Bound<'py, PyAny>>,
         success_prio: u8,
         fail_prio: u8,
@@ -553,6 +557,7 @@ impl PyHarness {
             cmd,
             args,
             env,
+            description,
             alert_timer_secs: alert_secs,
             success_prio,
             fail_prio,
@@ -579,6 +584,10 @@ impl PyHarness {
     fn shell_kill(&self, pid: String) -> PyResult<()> {
         self.collector.lock().unwrap().process_kills.push(pid);
         Ok(())
+    }
+
+    fn processes_list(&self) -> Vec<(String, String, String, String)> {
+        self.process_info.clone()
     }
 
     fn show_in_context(&self, data: String) -> PyResult<()> {
@@ -618,6 +627,7 @@ shell_exec = _harness.shell_exec
 shell_status = _harness.shell_status
 shell_output = _harness.shell_output
 shell_kill = _harness.shell_kill
+processes_list = _harness.processes_list
 show_in_context = _harness.show_in_context
 "#;
 
@@ -763,12 +773,27 @@ pub fn execute(
             })
             .collect();
 
+        let process_info: Vec<(String, String, String, String)> = state
+            .process_manager
+            .processes()
+            .iter()
+            .map(|p| {
+                let status = match &p.status {
+                    ProcessStatus::Running => "running".to_string(),
+                    ProcessStatus::Completed { exit_code } => format!("completed (exit {})", exit_code),
+                    ProcessStatus::Failed { error } => format!("failed: {}", error),
+                };
+                (p.id.0.clone(), p.cmd.clone(), p.description.clone(), status)
+            })
+            .collect();
+
         let harness = Py::new(
             py,
             PyHarness {
                 collector: collector.clone(),
                 process_outputs: process_outputs.clone(),
                 process_statuses,
+                process_info,
             },
         )?;
         locals.set_item("_harness", harness)?;

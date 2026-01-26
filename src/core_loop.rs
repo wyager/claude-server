@@ -442,6 +442,7 @@ impl CoreLoop {
                 cmd: req.cmd.clone(),
                 args: req.args.clone(),
                 env: req.env.clone(),
+                description: req.description.clone(),
                 status: ProcessStatus::Running,
                 alert_timer: Duration::from_secs(req.alert_timer_secs),
                 success_prio: req.success_prio,
@@ -451,8 +452,24 @@ impl CoreLoop {
             };
             self.state.process_manager.add(managed);
 
-            if let Err(e) = self.process_supervisor.spawn(req) {
+            if let Err(e) = self.process_supervisor.spawn(req.clone()) {
                 eprintln!("[core] Failed to spawn process: {}", e);
+                // Notify the agent via work queue
+                if let Some(p) = self.state.process_manager.get_mut(&req.id) {
+                    p.status = ProcessStatus::Failed {
+                        error: format!("spawn failed: {}", e),
+                    };
+                }
+                let wid = self.state.id_generator.next();
+                self.state.work_queue.push(WorkItem {
+                    id: wid,
+                    priority: req.fail_prio,
+                    time: Utc::now(),
+                    item_type: WorkItemType::ProcessFailed {
+                        pid: req.id,
+                        error: format!("spawn failed: {}", e),
+                    },
+                });
             }
         }
 

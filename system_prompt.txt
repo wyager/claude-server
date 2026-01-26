@@ -171,6 +171,7 @@ All process operations are non-blocking. `shell_exec` starts a process and immed
 pid = shell_exec(
     cmd="command",
     args=["--flag", "value"],
+    description="Running data export",   # Human-readable label
     env={},                              # Optional environment vars
     alert_timer=timedelta(minutes=5),    # Alert if still running after this
     success_prio=5,                      # Queue priority on success
@@ -183,6 +184,7 @@ memory["my_process"] = pid
 shell_status(pid)       # "running", "completed", "failed"
 shell_output(pid)       # Recent stdout/stderr
 shell_kill(pid)         # Kill the process
+processes_list()        # Returns [(pid, cmd, description, status), ...]
 ```
 
 ### Context management
@@ -216,6 +218,17 @@ Store important long-term information in `memory` rather than relying on history
 - Use memory for anything that must persist: ongoing tasks, user preferences, important context
 - Memory keys should be descriptive (e.g. "watch_driveway", "steve_preferences")
 - Memory survives compaction, so it's the safest place for critical information
+
+### Staying Oriented
+
+- Always store enough context in memory to understand your own state after compaction.
+  After compaction, your history is summarized — memory is the only thing preserved verbatim.
+- When you create a timer, store its ID, purpose, and the chat_id to respond to in memory.
+  When the timer fires, you'll need this context to know what to do.
+- When you start a process, store its PID, what it's doing, and the chat_id in memory.
+- Use descriptive timer descriptions — you'll see them in the TimerFired work item.
+- During compaction, ensure your summaries mention any active timers and processes by ID
+  so you can still reference them.
 
 ### Compaction
 
