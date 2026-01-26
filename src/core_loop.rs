@@ -190,6 +190,13 @@ impl CoreLoop {
         );
 
         if self.dump_turns {
+            if let Some(thinking) = &api_result.thinking {
+                println!("\n{}", "=".repeat(80));
+                println!("AGENT THINKING");
+                println!("{}\n", "=".repeat(80));
+                println!("{}", thinking);
+                println!("{}\n", "-".repeat(80));
+            }
             println!("\n{}", "=".repeat(80));
             println!("AGENT RESPONSE (Python code)");
             println!("{}\n", "=".repeat(80));

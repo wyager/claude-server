@@ -587,6 +587,15 @@ pub struct ApiRequest {
     pub system: Vec<SystemBlock>,
     pub tools: Vec<ToolDefinition>,
     pub messages: Vec<Message>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ThinkingConfig {
+    #[serde(rename = "type")]
+    pub thinking_type: String,
+    pub budget_tokens: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -627,6 +636,8 @@ pub enum MessageContent {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String },
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "tool_use")]

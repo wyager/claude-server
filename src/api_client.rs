@@ -14,6 +14,7 @@ pub struct ApiClient {
 
 pub struct ApiTurnResult {
     pub code: String,
+    pub thinking: Option<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_creation_tokens: u64,
@@ -118,10 +119,31 @@ impl ApiClient {
             system,
             tools,
             messages,
+            thinking: Some(ThinkingConfig {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 10_000,
+            }),
         }
     }
 
     fn extract_code(&self, response: ApiResponse) -> Result<ApiTurnResult> {
+        // Extract thinking text if present
+        let thinking: Option<String> = {
+            let parts: Vec<&str> = response
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Thinking { thinking } => Some(thinking.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
+        };
+
         // Find the tool_use block with name "execute"
         for block in &response.content {
             if let ContentBlock::ToolUse { name, input, .. } = block {
@@ -134,6 +156,7 @@ impl ApiClient {
 
                     return Ok(ApiTurnResult {
                         code,
+                        thinking,
                         input_tokens: response.usage.input_tokens,
                         output_tokens: response.usage.output_tokens,
                         cache_creation_tokens: response.usage.cache_creation_input_tokens,
