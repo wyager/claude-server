@@ -5,8 +5,11 @@
 ```bash
 make          # build and run the daemon (requires ANTHROPIC_API_KEY env var)
 make chat     # build, open browser, and run the chat web UI
+make run-dump # run with full context/response dumps each turn
 make build    # build only
 ```
+
+Ctrl+C triggers a graceful shutdown (saves state before exiting).
 
 Tests require single-threaded execution due to Python GIL contention:
 
@@ -26,9 +29,13 @@ The system is a Rust daemon that drives Claude through a work-queue loop. Each t
 4. Execute the Python in a fresh namespace (PyO3, not a subprocess)
 5. Collect side effects atomically, apply to state, persist to SQLite
 
-External events (user messages, timer firings, process completions) arrive via
-tokio mpsc channels and get converted into work queue items. The core loop owns
-all mutable state — no shared-state concurrency.
+External events (user messages, process completions) arrive via tokio mpsc
+channels and get converted into work queue items. When idle, the core loop
+uses `tokio::select!` to race the event channel against a sleep-until-next-timer
+future — no polling. The core loop owns all mutable state; no shared-state
+concurrency.
+
+See `INTERPRETER.md` for details on the Python integration.
 
 ## Source Layout
 
@@ -49,6 +56,7 @@ all mutable state — no shared-state concurrency.
 | `chat.html` | Single-file HTML/CSS/JS chat interface (embedded via include_str!) |
 | `system_prompt.txt` | System prompt sent to Claude on every API call |
 | `build.rs` | Discovers Python LIBDIR at build time, bakes rpath into binary |
+| `INTERPRETER.md` | How the Python interpreter integration works (PyO3, side effects, etc.) |
 
 ## Key Design Patterns
 
