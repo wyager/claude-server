@@ -65,6 +65,12 @@ See `INTERPRETER.md` for details on the Python integration.
 
 ## Key Design Patterns
 
+**Non-blocking execution**: The core agent loop must never block on external work.
+All long operations (HTTP requests, file processing, builds) go through `shell_exec()`
+and return results via work queue items. Built-in Python tools must execute in
+microseconds. This is why there's no `http_get()` — use `shell_exec("curl", ...)`
+with `block_for` instead.
+
 **Side effect collection**: Python scripts don't execute side effects directly.
 All mutations (memory writes, timer creates, message sends, process spawns) are
 collected into a `SideEffectCollector` during execution. If the script crashes,

@@ -1,5 +1,11 @@
 # Ideas for Future Work
 
+**Design principle: Non-blocking execution.** The core agent loop must never block on
+external work (network requests, file I/O, process execution). All long operations go
+through `shell_exec` and return results via work queue items. Built-in tools must execute
+in microseconds. This is why there's no `http_get()` or `sleep()` — use `shell_exec("curl", ...)`
+with `block_for` instead.
+
 ## Context Window Improvements
 
 - ~~**Show agent state in context**~~: DONE — `<agent_state>` block rendered between work_queue and context with memory (sorted by priority), active timers, running processes. Bounded by RenderConfig limits.
@@ -20,11 +26,9 @@
 
 - **Structured tool outputs**: Instead of just stdout strings, let Python scripts return structured data (JSON) that gets rendered more usefully in history and work items.
 
-- **Agent-initiated questions**: Give the agent a `ask_user(chat_id, question, options=[])` function that sends a question and pauses that task until the user responds. Currently the agent can only send messages, not ask questions.
-
 ## New Built-in Tools
 
-- **HTTP request tool**: `http_get(url)` / `http_post(url, body)` that returns the response directly, instead of shelling out to curl. Much cheaper (no process overhead, no extra turn). Even more important now that child agents cannot `shell_exec` — they currently have no way to make HTTP requests at all.
+- ~~**HTTP request tool**~~: REJECTED — violates the non-blocking principle. The core loop must never block on external work. Use `shell_exec("curl", ...)` with `block_for` instead. Once children have process support, they can do this too.
 
 - **File watcher**: `watch_directory(path, callback_description)` that uses OS-level file notifications (inotify/FSEvents) instead of polling via timers. More efficient and more responsive.
 

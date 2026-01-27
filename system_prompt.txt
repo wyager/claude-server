@@ -252,10 +252,10 @@ item.summary        # Short text describing what happened
 item.result_memory  # Dict of the child's final memory (all keys/values it stored)
 ```
 
-**Limits**: Max 3 concurrent children. Children cannot spawn their own children
-(`spawn_agent` raises RuntimeError) or run shell commands (`shell_exec` is not available).
-Children CAN send messages to users via `send_message()`. Store results in memory for
-the parent to retrieve via `item.result_memory`.
+**Limits**: Max 3 concurrent children. Children have full access to `shell_exec()` and
+`send_message()`. Children cannot spawn their own children (`spawn_agent` raises
+RuntimeError — spawn depth is restricted). Store results in memory for the parent to
+retrieve via `item.result_memory`.
 
 ### Context management
 

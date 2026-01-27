@@ -1,6 +1,6 @@
+mod agent_loop;
 mod api_client;
 mod chat;
-mod child_agent;
 mod compaction;
 mod config;
 mod core_loop;
@@ -11,12 +11,14 @@ mod python;
 mod renderer;
 mod types;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use std::path::PathBuf;
 
 use anyhow::Result;
 use tokio::sync::{broadcast, mpsc};
+
+use types::TokenAccumulator;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -117,6 +119,9 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>) -> Result<()> {
     // Create process supervisor
     let process_supervisor = process::ProcessSupervisor::new(process_event_tx, database.clone());
 
+    // Create token accumulator
+    let token_accumulator = Arc::new(Mutex::new(TokenAccumulator::default()));
+
     // Create core loop
     let mut core = core_loop::CoreLoop::new(
         state,
@@ -130,6 +135,7 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>) -> Result<()> {
         dump_turns,
         dump_dir,
         broadcast_tx.clone(),
+        token_accumulator.clone(),
     );
 
     // Forward process events to the main event channel
@@ -154,7 +160,13 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>) -> Result<()> {
     });
 
     // Start HTTP server
-    let router = http_server::create_router(event_tx.clone(), database.clone(), broadcast_tx);
+    let router = http_server::create_router(
+        event_tx.clone(),
+        database.clone(),
+        broadcast_tx,
+        token_accumulator.clone(),
+        config.clone(),
+    );
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     println!("  HTTP server listening on {}", config.listen_addr);
     tokio::spawn(async move {
@@ -178,7 +190,7 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>) -> Result<()> {
     core.run().await?;
 
     // Save final state
-    database.save_state(&core.state)?;
+    database.save_state(core.state())?;
     println!("State saved. Goodbye.");
 
     Ok(())

@@ -22,6 +22,14 @@ pub struct Config {
     pub render_config: RenderConfig,
     /// Timeout for Python script execution in seconds
     pub python_timeout_secs: u64,
+    /// Cost per million input tokens (USD)
+    pub cost_per_m_input: f64,
+    /// Cost per million output tokens (USD)
+    pub cost_per_m_output: f64,
+    /// Cost per million cache read tokens (USD)
+    pub cost_per_m_cache_read: f64,
+    /// Cost per million cache write tokens (USD)
+    pub cost_per_m_cache_write: f64,
 }
 
 impl Config {
@@ -82,6 +90,26 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(5);
 
+        let cost_per_m_input: f64 = std::env::var("CLAUDE_SERVER_COST_INPUT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3.0);
+
+        let cost_per_m_output: f64 = std::env::var("CLAUDE_SERVER_COST_OUTPUT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(15.0);
+
+        let cost_per_m_cache_read: f64 = std::env::var("CLAUDE_SERVER_COST_CACHE_READ")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.30);
+
+        let cost_per_m_cache_write: f64 = std::env::var("CLAUDE_SERVER_COST_CACHE_WRITE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3.75);
+
         Ok(Self {
             model,
             api_key,
@@ -96,6 +124,10 @@ impl Config {
             compact_target,
             render_config: RenderConfig::default(),
             python_timeout_secs,
+            cost_per_m_input,
+            cost_per_m_output,
+            cost_per_m_cache_read,
+            cost_per_m_cache_write,
         })
     }
 

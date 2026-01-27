@@ -1,5 +1,5 @@
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -14,8 +14,10 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
 
+use crate::config::Config;
 use crate::core_loop::HarnessEvent;
 use crate::db::Database;
+use crate::types::TokenAccumulator;
 
 /// Broadcast message sent from the core loop to SSE subscribers.
 #[derive(Debug, Clone)]
@@ -36,6 +38,8 @@ struct AppState {
     event_tx: mpsc::UnboundedSender<HarnessEvent>,
     db: Arc<Database>,
     broadcast_tx: broadcast::Sender<BroadcastMsg>,
+    token_accumulator: Arc<Mutex<TokenAccumulator>>,
+    config: Arc<Config>,
 }
 
 // ---- Request/Response types ----
@@ -124,6 +128,28 @@ async fn handle_shutdown(
     Ok(Json(serde_json::json!({ "status": "shutting_down" })))
 }
 
+// ---- Cost Handler ----
+
+async fn handle_cost(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let acc = state.token_accumulator.lock().unwrap();
+    let config = &state.config;
+    let cost = (acc.input_tokens as f64 * config.cost_per_m_input
+        + acc.output_tokens as f64 * config.cost_per_m_output
+        + acc.cache_read_tokens as f64 * config.cost_per_m_cache_read
+        + acc.cache_creation_tokens as f64 * config.cost_per_m_cache_write)
+        / 1_000_000.0;
+    Json(serde_json::json!({
+        "input_tokens": acc.input_tokens,
+        "output_tokens": acc.output_tokens,
+        "cache_read_tokens": acc.cache_read_tokens,
+        "cache_creation_tokens": acc.cache_creation_tokens,
+        "estimated_cost_usd": (cost * 100.0).round() / 100.0,
+        "turns": acc.turns,
+    }))
+}
+
 // ---- SSE Handler ----
 
 async fn handle_sse(
@@ -168,16 +194,21 @@ pub fn create_router(
     event_tx: mpsc::UnboundedSender<HarnessEvent>,
     db: Arc<Database>,
     broadcast_tx: broadcast::Sender<BroadcastMsg>,
+    token_accumulator: Arc<Mutex<TokenAccumulator>>,
+    config: Arc<Config>,
 ) -> Router {
     let state = AppState {
         event_tx,
         db,
         broadcast_tx,
+        token_accumulator,
+        config,
     };
 
     Router::new()
         .route("/message", post(handle_message))
         .route("/status", get(handle_status))
+        .route("/cost", get(handle_cost))
         .route("/messages/{chat_id}", get(handle_get_messages))
         .route("/messages/{chat_id}/stream", get(handle_sse))
         .route("/shutdown", post(handle_shutdown))

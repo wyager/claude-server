@@ -60,6 +60,7 @@ pub struct ChildAgentRequest {
     pub seed_memory: HashMap<String, serde_json::Value>,
     pub max_turns: u32,
     pub priority: u8,
+    pub child_depth_remaining: u32,
 }
 
 #[derive(Debug)]
@@ -634,7 +635,7 @@ struct PyHarness {
     process_statuses: HashMap<String, String>,
     /// (pid, cmd, description, status) for all tracked processes
     process_info: Vec<(String, String, String, String)>,
-    allow_child_spawn: bool,
+    child_depth_remaining: u32,
 }
 
 #[pymethods]
@@ -735,9 +736,9 @@ impl PyHarness {
         max_turns: u32,
         priority: u8,
     ) -> PyResult<String> {
-        if !self.allow_child_spawn {
+        if self.child_depth_remaining == 0 {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "Sub-agents cannot spawn their own children",
+                "Cannot spawn sub-agents at this depth",
             ));
         }
         // Cap max_turns at 50
@@ -767,6 +768,7 @@ impl PyHarness {
             seed_memory,
             max_turns,
             priority,
+            child_depth_remaining: self.child_depth_remaining - 1,
         });
         Ok(id_str)
     }
@@ -822,7 +824,7 @@ pub fn execute(
     is_compaction: bool,
     process_outputs: &HashMap<String, String>,
 ) -> ExecutionResult {
-    execute_with_timeout(state, code, is_compaction, process_outputs, 5, true)
+    execute_with_timeout(state, code, is_compaction, process_outputs, 5, 1)
 }
 
 pub fn execute_with_timeout(
@@ -831,7 +833,7 @@ pub fn execute_with_timeout(
     is_compaction: bool,
     process_outputs: &HashMap<String, String>,
     timeout_secs: u64,
-    allow_child_spawn: bool,
+    child_depth_remaining: u32,
 ) -> ExecutionResult {
     // Clone everything the thread needs (state is already Clone)
     let state = state.clone();
@@ -841,7 +843,7 @@ pub fn execute_with_timeout(
     let (tx, rx) = std::sync::mpsc::sync_channel::<ExecutionResult>(1);
 
     std::thread::spawn(move || {
-        let result = execute_inner(&state, &code, is_compaction, &process_outputs, allow_child_spawn);
+        let result = execute_inner(&state, &code, is_compaction, &process_outputs, child_depth_remaining);
         let _ = tx.send(result);
     });
 
@@ -902,7 +904,7 @@ fn execute_inner(
     code: &str,
     is_compaction: bool,
     process_outputs: &HashMap<String, String>,
-    allow_child_spawn: bool,
+    child_depth_remaining: u32,
 ) -> ExecutionResult {
     let collector = Arc::new(Mutex::new(SideEffectCollector {
         id_gen: state.id_generator.clone(),
@@ -1051,7 +1053,7 @@ fn execute_inner(
                 process_outputs: process_outputs.clone(),
                 process_statuses,
                 process_info,
-                allow_child_spawn,
+                child_depth_remaining,
             },
         )?;
         locals.set_item("_harness", harness)?;
@@ -1341,7 +1343,7 @@ print("all passed")
             false,
             &HashMap::new(),
             0,
-            true,
+            1,
         );
         assert!(!result.is_error, "Error: {}", result.error_text);
         assert_eq!(result.stdout.trim(), "all passed");
@@ -1364,7 +1366,7 @@ print("all passed")
             false,
             &HashMap::new(),
             2, // 2 second timeout for test speed
-            true,
+            1,
         );
         let elapsed = start.elapsed();
         assert!(result.is_error, "Should have timed out");
@@ -1397,7 +1399,7 @@ memory["my_child"] = child_id
             false,
             &HashMap::new(),
             0,
-            true,
+            1,
         );
         assert!(!result.is_error, "Error: {}", result.error_text);
         assert!(!result.stdout.trim().is_empty());

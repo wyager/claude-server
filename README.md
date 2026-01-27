@@ -1310,6 +1310,14 @@ pid = shell_exec(
 - When the process completes, a `ProcessCompleted` item is added at `success_prio`.
 - When the process fails, a `ProcessFailed` item is added at `fail_prio`.
 
+### No Special "Ask User" Primitive
+
+The harness intentionally does not provide a blocking `ask_user()` function. The agent
+can ask questions by sending a message via `send_message()` — the user's reply will arrive
+later as a normal `UserMessage` work item. The agent should track what it's waiting for in
+memory and continue working on other tasks in the meantime. This keeps the architecture
+simple and avoids special-casing human-in-the-loop flows into the harness.
+
 ### Concurrent Modifications
 
 Claude's Python execution receives a snapshot of the work queue as it was when

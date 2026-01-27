@@ -607,6 +607,28 @@ impl Default for RenderConfig {
     }
 }
 
+// ---- Agent Permissions ----
+
+#[derive(Debug, Clone)]
+pub struct AgentPermissions {
+    pub can_compact: bool,
+    pub max_turns: Option<u32>,      // None = unlimited (parent)
+    pub child_depth_remaining: u32,  // 0 = can't spawn children
+}
+
+// ---- Token Accumulator ----
+
+/// Tracks cumulative token usage across the daemon session.
+/// Shared between the core loop (writer) and the HTTP server (reader).
+#[derive(Debug, Default)]
+pub struct TokenAccumulator {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub turns: u32,
+}
+
 // ---- Deployment Plugin ----
 
 pub trait DeploymentPlugin: Send + Sync {
