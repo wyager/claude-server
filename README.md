@@ -283,8 +283,8 @@ Work item types (each has different fields):
 |------|-------------|-----------------|
 | `UserMessage` | `chat_id`, `user`, `content` | 9 |
 | `TimerFired` | `timer_id`, `every` (interval or None), `description` | Set by Claude |
-| `ProcessCompleted` | `pid`, `exit_code` | Set by Claude |
-| `ProcessFailed` | `pid`, `error` | Set by Claude |
+| `ProcessCompleted` | `pid`, `exit_code`, `output_preview` | Set by Claude |
+| `ProcessFailed` | `pid`, `error`, `output_preview` | Set by Claude |
 | `ProcessTimeout` | `pid` | Set by Claude |
 | `Compaction` | `description` | 10 |
 
@@ -467,18 +467,23 @@ the process in the same script — results arrive asynchronously via work queue 
 pid = shell_exec(
     cmd="ffmpeg",
     args=["-i", "input.mp4", "-vf", "scale=640:480", "output.mp4"],
+    description="Transcode video",       # Human-readable label
     env={"PATH": "/usr/bin"},
-    alert_timer=timedelta(minutes=5),   # Alert if still running after 5 min
-    success_prio=5,                     # Work queue priority on success
-    fail_prio=7                         # Work queue priority on failure
+    alert_timer=timedelta(minutes=5),    # Alert if still running after 5 min
+    success_prio=5,                      # Work queue priority on success
+    fail_prio=7,                         # Work queue priority on failure
+    block_for=timedelta(milliseconds=500) # Wait up to 500ms for completion
 )
-# pid is just a string like "4d66" — store it in memory if needed
-memory["ffmpeg_job"] = pid
+
+# For short commands, block_for lets the agent see the result on the next turn
+# instead of waiting an extra round-trip. The ProcessCompleted work item includes
+# output_preview with the last ~500 chars of stdout/stderr.
 
 # These can be called on FUTURE turns to check on a process:
 shell_status(pid)        # Returns: "running", "completed", "failed"
-shell_output(pid)        # Returns recent stdout/stderr (last 100 lines)
+shell_output(pid)        # Full stdout/stderr (only if output_preview was truncated)
 shell_kill(pid)          # Kill the process
+processes_list()         # Returns [(pid, cmd, description, status), ...]
 ```
 
 #### Context Management

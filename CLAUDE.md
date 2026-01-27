@@ -79,6 +79,11 @@ The system prompt is cached via `cache_control: { type: "ephemeral" }`.
 startup. Each turn creates a fresh `PyDict` as globals/locals — no state leaks
 between turns. Module imports (`sys.modules`) persist but are harmless.
 
+**Process output guarantees**: The completion monitor awaits the output reader's
+JoinHandle before sending events, so output is always fully flushed when the
+agent sees ProcessCompleted. The `block_for` parameter uses a oneshot channel
+to let the core loop wait for fast processes to finish before the next turn.
+
 ## HTTP API
 
 ```

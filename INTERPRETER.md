@@ -139,6 +139,20 @@ After execution, the value of `compaction_script` is read back from the
 Python locals dict and stored in the collector. The core loop then uses this
 script to manipulate history entries (removing old ones, adding summaries).
 
+## Process Completion Guarantees
+
+When a process spawned by `shell_exec()` finishes, the harness guarantees that
+all stdout/stderr is flushed to the DB before the `ProcessCompleted` event is
+sent. This is achieved by having the completion monitor task await the output
+reader task's `JoinHandle` after `child.wait()` returns.
+
+The `block_for` parameter on `shell_exec()` uses a `tokio::sync::oneshot` channel:
+the completion monitor signals the oneshot after the process exits and output is
+flushed. `apply_side_effects` awaits this oneshot with `tokio::time::timeout`,
+returning as soon as the process finishes or the timeout elapses — whichever
+comes first. The completion event then flows through the normal channel and is
+picked up by `drain_events()` on the next loop iteration.
+
 ## Build Configuration
 
 The `build.rs` script queries `python3 -c "import sysconfig; ..."` to discover

@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-01-27
+
+### Process Output Race Condition Fix
+- The completion monitor now awaits the output reader task's JoinHandle before
+  sending the completion event, guaranteeing all output is flushed to the DB
+- Previously, output could be incomplete when the agent read it
+
+### Output Preview on ProcessCompleted/ProcessFailed
+- Work items now include `output_preview` with the last ~500 chars of stdout/stderr
+- Agent can read `item.output_preview` directly instead of calling `shell_output()`
+- Rendered inline in the work queue display
+
+### `block_for` Parameter on shell_exec
+- `shell_exec(..., block_for=timedelta(milliseconds=500))` waits for fast commands
+- Returns as soon as the process finishes (not the full timeout duration)
+- ProcessCompleted appears in the queue on the next turn — no extra round-trip
+- Uses a oneshot channel for proper synchronization (no sleep)
+
+### Direct File I/O Prompt Hint
+- System prompt now tells the agent to use Python `open()` for file operations
+- Eliminates expensive shell_exec round-trips for file writes
+- Combined with block_for and output_preview, reduced a coding task from 14 turns to 4
+
 ## 2026-01-26
 
 ### Extended Thinking

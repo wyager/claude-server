@@ -164,7 +164,10 @@ send_image(chat_id="81d4", image=image_data, caption="Photo")
 
 ### Process management
 
-All process operations are non-blocking. `shell_exec` starts a process and immediately returns a string ID. You cannot wait on or interact with the process in the same script — use the returned ID to reference the process in future turns when results arrive via the work queue.
+All process operations are non-blocking by default. `shell_exec` starts a process and
+returns a string ID. When the process completes, a `ProcessCompleted` or `ProcessFailed`
+work item appears in your queue — and it includes an `output_preview` field with the
+last ~500 chars of stdout/stderr, so you often don't need to call `shell_output()` at all.
 
 ```python
 # Start a background process (returns immediately with a hex ID string)
@@ -175,16 +178,29 @@ pid = shell_exec(
     env={},                              # Optional environment vars
     alert_timer=timedelta(minutes=5),    # Alert if still running after this
     success_prio=5,                      # Queue priority on success
-    fail_prio=7                          # Queue priority on failure
+    fail_prio=7,                         # Queue priority on failure
+    block_for=timedelta(milliseconds=500) # Optional: wait up to this long for completion
 )
 # pid is just a string like "4d66" — store it in memory if you need to reference it later
 memory["my_process"] = pid
 
 # These can be called on future turns to check on a process:
 shell_status(pid)       # "running", "completed", "failed"
-shell_output(pid)       # Recent stdout/stderr
+shell_output(pid)       # Recent stdout/stderr (only needed if output_preview was truncated)
 shell_kill(pid)         # Kill the process
 processes_list()        # Returns [(pid, cmd, description, status), ...]
+```
+
+**`block_for`**: For short commands (curl, mkdir, cat, etc.), pass `block_for` to avoid
+wasting a turn waiting for completion. The harness waits up to that duration for the
+process to finish. If it finishes in time, the `ProcessCompleted` work item (with
+`output_preview`) appears in your queue on the very next turn — no extra round-trip.
+If it doesn't finish in time, it arrives later as normal.
+
+**`output_preview`**: When a process completes, the `ProcessCompleted` work item
+includes an `output_preview` field with the last ~500 characters of output. You can
+read it directly from the work item (`work_queue[i].output_preview`) instead of calling
+`shell_output()`. Only use `shell_output()` if you need the full output and it was truncated.
 ```
 
 ### Context management
