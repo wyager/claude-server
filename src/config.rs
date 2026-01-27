@@ -32,7 +32,7 @@ impl Config {
         }
 
         let model = std::env::var("CLAUDE_SERVER_MODEL")
-            .unwrap_or_else(|_| "claude-opus-4-5-20251101".to_string());
+            .unwrap_or_else(|_| "claude-sonnet-4-5-20250929".to_string());
 
         let api_base_url = std::env::var("CLAUDE_SERVER_API_URL")
             .unwrap_or_else(|_| "https://api.anthropic.com".to_string());

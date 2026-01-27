@@ -311,6 +311,9 @@ pub struct Timer {
     pub priority: u8,
     pub schedule: TimerSchedule,
     pub created_at: DateTime<Utc>,
+    /// For recurring timers: true after firing, until agent calls acknowledge_timer()
+    #[serde(default)]
+    pub pending_ack: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,6 +378,10 @@ impl TimerManager {
                     }
                 }
                 TimerSchedule::Recurring { every, next_fire } => {
+                    // Don't fire again until the previous firing is acknowledged
+                    if timer.pending_ack {
+                        continue;
+                    }
                     if now >= *next_fire {
                         fired.push(WorkItem {
                             id: id_gen.next(),
@@ -386,9 +393,8 @@ impl TimerManager {
                                 description: timer.description.clone(),
                             },
                         });
-                        *next_fire = now
-                            + chrono::Duration::from_std(*every)
-                                .unwrap_or(chrono::Duration::seconds(1));
+                        // Don't advance next_fire — wait for acknowledge_timer()
+                        timer.pending_ack = true;
                     }
                 }
             }
@@ -399,6 +405,18 @@ impl TimerManager {
         }
 
         fired
+    }
+
+    /// Acknowledge a recurring timer firing — re-arm it from now.
+    pub fn acknowledge(&mut self, id: &AgentId) {
+        if let Some(timer) = self.timers.iter_mut().find(|t| &t.id == id) {
+            if let TimerSchedule::Recurring { every, next_fire } = &mut timer.schedule {
+                timer.pending_ack = false;
+                *next_fire = chrono::Utc::now()
+                    + chrono::Duration::from_std(*every)
+                        .unwrap_or(chrono::Duration::seconds(1));
+            }
+        }
     }
 
     pub fn list(&self) -> &[Timer] {

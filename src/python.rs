@@ -36,6 +36,7 @@ pub struct SideEffectCollector {
     pub queue_removes: Vec<String>,
     pub timer_adds: Vec<TimerAddRequest>,
     pub timer_cancels: Vec<String>,
+    pub timer_acks: Vec<String>,
     pub filter_adds: Vec<QueueFilter>,
     pub filter_removes: Vec<String>,
     pub messages: Vec<OutboundMessageRequest>,
@@ -553,7 +554,7 @@ impl PyHarness {
         Ok(())
     }
 
-    #[pyo3(signature = (cmd, args=vec![], env=HashMap::new(), description="".to_string(), alert_timer=None, success_prio=5, fail_prio=7, block_for=None))]
+    #[pyo3(signature = (cmd, args=vec![], env=HashMap::new(), description="".to_string(), alert_timer=None, success_prio=7, fail_prio=8, block_for=None))]
     fn shell_exec<'py>(
         &self,
         cmd: String,
@@ -620,6 +621,11 @@ impl PyHarness {
         Ok(())
     }
 
+    fn acknowledge_timer(&self, timer_id: String) -> PyResult<()> {
+        self.collector.lock().unwrap().timer_acks.push(timer_id);
+        Ok(())
+    }
+
     fn compact(&self) -> PyResult<()> {
         self.collector.lock().unwrap().compact_called = true;
         Ok(())
@@ -653,6 +659,7 @@ shell_status = _harness.shell_status
 shell_output = _harness.shell_output
 shell_kill = _harness.shell_kill
 processes_list = _harness.processes_list
+acknowledge_timer = _harness.acknowledge_timer
 show_in_context = _harness.show_in_context
 "#;
 

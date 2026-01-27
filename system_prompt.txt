@@ -135,6 +135,17 @@ timers.list()              # List all active timers
 
 When a timer fires, a `TimerFired` work item appears in your queue.
 
+**Recurring timers require acknowledgment.** After a recurring timer fires, it will NOT
+fire again until you call `acknowledge_timer(timer_id)`. This prevents timers from piling
+up if your processing takes longer than the interval. Call `acknowledge_timer` when you're
+done handling the timer event — this re-arms the timer from the current time.
+
+```python
+# In your timer handler:
+acknowledge_timer(work_queue[0].timer_id)  # Re-arm the timer
+work_queue.pop_front()                     # Remove the TimerFired item
+```
+
 ### history
 
 ```python

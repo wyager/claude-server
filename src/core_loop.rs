@@ -423,11 +423,17 @@ impl CoreLoop {
                 priority: req.priority,
                 schedule,
                 created_at: Utc::now(),
+                pending_ack: false,
             };
             self.state.timer_manager.add(timer);
         }
         for id in effects.timer_cancels {
             self.state.timer_manager.cancel(&AgentId(id));
+        }
+
+        // Timer acknowledgments — re-arm recurring timers
+        for id in effects.timer_acks {
+            self.state.timer_manager.acknowledge(&AgentId(id));
         }
 
         // Filter operations
