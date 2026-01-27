@@ -75,6 +75,7 @@ pub struct ProcessStartRequest {
     pub alert_timer_secs: u64,
     pub success_prio: u8,
     pub fail_prio: u8,
+    pub block_for_ms: Option<u64>,
 }
 
 // ---- Execution Result ----
@@ -106,6 +107,7 @@ struct PyWorkItem {
     pid: Option<String>,
     exit_code: Option<i32>,
     error: Option<String>,
+    output_preview: Option<String>,
 }
 
 #[pymethods]
@@ -137,6 +139,7 @@ impl PyWorkItem {
                 "description" => self.description.as_deref(),
                 "pid" => self.pid.as_deref(),
                 "error" => self.error.as_deref(),
+                "output_preview" => self.output_preview.as_deref(),
                 _ => {
                     return Err(PyAttributeError::new_err(format!(
                         "'WorkItem' has no attribute '{}'",
@@ -207,7 +210,11 @@ fn work_item_to_py(item: &WorkItem) -> PyWorkItem {
                 None,
                 None,
             ),
-            WorkItemType::ProcessCompleted { pid, exit_code } => (
+            WorkItemType::ProcessCompleted {
+                pid,
+                exit_code,
+                output_preview,
+            } => (
                 "ProcessCompleted",
                 None,
                 None,
@@ -219,7 +226,11 @@ fn work_item_to_py(item: &WorkItem) -> PyWorkItem {
                 Some(*exit_code),
                 None,
             ),
-            WorkItemType::ProcessFailed { pid, error } => (
+            WorkItemType::ProcessFailed {
+                pid,
+                error,
+                output_preview,
+            } => (
                 "ProcessFailed",
                 None,
                 None,
@@ -257,6 +268,13 @@ fn work_item_to_py(item: &WorkItem) -> PyWorkItem {
             ),
         };
 
+    // Extract output_preview from ProcessCompleted/ProcessFailed
+    let output_preview = match &item.item_type {
+        WorkItemType::ProcessCompleted { output_preview, .. } => output_preview.clone(),
+        WorkItemType::ProcessFailed { output_preview, .. } => output_preview.clone(),
+        _ => None,
+    };
+
     PyWorkItem {
         id: item.id.0.clone(),
         priority: item.priority,
@@ -271,6 +289,7 @@ fn work_item_to_py(item: &WorkItem) -> PyWorkItem {
         pid,
         exit_code,
         error,
+        output_preview,
     }
 }
 
@@ -534,7 +553,7 @@ impl PyHarness {
         Ok(())
     }
 
-    #[pyo3(signature = (cmd, args=vec![], env=HashMap::new(), description="".to_string(), alert_timer=None, success_prio=5, fail_prio=7))]
+    #[pyo3(signature = (cmd, args=vec![], env=HashMap::new(), description="".to_string(), alert_timer=None, success_prio=5, fail_prio=7, block_for=None))]
     fn shell_exec<'py>(
         &self,
         cmd: String,
@@ -544,10 +563,15 @@ impl PyHarness {
         alert_timer: Option<&Bound<'py, PyAny>>,
         success_prio: u8,
         fail_prio: u8,
+        block_for: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<String> {
         let alert_secs = match alert_timer {
             Some(val) => extract_seconds(val)? as u64,
             None => 300,
+        };
+        let block_for_ms = match block_for {
+            Some(val) => Some((extract_seconds(val)? * 1000.0) as u64),
+            None => None,
         };
         let mut col = self.collector.lock().unwrap();
         let id = col.id_gen.next();
@@ -561,6 +585,7 @@ impl PyHarness {
             alert_timer_secs: alert_secs,
             success_prio,
             fail_prio,
+            block_for_ms,
         });
         Ok(id_str)
     }

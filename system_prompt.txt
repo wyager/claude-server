@@ -203,6 +203,25 @@ print("text")           # Captured as script output in history
 - You can do multiple things in a single script (read content, set up a timer, pop the item).
 - If you need to see the full content of a truncated work item, print it.
 
+### Direct File Operations
+
+You have full Python standard library access. For file operations, use Python directly
+rather than shelling out — it's simpler and doesn't cost an extra turn:
+
+```python
+# Write a file
+with open("/path/to/file.txt", "w") as f:
+    f.write("content")
+
+# Read a file
+content = open("/path/to/file.txt").read()
+print(content)
+
+# Check if file exists
+import os.path
+os.path.exists("/path/to/file.txt")
+```
+
 ### Context Management
 
 Your context metadata tells you which history entries you can modify. For those entries:

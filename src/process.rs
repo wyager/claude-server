@@ -4,8 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
-use tokio::sync::mpsc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::db::Database;
 use crate::python::ProcessStartRequest;
@@ -17,11 +16,6 @@ pub enum ProcessEvent {
     Completed { pid: AgentId, exit_code: i32 },
     Failed { pid: AgentId, error: String },
     Timeout { pid: AgentId },
-}
-
-struct RunningProcess {
-    os_pid: u32,
-    kill_handle: tokio::process::Child,
 }
 
 pub struct ProcessSupervisor {
@@ -39,7 +33,12 @@ impl ProcessSupervisor {
         }
     }
 
-    pub fn spawn(&self, request: ProcessStartRequest) -> Result<()> {
+    /// Spawn a process. Returns a oneshot receiver if block_for_ms is set,
+    /// which resolves when the process completes (after all output is flushed).
+    pub fn spawn(
+        &self,
+        request: ProcessStartRequest,
+    ) -> Result<Option<oneshot::Receiver<()>>> {
         let mut cmd = Command::new(&request.cmd);
         cmd.args(&request.args);
         for (k, v) in &request.env {
@@ -62,12 +61,13 @@ impl ProcessSupervisor {
             });
         }
 
-        // Spawn stdout/stderr reader
+        // Spawn output reader — capture its JoinHandle so the completion
+        // monitor can wait for all output to be flushed before signaling
         let db = self.db.clone();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let reader_pid = pid_str.clone();
-        tokio::spawn(async move {
+        let reader_handle = tokio::spawn(async move {
             if let Some(stdout) = stdout {
                 let reader = tokio::io::BufReader::new(stdout);
                 let mut lines = reader.lines();
@@ -84,35 +84,58 @@ impl ProcessSupervisor {
             }
         });
 
-        // Spawn completion monitor
+        // Create oneshot channel if block_for is requested
+        let (block_tx, block_rx) = if request.block_for_ms.is_some() {
+            let (tx, rx) = oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        // Spawn completion monitor — waits for process exit AND output flush
         let event_tx = self.event_tx.clone();
         let running = self.running.clone();
         let completion_pid = pid.clone();
         let completion_pid_str = pid_str.clone();
         tokio::spawn(async move {
-            match child.wait().await {
+            let event = match child.wait().await {
                 Ok(status) => {
+                    // Wait for reader to finish flushing all output before signaling
+                    let _ = reader_handle.await;
                     running.lock().await.remove(&completion_pid_str);
+
                     if status.success() {
-                        let _ = event_tx.send(ProcessEvent::Completed {
+                        ProcessEvent::Completed {
                             pid: completion_pid,
                             exit_code: status.code().unwrap_or(0),
-                        });
+                        }
                     } else {
-                        let _ = event_tx.send(ProcessEvent::Failed {
+                        ProcessEvent::Failed {
                             pid: completion_pid,
                             error: format!("exit code {}", status.code().unwrap_or(-1)),
-                        });
+                        }
                     }
                 }
                 Err(e) => {
+                    let _ = reader_handle.await;
                     running.lock().await.remove(&completion_pid_str);
-                    let _ = event_tx.send(ProcessEvent::Failed {
+                    ProcessEvent::Failed {
                         pid: completion_pid,
                         error: format!("wait error: {}", e),
-                    });
+                    }
                 }
+            };
+
+            // Send on oneshot first (for block_for callers), then normal channel
+            if let Some(tx) = block_tx {
+                // We need to clone-ish the event for the oneshot.
+                // Since ProcessEvent isn't Clone, send on oneshot and reconstruct for the channel.
+                // Actually, let's just send on the normal channel — the block_for caller
+                // will receive it via drain_events on the next loop iteration.
+                // The oneshot just needs to signal "done" so the caller stops waiting.
+                let _ = tx.send(());
             }
+            let _ = event_tx.send(event);
         });
 
         // Spawn alert timer
@@ -123,7 +146,6 @@ impl ProcessSupervisor {
         let running = self.running.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(alert_secs)).await;
-            // Only send timeout if still running
             if running.lock().await.contains_key(&timeout_pid_str) {
                 let _ = event_tx.send(ProcessEvent::Timeout {
                     pid: timeout_pid,
@@ -131,13 +153,12 @@ impl ProcessSupervisor {
             }
         });
 
-        Ok(())
+        Ok(block_rx)
     }
 
     pub async fn kill(&self, pid: &str) -> Result<()> {
         let running = self.running.lock().await;
         if let Some(&os_pid) = running.get(pid) {
-            // Use kill command to send SIGTERM
             let _ = Command::new("kill")
                 .arg(os_pid.to_string())
                 .status()

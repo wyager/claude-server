@@ -85,10 +85,14 @@ pub enum WorkItemType {
     ProcessCompleted {
         pid: AgentId,
         exit_code: i32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_preview: Option<String>,
     },
     ProcessFailed {
         pid: AgentId,
         error: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_preview: Option<String>,
     },
     ProcessTimeout {
         pid: AgentId,

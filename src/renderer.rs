@@ -158,12 +158,26 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
             }
             out.push_str(&format!("description: \"{}\"\n", description));
         }
-        WorkItemType::ProcessCompleted { pid, exit_code } => {
+        WorkItemType::ProcessCompleted {
+            pid,
+            exit_code,
+            output_preview,
+        } => {
             out.push_str("type: ProcessCompleted\n");
             out.push_str(&format!("pid: {}\n", pid));
             out.push_str(&format!("exit_code: {}\n", exit_code));
+            if let Some(preview) = output_preview {
+                out.push_str("output_preview:\n");
+                for line in preview.lines() {
+                    out.push_str(&format!("  {}\n", line));
+                }
+            }
         }
-        WorkItemType::ProcessFailed { pid, error } => {
+        WorkItemType::ProcessFailed {
+            pid,
+            error,
+            output_preview,
+        } => {
             out.push_str("type: ProcessFailed\n");
             out.push_str(&format!("pid: {}\n", pid));
             out.push_str(&format!(

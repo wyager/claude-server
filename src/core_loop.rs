@@ -305,12 +305,18 @@ impl CoreLoop {
                     if let Some(p) = self.state.process_manager.get_mut(&pid) {
                         p.status = ProcessStatus::Completed { exit_code };
                     }
+                    // Load output preview (race-condition-free: reader finishes before event)
+                    let output_preview = self.load_output_preview(&pid.0);
                     let id = self.state.id_generator.next();
                     self.state.work_queue.push(WorkItem {
                         id,
                         priority: prio,
                         time: Utc::now(),
-                        item_type: WorkItemType::ProcessCompleted { pid, exit_code },
+                        item_type: WorkItemType::ProcessCompleted {
+                            pid,
+                            exit_code,
+                            output_preview,
+                        },
                     });
                 }
                 ProcessEvent::Failed { pid, error } => {
@@ -325,12 +331,17 @@ impl CoreLoop {
                             error: error.clone(),
                         };
                     }
+                    let output_preview = self.load_output_preview(&pid.0);
                     let id = self.state.id_generator.next();
                     self.state.work_queue.push(WorkItem {
                         id,
                         priority: prio,
                         time: Utc::now(),
-                        item_type: WorkItemType::ProcessFailed { pid, error },
+                        item_type: WorkItemType::ProcessFailed {
+                            pid,
+                            error,
+                            output_preview,
+                        },
                     });
                 }
                 ProcessEvent::Timeout { pid } => {
@@ -351,6 +362,22 @@ impl CoreLoop {
             },
             HarnessEvent::Shutdown => {} // handled in run()
         }
+    }
+
+    /// Load the last ~500 chars of process output as a preview.
+    fn load_output_preview(&self, pid: &str) -> Option<String> {
+        self.db
+            .load_process_output(pid)
+            .ok()
+            .map(|o| {
+                let trimmed = o.trim_end();
+                if trimmed.len() > 500 {
+                    format!("...{}", &trimmed[trimmed.len() - 500..])
+                } else {
+                    trimmed.to_string()
+                }
+            })
+            .filter(|s| !s.is_empty())
     }
 
     async fn apply_side_effects(&mut self, effects: python::SideEffectCollector) {
@@ -452,24 +479,40 @@ impl CoreLoop {
             };
             self.state.process_manager.add(managed);
 
-            if let Err(e) = self.process_supervisor.spawn(req.clone()) {
-                eprintln!("[core] Failed to spawn process: {}", e);
-                // Notify the agent via work queue
-                if let Some(p) = self.state.process_manager.get_mut(&req.id) {
-                    p.status = ProcessStatus::Failed {
-                        error: format!("spawn failed: {}", e),
-                    };
+            let block_for_ms = req.block_for_ms;
+            match self.process_supervisor.spawn(req.clone()) {
+                Ok(completion_rx) => {
+                    // If block_for is set, wait for the process to complete or timeout
+                    if let (Some(ms), Some(rx)) = (block_for_ms, completion_rx) {
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(ms),
+                            rx,
+                        )
+                        .await;
+                        // Whether it completed or timed out, drain any pending events
+                        // so they appear in the work queue for the current turn
+                        self.drain_events();
+                    }
                 }
-                let wid = self.state.id_generator.next();
-                self.state.work_queue.push(WorkItem {
-                    id: wid,
-                    priority: req.fail_prio,
-                    time: Utc::now(),
-                    item_type: WorkItemType::ProcessFailed {
-                        pid: req.id,
-                        error: format!("spawn failed: {}", e),
-                    },
-                });
+                Err(e) => {
+                    eprintln!("[core] Failed to spawn process: {}", e);
+                    if let Some(p) = self.state.process_manager.get_mut(&req.id) {
+                        p.status = ProcessStatus::Failed {
+                            error: format!("spawn failed: {}", e),
+                        };
+                    }
+                    let wid = self.state.id_generator.next();
+                    self.state.work_queue.push(WorkItem {
+                        id: wid,
+                        priority: req.fail_prio,
+                        time: Utc::now(),
+                        item_type: WorkItemType::ProcessFailed {
+                            pid: req.id,
+                            error: format!("spawn failed: {}", e),
+                            output_preview: None,
+                        },
+                    });
+                }
             }
         }
 
