@@ -283,9 +283,9 @@ Work item types (each has different fields):
 |------|-------------|-----------------|
 | `UserMessage` | `chat_id`, `user`, `content` | 9 |
 | `TimerFired` | `timer_id`, `every` (interval or None), `description` | Set by Claude |
-| `ProcessCompleted` | `pid`, `exit_code`, `output_preview` | Set by Claude |
-| `ProcessFailed` | `pid`, `error`, `output_preview` | Set by Claude |
-| `ProcessTimeout` | `pid` | Set by Claude |
+| `ProcessCompleted` | `pid`, `exit_code`, `output_preview` | 7 (default) |
+| `ProcessFailed` | `pid`, `error`, `output_preview` | 8 (default) |
+| `ProcessTimeout` | `pid` | 8 (default) |
 | `Compaction` | `description` | 10 |
 
 The work queue display is truncated to fit in context:

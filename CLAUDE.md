@@ -106,4 +106,5 @@ All endpoints have CORS enabled (permissive). The chat UI uses these directly.
 | `CLAUDE_SERVER_SYSTEM_PROMPT` | `system_prompt.txt` | System prompt file |
 | `CLAUDE_SERVER_DEPLOYMENT_CONTEXT` | (none) | Deployment context file |
 | `CLAUDE_SERVER_CONTEXT_WINDOW` | `200000` | Model context window size |
+| `CLAUDE_SERVER_MODEL` | `claude-sonnet-4-5-20250929` | Model to use |
 | `CLAUDE_SERVER_MAX_TOKENS` | `16384` | Max output tokens per turn |

@@ -2,6 +2,21 @@
 
 ## 2026-01-27
 
+### Priority Defaults Revised
+- `success_prio` raised from 5→7, `fail_prio` raised from 7→8
+- ProcessCompleted now appears above TimerFired (default 5) in the work queue
+- Prevents agents from blindly accessing `work_queue[0]` and hitting the wrong item type
+
+### Timer Acknowledgment for Recurring Timers
+- Recurring timers no longer re-arm automatically after firing
+- Agent must call `acknowledge_timer(timer_id)` to re-arm from current time
+- Prevents timer events from piling up if processing takes longer than the interval
+- One-shot timers unaffected (removed after firing)
+
+### Default Model Changed to Sonnet 4.5
+- Default model changed from `claude-opus-4-5-20251101` to `claude-sonnet-4-5-20250929`
+- Configurable via `CLAUDE_SERVER_MODEL` env var
+
 ### Process Output Race Condition Fix
 - The completion monitor now awaits the output reader task's JoinHandle before
   sending the completion event, guaranteeing all output is flushed to the DB
