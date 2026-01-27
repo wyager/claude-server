@@ -505,8 +505,9 @@ spawn_agent(
 )
 ```
 
-Children are sandboxed: no message sending, no process spawning. Max 3 concurrent
-children (`CLAUDE_SERVER_MAX_CHILDREN`), no recursion (children cannot spawn children).
+Children can send messages via `send_message()` but cannot spawn processes
+(`shell_exec`) or spawn their own children (`spawn_agent` raises `RuntimeError`).
+Max 3 concurrent children (`CLAUDE_SERVER_MAX_CHILDREN`).
 When a child finishes, a `ChildAgentCompleted` work item arrives with `result_memory`,
 `turns_used`, `success`, and `summary`.
 
@@ -1385,7 +1386,7 @@ claude-server/
     db.rs                 -- SQLite persistence (state JSON blob, process output, messages)
     process.rs            -- Tokio process spawning/monitoring (output capture, completion events)
     compaction.rs         -- Compaction state machine (trigger, script accumulation, execution)
-    child_agent.rs        -- Sub-agent loop (simplified core loop, sandboxed: no msgs, no procs)
+    child_agent.rs        -- Sub-agent loop (simplified core loop, can send msgs, no procs/children)
     http_server.rs        -- Axum HTTP API (POST /message, GET /status, GET /messages/:chat_id, SSE stream)
     chat.rs               -- Chat UI subcommand (serves embedded HTML)
     chat.html             -- Single-file HTML/CSS/JS chat interface

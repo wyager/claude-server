@@ -222,22 +222,9 @@ impl CoreLoop {
             api_result.cache_read_tokens
         );
 
-        // Dump turn (to stdout and/or file)
-        self.turn_counter += 1;
-        if self.dump_turns || self.dump_dir.is_some() {
-            write_turn_dump(
-                "parent",
-                self.turn_counter,
-                &rendered.text,
-                api_result.thinking.as_deref(),
-                &api_result.code,
-                self.dump_turns,
-                self.dump_dir.as_deref(),
-            );
-        }
-
         // Update token tracking
         self.state.last_input_tokens = api_result.input_tokens;
+        self.turn_counter += 1;
 
         // Load process outputs for shell_output() calls
         let process_outputs = self.db.load_all_process_outputs().unwrap_or_default();
@@ -254,38 +241,59 @@ impl CoreLoop {
             self.compaction.active,
             &process_outputs,
             self.config.python_timeout_secs,
+            true, // parent can spawn children
         );
 
-        // Record in history
-        let entry_id = self.state.id_generator.next();
-        let output = if exec_result.is_error {
-            format!("[ERROR]\n{}", exec_result.error_text)
-        } else {
-            exec_result.stdout.clone()
-        };
+        let is_error = exec_result.is_error;
+        let stdout = exec_result.stdout.clone();
+        let error_text = exec_result.error_text.clone();
 
         println!(
-            "[core] Executed entry {} (error={}): {}",
-            entry_id,
-            exec_result.is_error,
+            "[core] Executed (error={}): {}",
+            is_error,
             &api_result.code.lines().next().unwrap_or("(empty)")
         );
 
-        if !exec_result.stdout.is_empty() {
-            print!("[stdout] {}", exec_result.stdout);
+        if !stdout.is_empty() {
+            print!("[stdout] {}", stdout);
         }
+
+        // Apply side effects (only if no error) — must happen BEFORE
+        // generating the history entry ID, otherwise the id_generator
+        // gets rolled back and produces duplicate IDs.
+        if !is_error {
+            self.apply_side_effects(exec_result.side_effects).await;
+        }
+
+        // Record in history (after side effects so entry_id is fresh)
+        let entry_id = self.state.id_generator.next();
+        let output = if is_error {
+            format!("[ERROR]\n{}", error_text)
+        } else {
+            stdout
+        };
 
         self.state.event_history.push(HistoryEntry::Execution {
             id: entry_id,
             time: Utc::now(),
-            code: api_result.code,
-            output,
-            is_error: exec_result.is_error,
+            code: api_result.code.clone(),
+            output: output.clone(),
+            is_error,
         });
 
-        // Apply side effects (only if no error)
-        if !exec_result.is_error {
-            self.apply_side_effects(exec_result.side_effects).await;
+        // Dump turn (to stdout and/or file) — after execution so output is included
+        if self.dump_turns || self.dump_dir.is_some() {
+            write_turn_dump(
+                "parent",
+                self.turn_counter,
+                &rendered.text,
+                api_result.thinking.as_deref(),
+                &api_result.code,
+                &output,
+                is_error,
+                self.dump_turns,
+                self.dump_dir.as_deref(),
+            );
         }
 
         Ok(())
@@ -679,6 +687,7 @@ impl CoreLoop {
                 true,
                 &HashMap::new(),
                 self.config.python_timeout_secs,
+                false, // compaction doesn't need to spawn children
             );
 
             if compact_result.is_error {
@@ -741,6 +750,8 @@ pub fn write_turn_dump(
     context: &str,
     thinking: Option<&str>,
     code: &str,
+    output: &str,
+    is_error: bool,
     to_stdout: bool,
     dump_dir: Option<&std::path::Path>,
 ) {
@@ -775,6 +786,22 @@ pub fn write_turn_dump(
     dump.push_str(&format!("{}\n\n", sep));
     dump.push_str(code);
     dump.push_str(&format!("\n{}\n", dash));
+
+    if !output.is_empty() {
+        dump.push_str(&format!("\n{}\n", sep));
+        dump.push_str(&format!(
+            "[{}] Turn {} — EXECUTION {}\n",
+            agent_name,
+            turn_number,
+            if is_error { "ERROR" } else { "OUTPUT" }
+        ));
+        dump.push_str(&format!("{}\n\n", sep));
+        dump.push_str(output);
+        if !output.ends_with('\n') {
+            dump.push('\n');
+        }
+        dump.push_str(&format!("{}\n", dash));
+    }
 
     if to_stdout {
         println!("{}", dump);

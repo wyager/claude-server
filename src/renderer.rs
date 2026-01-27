@@ -197,12 +197,41 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
             turns_used,
             success,
             summary,
-            ..
+            result_memory,
         } => {
             out.push_str("type: ChildAgentCompleted\n");
             out.push_str(&format!("child_id: {}\n", child_id));
             out.push_str(&format!("success: {}\n", success));
             out.push_str(&format!("turns_used: {}\n", turns_used));
+
+            // Show result_memory preview
+            if result_memory.is_empty() {
+                out.push_str("result_memory: (empty)\n");
+            } else {
+                let total = result_memory.len();
+                let display_count = total.min(5);
+                out.push_str(&format!(
+                    "result_memory ({} {}):\n",
+                    total,
+                    if total == 1 { "key" } else { "keys" }
+                ));
+                let mut keys: Vec<&String> = result_memory.keys().collect();
+                keys.sort();
+                for key in keys.iter().take(display_count) {
+                    let val_str = serde_json::to_string(&result_memory[*key])
+                        .unwrap_or_else(|_| "?".to_string());
+                    let truncated = if val_str.len() > 80 {
+                        format!("{}...", &val_str[..80])
+                    } else {
+                        val_str
+                    };
+                    out.push_str(&format!("  {}: {}\n", key, truncated));
+                }
+                if total > display_count {
+                    out.push_str(&format!("  ... and {} more keys\n", total - display_count));
+                }
+            }
+
             out.push_str(&format!(
                 "summary: {}\n",
                 truncate_with_note(summary, content_limit)

@@ -2,6 +2,33 @@
 
 ## 2026-01-27 (cont.)
 
+### Child Agent Deployment Preamble Fix
+- Updated child agent deployment preamble to accurately tell children they can `send_message()`
+- Previously the preamble told children they were fully sandboxed (no messaging), causing
+  children to not use `send_message()` even though it was available
+- System prompt sub-agents section also updated to document the capability
+
+### ID Collision Fix
+- History entry IDs now generated AFTER `apply_side_effects()`, preventing duplicate IDs
+  between history entries and agent-created objects (timers, processes, children)
+
+### ChildAgentCompleted Result Preview
+- Rendered work queue item for `ChildAgentCompleted` now shows `result_memory` keys
+  with truncated values (max 5 keys, 80 chars each)
+- Parent agent can see what the child produced without needing to print it
+- Success summary simplified to "Completed successfully" (preview provides the detail)
+- Error summaries truncate cleanly with "..."
+
+### Child Agent Capabilities Expanded
+- Children can now send messages via `send_message()` (saved to DB)
+- `spawn_agent()` now raises `RuntimeError("Sub-agents cannot spawn their own children")`
+  instead of silently doing nothing
+- Process spawning (`shell_exec`) not yet supported (future work)
+
+### Execution Output in Dump Files
+- Turn dump files now include a fourth section showing EXECUTION OUTPUT (or EXECUTION ERROR)
+  with the Python script's stdout/stderr
+
 ### Streaming Responses (SSE)
 - Added `tokio::sync::broadcast` channel for real-time message delivery
 - `GET /messages/:chat_id/stream` SSE endpoint with `message` and `status` events

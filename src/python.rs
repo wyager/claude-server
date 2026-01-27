@@ -634,6 +634,7 @@ struct PyHarness {
     process_statuses: HashMap<String, String>,
     /// (pid, cmd, description, status) for all tracked processes
     process_info: Vec<(String, String, String, String)>,
+    allow_child_spawn: bool,
 }
 
 #[pymethods]
@@ -734,6 +735,11 @@ impl PyHarness {
         max_turns: u32,
         priority: u8,
     ) -> PyResult<String> {
+        if !self.allow_child_spawn {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Sub-agents cannot spawn their own children",
+            ));
+        }
         // Cap max_turns at 50
         let max_turns = max_turns.min(50);
 
@@ -816,7 +822,7 @@ pub fn execute(
     is_compaction: bool,
     process_outputs: &HashMap<String, String>,
 ) -> ExecutionResult {
-    execute_with_timeout(state, code, is_compaction, process_outputs, 5)
+    execute_with_timeout(state, code, is_compaction, process_outputs, 5, true)
 }
 
 pub fn execute_with_timeout(
@@ -825,6 +831,7 @@ pub fn execute_with_timeout(
     is_compaction: bool,
     process_outputs: &HashMap<String, String>,
     timeout_secs: u64,
+    allow_child_spawn: bool,
 ) -> ExecutionResult {
     // Clone everything the thread needs (state is already Clone)
     let state = state.clone();
@@ -834,7 +841,7 @@ pub fn execute_with_timeout(
     let (tx, rx) = std::sync::mpsc::sync_channel::<ExecutionResult>(1);
 
     std::thread::spawn(move || {
-        let result = execute_inner(&state, &code, is_compaction, &process_outputs);
+        let result = execute_inner(&state, &code, is_compaction, &process_outputs, allow_child_spawn);
         let _ = tx.send(result);
     });
 
@@ -895,6 +902,7 @@ fn execute_inner(
     code: &str,
     is_compaction: bool,
     process_outputs: &HashMap<String, String>,
+    allow_child_spawn: bool,
 ) -> ExecutionResult {
     let collector = Arc::new(Mutex::new(SideEffectCollector {
         id_gen: state.id_generator.clone(),
@@ -1043,6 +1051,7 @@ fn execute_inner(
                 process_outputs: process_outputs.clone(),
                 process_statuses,
                 process_info,
+                allow_child_spawn,
             },
         )?;
         locals.set_item("_harness", harness)?;
@@ -1332,6 +1341,7 @@ print("all passed")
             false,
             &HashMap::new(),
             0,
+            true,
         );
         assert!(!result.is_error, "Error: {}", result.error_text);
         assert_eq!(result.stdout.trim(), "all passed");
@@ -1354,6 +1364,7 @@ print("all passed")
             false,
             &HashMap::new(),
             2, // 2 second timeout for test speed
+            true,
         );
         let elapsed = start.elapsed();
         assert!(result.is_error, "Should have timed out");
@@ -1386,6 +1397,7 @@ memory["my_child"] = child_id
             false,
             &HashMap::new(),
             0,
+            true,
         );
         assert!(!result.is_error, "Error: {}", result.error_text);
         assert!(!result.stdout.trim().is_empty());

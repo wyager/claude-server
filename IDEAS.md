@@ -14,7 +14,9 @@
 
 - **Self-improvement**: Let the agent edit its own system prompt or add custom Python functions that persist across turns (like Conway's self-improvement). The agent could learn project-specific patterns and optimize its own workflow.
 
-- ~~**Sub-agents**~~: DONE — `spawn_agent(task, model, memory, max_turns, priority)` launches child agents via `child_agent.rs`. Max 3 concurrent, max 50 turns, no recursion. Children sandboxed (no message sending, no process spawning). Returns `ChildAgentCompleted` work item.
+- ~~**Sub-agents**~~: DONE — `spawn_agent(task, model, memory, max_turns, priority)` launches child agents via `child_agent.rs`. Max 3 concurrent, max 50 turns, no recursion. Children can `send_message()` but cannot `shell_exec()` or `spawn_agent()`. Returns `ChildAgentCompleted` work item.
+
+- **Child process support**: Give child agents full `shell_exec` with their own ProcessSupervisor and event loop, so they can run commands, wait for results, etc. Currently children are limited to pure Python + memory + messaging.
 
 - **Structured tool outputs**: Instead of just stdout strings, let Python scripts return structured data (JSON) that gets rendered more usefully in history and work items.
 
@@ -22,7 +24,7 @@
 
 ## New Built-in Tools
 
-- **HTTP request tool**: `http_get(url)` / `http_post(url, body)` that returns the response directly, instead of shelling out to curl. Much cheaper (no process overhead, no extra turn).
+- **HTTP request tool**: `http_get(url)` / `http_post(url, body)` that returns the response directly, instead of shelling out to curl. Much cheaper (no process overhead, no extra turn). Even more important now that child agents cannot `shell_exec` — they currently have no way to make HTTP requests at all.
 
 - **File watcher**: `watch_directory(path, callback_description)` that uses OS-level file notifications (inotify/FSEvents) instead of polling via timers. More efficient and more responsive.
 

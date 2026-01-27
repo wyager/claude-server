@@ -10,6 +10,7 @@ make build    # build only
 # CLI flags:
 #   --dump-turns       print full context/response to stdout each turn
 #   --dump-dir <path>  write turn dumps to files (parent-001-dump.txt, child-<id>-001-dump.txt)
+#                      dumps include: CONTEXT, RESPONSE, THINKING, and EXECUTION OUTPUT/ERROR
 ```
 
 Ctrl+C triggers a graceful shutdown (saves state before exiting).
@@ -54,7 +55,7 @@ See `INTERPRETER.md` for details on the Python integration.
 | `db.rs` | SQLite persistence (state as JSON blob, process output, outbound messages) |
 | `process.rs` | Tokio-based process spawning, output capture, completion/failure/timeout events |
 | `compaction.rs` | Compaction state machine (trigger detection, script accumulation, execution) |
-| `child_agent.rs` | Sub-agent loop: simplified core loop for spawned child agents (no message sending, no process spawning) |
+| `child_agent.rs` | Sub-agent loop: simplified core loop for spawned child agents (can send messages, no process spawning/child spawning) |
 | `http_server.rs` | Axum HTTP API: POST /message, GET /status, GET /messages/:chat_id, GET /messages/:chat_id/stream (SSE), POST /shutdown |
 | `chat.rs` | Chat UI subcommand: serves embedded HTML with API URL injection |
 | `chat.html` | Single-file HTML/CSS/JS chat interface (embedded via include_str!) |
@@ -105,7 +106,8 @@ and running processes. Bounded by RenderConfig limits (20 memory keys, 20 timers
 a child agent loop (`child_agent.rs`) that runs independently and returns a
 `ChildAgentCompleted` work item with `result_memory`, `turns_used`, `success`,
 and `summary`. Max 3 concurrent children, max 50 turns, no recursion. Children
-are sandboxed: no message sending, no process spawning.
+can send messages via `send_message()` but cannot spawn processes (`shell_exec`)
+or spawn their own children (`spawn_agent` raises `RuntimeError`).
 
 **Streaming responses (SSE)**: A `tokio::sync::broadcast` channel delivers
 messages in real time. The SSE endpoint (`GET /messages/:chat_id/stream`)

@@ -107,7 +107,11 @@ the `#[pyclass]` method calls `id_gen.next()` on the collector's generator
 and returns the hex ID string synchronously. After execution, the updated
 `IdGenerator` (with its advanced counter) is moved back into `HarnessState`.
 
-This means IDs are assigned during Python execution, not deferred.
+This means IDs for agent-created objects are assigned during Python execution,
+not deferred. History entry IDs, however, are generated AFTER
+`apply_side_effects()` returns the updated `IdGenerator`. This prevents
+collisions between history entry IDs and IDs assigned to timers, processes,
+or child agents during the same turn.
 
 ## Stdout Capture
 

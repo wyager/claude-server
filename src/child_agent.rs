@@ -81,7 +81,9 @@ pub async fn run_child_agent(
     let child_deployment = format!(
         "You are a sub-agent spawned by a parent agent to complete a specific task.\n\
         Complete the assigned task, store your results in memory, and stop.\n\
-        Do NOT send messages — your parent will read your memory when you complete.\n\
+        You can use send_message() if the task requires communicating with users.\n\
+        You cannot use shell_exec() or spawn_agent() — those will raise errors.\n\
+        Your parent receives your final memory contents when you complete.\n\
         \n{}",
         deployment_context
     );
@@ -122,20 +124,6 @@ pub async fn run_child_agent(
 
         state.last_input_tokens = api_result.input_tokens;
 
-        // Dump turn to file if dump_dir is set
-        if dump_dir.is_some() {
-            let agent_name = format!("child-{}", child_id);
-            core_loop::write_turn_dump(
-                &agent_name,
-                turns_used + 1,
-                &rendered.text,
-                api_result.thinking.as_deref(),
-                &api_result.code,
-                false, // don't print to stdout — too noisy with concurrent children
-                dump_dir.as_deref(),
-            );
-        }
-
         // Execute Python
         let process_outputs = db.load_all_process_outputs().unwrap_or_default();
         let exec_result = python::execute_with_timeout(
@@ -144,65 +132,71 @@ pub async fn run_child_agent(
             false,
             &process_outputs,
             config.python_timeout_secs,
+            false, // children cannot spawn grandchildren
         );
 
-        // Record in history
-        let entry_id = state.id_generator.next();
-        let output = if exec_result.is_error {
-            format!("[ERROR]\n{}", exec_result.error_text)
-        } else {
-            exec_result.stdout.clone()
-        };
+        let is_error = exec_result.is_error;
+        let stdout = exec_result.stdout.clone();
+        let error_text = exec_result.error_text.clone();
 
         println!(
             "[child:{}] Turn {} (error={}): {}",
             child_id,
             turns_used + 1,
-            exec_result.is_error,
+            is_error,
             api_result.code.lines().next().unwrap_or("(empty)")
         );
+
+        // Apply side effects BEFORE generating entry ID (same fix as parent)
+        if !is_error {
+            apply_child_side_effects(&mut state, exec_result.side_effects, &db);
+        }
+
+        // Record in history (after side effects so entry_id is fresh)
+        let entry_id = state.id_generator.next();
+        let output = if is_error {
+            format!("[ERROR]\n{}", error_text)
+        } else {
+            stdout
+        };
 
         state.event_history.push(HistoryEntry::Execution {
             id: entry_id,
             time: Utc::now(),
             code: api_result.code.clone(),
-            output,
-            is_error: exec_result.is_error,
+            output: output.clone(),
+            is_error,
         });
 
-        // Apply side effects (simplified — no process spawning, no child agents)
-        if !exec_result.is_error {
-            apply_child_side_effects(&mut state, exec_result.side_effects);
+        // Dump turn to file if dump_dir is set (after execution so output is included)
+        if dump_dir.is_some() {
+            let agent_name = format!("child-{}", child_id);
+            core_loop::write_turn_dump(
+                &agent_name,
+                turns_used + 1,
+                &rendered.text,
+                api_result.thinking.as_deref(),
+                &api_result.code,
+                &output,
+                is_error,
+                false,
+                dump_dir.as_deref(),
+            );
         }
 
         turns_used += 1;
     }
 
-    // Build summary from the last history entry
+    // Build summary
     let success = last_error.is_empty();
     let summary = if !success {
-        last_error
+        if last_error.len() > 200 {
+            format!("{}...", &last_error[..200])
+        } else {
+            last_error
+        }
     } else {
-        state
-            .event_history
-            .entries()
-            .last()
-            .map(|e| match e {
-                HistoryEntry::Execution {
-                    code, output, is_error, ..
-                } => {
-                    if *is_error {
-                        format!("Last turn errored: {}", &output[..output.len().min(200)])
-                    } else {
-                        let code_preview = &code[..code.len().min(100)];
-                        let output_preview = &output[..output.len().min(200)];
-                        format!("Completed. Last code: {}; Output: {}", code_preview, output_preview)
-                    }
-                }
-                HistoryEntry::Summary { description, .. } => description.clone(),
-                HistoryEntry::SystemAlert { message, .. } => message.clone(),
-            })
-            .unwrap_or_else(|| "Completed with no output".to_string())
+        "Completed successfully".to_string()
     };
 
     println!(
@@ -220,8 +214,10 @@ pub async fn run_child_agent(
     });
 }
 
-/// Apply side effects for a child agent (simplified — no child spawning, limited ops)
-fn apply_child_side_effects(state: &mut HarnessState, effects: python::SideEffectCollector) {
+/// Apply side effects for a child agent.
+/// Children can do everything the parent can except spawn_agent (blocked at the Python level).
+/// Process spawning is not yet supported (requires a full event loop with ProcessSupervisor).
+fn apply_child_side_effects(state: &mut HarnessState, effects: python::SideEffectCollector, db: &Database) {
     state.id_generator = effects.id_gen;
 
     // Memory
@@ -288,6 +284,13 @@ fn apply_child_side_effects(state: &mut HarnessState, effects: python::SideEffec
         state.timer_manager.acknowledge(&AgentId(id));
     }
 
-    // Note: process starts, child agent spawns, and outbound messages are
-    // intentionally NOT handled for child agents to keep them sandboxed.
+    // Outbound messages
+    for msg in effects.messages {
+        println!("[child] message -> chat:{} | {}", msg.chat_id, msg.content);
+        let _ = db.save_outbound_message(&msg.chat_id, &msg.content);
+    }
+
+    // Note: process starts are NOT handled in the child loop. Supporting them
+    // would require a full event loop with ProcessSupervisor — a future enhancement.
+    // spawn_agent is blocked at the Python level with a RuntimeError.
 }
