@@ -97,6 +97,13 @@ pub enum WorkItemType {
     ProcessTimeout {
         pid: AgentId,
     },
+    ChildAgentCompleted {
+        child_id: AgentId,
+        result_memory: HashMap<String, serde_json::Value>,
+        turns_used: u32,
+        success: bool,
+        summary: String,
+    },
     Compaction,
 }
 
@@ -538,6 +545,8 @@ pub struct HarnessState {
     pub timer_manager: TimerManager,
     pub process_manager: ProcessManager,
     pub memory: Memory,
+    #[serde(default)]
+    pub memory_priorities: HashMap<String, u8>,
     pub id_generator: IdGenerator,
     pub last_input_tokens: u64,
     pub context_window: u64,
@@ -552,6 +561,7 @@ impl HarnessState {
             timer_manager: TimerManager::new(),
             process_manager: ProcessManager::new(),
             memory: HashMap::new(),
+            memory_priorities: HashMap::new(),
             id_generator: IdGenerator::new(),
             last_input_tokens: 0,
             context_window,
@@ -575,6 +585,10 @@ pub struct RenderConfig {
     pub work_queue_content_limits: Vec<usize>,
     pub work_queue_default_limit: usize,
     pub work_queue_max_display: usize,
+    pub agent_state_memory_max_display: usize,
+    pub agent_state_memory_value_max_chars: usize,
+    pub agent_state_timer_max_display: usize,
+    pub agent_state_process_max_display: usize,
 }
 
 impl Default for RenderConfig {
@@ -585,6 +599,10 @@ impl Default for RenderConfig {
             work_queue_content_limits: vec![500, 500, 500, 200, 200, 200, 200, 200, 200, 200],
             work_queue_default_limit: 80,
             work_queue_max_display: 20,
+            agent_state_memory_max_display: 20,
+            agent_state_memory_value_max_chars: 120,
+            agent_state_timer_max_display: 20,
+            agent_state_process_max_display: 10,
         }
     }
 }

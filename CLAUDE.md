@@ -7,6 +7,9 @@ make          # build and run the daemon (requires ANTHROPIC_API_KEY env var)
 make chat     # build, open browser, and run the chat web UI
 make run-dump # run with full context/response dumps each turn
 make build    # build only
+# CLI flags:
+#   --dump-turns       print full context/response to stdout each turn
+#   --dump-dir <path>  write turn dumps to files (parent-001-dump.txt, child-<id>-001-dump.txt)
 ```
 
 Ctrl+C triggers a graceful shutdown (saves state before exiting).
@@ -51,7 +54,8 @@ See `INTERPRETER.md` for details on the Python integration.
 | `db.rs` | SQLite persistence (state as JSON blob, process output, outbound messages) |
 | `process.rs` | Tokio-based process spawning, output capture, completion/failure/timeout events |
 | `compaction.rs` | Compaction state machine (trigger detection, script accumulation, execution) |
-| `http_server.rs` | Axum HTTP API: POST /message, GET /status, GET /messages/:chat_id, POST /shutdown |
+| `child_agent.rs` | Sub-agent loop: simplified core loop for spawned child agents (no message sending, no process spawning) |
+| `http_server.rs` | Axum HTTP API: POST /message, GET /status, GET /messages/:chat_id, GET /messages/:chat_id/stream (SSE), POST /shutdown |
 | `chat.rs` | Chat UI subcommand: serves embedded HTML with API URL injection |
 | `chat.html` | Single-file HTML/CSS/JS chat interface (embedded via include_str!) |
 | `system_prompt.txt` | System prompt sent to Claude on every API call |
@@ -84,13 +88,38 @@ JoinHandle before sending events, so output is always fully flushed when the
 agent sees ProcessCompleted. The `block_for` parameter uses a oneshot channel
 to let the core loop wait for fast processes to finish before the next turn.
 
+**Python execution timeout**: Scripts are bounded by a configurable timeout
+(`CLAUDE_SERVER_PYTHON_TIMEOUT`, default 5s). If a script blocks too long,
+`PyErr_SetInterrupt` is used to interrupt execution.
+
+**Memory priorities**: Memory keys can have an associated priority (0-10) via
+`memory.set(key, value, priority=N)`. Higher-priority keys are rendered first
+in the `<agent_state>` block and are less likely to be truncated.
+
+**Agent state in context**: An `<agent_state>` block is rendered between the work
+queue and context metadata, showing memory (sorted by priority), active timers,
+and running processes. Bounded by RenderConfig limits (20 memory keys, 20 timers,
+10 processes).
+
+**Sub-agents**: `spawn_agent(task, model, memory, max_turns, priority)` launches
+a child agent loop (`child_agent.rs`) that runs independently and returns a
+`ChildAgentCompleted` work item with `result_memory`, `turns_used`, `success`,
+and `summary`. Max 3 concurrent children, max 50 turns, no recursion. Children
+are sandboxed: no message sending, no process spawning.
+
+**Streaming responses (SSE)**: A `tokio::sync::broadcast` channel delivers
+messages in real time. The SSE endpoint (`GET /messages/:chat_id/stream`)
+pushes `message` and `status` events to connected clients. The chat UI uses
+`EventSource` instead of polling.
+
 ## HTTP API
 
 ```
-POST /message          { chat_id?, user, content } → { status, chat_id }
-GET  /status           → { status, model }
-GET  /messages/:chat_id → { messages: [...] }
-POST /shutdown         → { status }
+POST /message                    { chat_id?, user, content } → { status, chat_id }
+GET  /status                     → { status, model }
+GET  /messages/:chat_id          → { messages: [...] }
+GET  /messages/:chat_id/stream   SSE stream (message + status events)
+POST /shutdown                   → { status }
 ```
 
 All endpoints have CORS enabled (permissive). The chat UI uses these directly.
@@ -108,3 +137,5 @@ All endpoints have CORS enabled (permissive). The chat UI uses these directly.
 | `CLAUDE_SERVER_CONTEXT_WINDOW` | `200000` | Model context window size |
 | `CLAUDE_SERVER_MODEL` | `claude-sonnet-4-5-20250929` | Model to use |
 | `CLAUDE_SERVER_MAX_TOKENS` | `16384` | Max output tokens per turn |
+| `CLAUDE_SERVER_PYTHON_TIMEOUT` | `5` | Python script execution timeout (seconds) |
+| `CLAUDE_SERVER_MAX_CHILDREN` | `3` | Max concurrent sub-agent children |

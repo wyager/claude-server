@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-01-27 (cont.)
+
+### Streaming Responses (SSE)
+- Added `tokio::sync::broadcast` channel for real-time message delivery
+- `GET /messages/:chat_id/stream` SSE endpoint with `message` and `status` events
+- Chat UI rewritten to use EventSource (no more polling)
+- Typing indicator (thinking.../executing...) in chat UI
+- Added `tokio-stream` (sync feature) and `futures` deps
+
+### Agent State in Context
+- `<agent_state>` block rendered between work_queue and context showing memory (sorted by priority), active timers, running processes
+- `memory.set(key, value, priority=N)`, `memory.set_priority(key, N)`, `memory.get_priority(key)` Python API
+- `memory_priorities` added to HarnessState (backwards compatible with existing DBs)
+- Bounded by RenderConfig limits (20 memory keys, 20 timers, 10 processes)
+
+### Sub-agents
+- `spawn_agent(task, model, memory={}, max_turns=20, priority=6)` Python API
+- `child_agent.rs` with simplified core loop (no message sending, no process spawning)
+- `ChildAgentCompleted` work item type with `result_memory`, `turns_used`, `success`, `summary`
+- Max 3 concurrent children (`CLAUDE_SERVER_MAX_CHILDREN`), max 50 turns, no recursion
+
+### Python Execution Timeout
+- `CLAUDE_SERVER_PYTHON_TIMEOUT` env var (default 5s)
+- Scripts that block too long are interrupted via `PyErr_SetInterrupt`
+
+### Context Dump Improvements
+- `--dump-dir <path>` CLI flag writes turn dumps to files instead of stdout
+- Parent dumps: `parent-001-dump.txt`, children: `child-<id>-001-dump.txt`
+- `--dump-turns` still works for stdout (parent only)
+
 ## 2026-01-27
 
 ### Priority Defaults Revised

@@ -30,10 +30,16 @@ The fresh-namespace approach is the practical substitute.
 10. Extract SideEffectCollector, return ExecutionResult
 ```
 
-On error at step 8, the Python traceback is formatted and returned.
-The `SideEffectCollector` is replaced with an empty default — all side effects
-are discarded. This makes execution transactional: either everything succeeds
-and all mutations apply, or nothing changes.
+Step 8 is bounded by a configurable timeout (`CLAUDE_SERVER_PYTHON_TIMEOUT`,
+default 5 seconds). If the script blocks beyond this limit, `PyErr_SetInterrupt`
+is called to raise a `KeyboardInterrupt` in the Python thread. The timeout
+prevents a misbehaving script (e.g., `time.sleep(60)` or an infinite loop)
+from blocking the entire core loop.
+
+On error at step 8 (including timeout interrupts), the Python traceback is
+formatted and returned. The `SideEffectCollector` is replaced with an empty
+default — all side effects are discarded. This makes execution transactional:
+either everything succeeds and all mutations apply, or nothing changes.
 
 ## Namespace
 
@@ -42,7 +48,7 @@ The agent's Python code sees these objects:
 | Object | Type | Source |
 |--------|------|--------|
 | `work_queue` | `PyWorkQueue` | Snapshot of `state.work_queue` |
-| `memory` | `PyMemory` | Clone of `state.memory` (dict-like) |
+| `memory` | `PyMemory` | Clone of `state.memory` (dict-like, supports priorities) |
 | `timers` | `PyTimerManager` | Timer metadata from `state.timer_manager` |
 | `history` | `PyHistoryManager` | History entries from `state.event_history` |
 | `send_message(chat_id, content)` | function | From `_harness.send_message` |
@@ -54,6 +60,19 @@ The agent's Python code sees these objects:
 | `timedelta`, `datetime` | classes | From Python's `datetime` module |
 
 In compaction mode, `compact()` and `compaction_script` are also available.
+
+### Memory Priorities
+
+`PyMemory` supports priority-based ordering via three additional methods:
+
+- `memory.set(key, value, priority=N)` — set a key with an explicit priority (0-10)
+- `memory.set_priority(key, N)` — change the priority of an existing key
+- `memory.get_priority(key)` — read the current priority of a key
+
+Priorities are stored in `state.memory_priorities` (a separate `HashMap<String, u8>`)
+and are backwards compatible — keys without an explicit priority default to 5.
+Higher-priority keys are rendered first in the `<agent_state>` context block and
+are less likely to be truncated when the render limit is hit.
 
 The convenience functions (`send_message`, `shell_exec`, etc.) are created
 by the preamble, which assigns `_harness.method_name` to top-level names.

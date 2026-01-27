@@ -286,6 +286,7 @@ Work item types (each has different fields):
 | `ProcessCompleted` | `pid`, `exit_code`, `output_preview` | 7 (default) |
 | `ProcessFailed` | `pid`, `error`, `output_preview` | 8 (default) |
 | `ProcessTimeout` | `pid` | 8 (default) |
+| `ChildAgentCompleted` | `child_id`, `result_memory`, `turns_used`, `success`, `summary` | Set by caller |
 | `Compaction` | `description` | 10 |
 
 The work queue display is truncated to fit in context:
@@ -325,7 +326,9 @@ pre-defined objects, runs Claude's script, then deserializes the modified state 
 Side effects (sending messages, starting processes) execute immediately during
 script execution.
 
-**Non-blocking rule:** All Python scripts must execute within a few milliseconds.
+**Non-blocking rule:** All Python scripts must complete quickly.
+A configurable timeout (`CLAUDE_SERVER_PYTHON_TIMEOUT`, default 5s) enforces
+this — scripts that block too long are interrupted via `PyErr_SetInterrupt`.
 The agent has no access to blocking operations (no sleep, no waiting on I/O,
 no blocking on network requests). All long-lived operations are managed
 asynchronously through the work queue: start a process with `shell_exec()`,
@@ -391,7 +394,10 @@ work_queue.remove_filter(name="spam_filter")
 ```python
 memory: dict[str, str]
 
-memory["key"] = "value"        # Store a memory
+memory["key"] = "value"        # Store a memory (default priority 5)
+memory.set("key", "value", priority=8)  # Store with explicit priority (0-10)
+memory.set_priority("key", 8) # Change priority of existing key
+memory.get_priority("key")    # Read priority of a key
 del memory["key"]              # Delete a memory
 print(memory["key"])           # Read a memory
 "key" in memory                # Check existence
@@ -485,6 +491,24 @@ shell_output(pid)        # Full stdout/stderr (only if output_preview was trunca
 shell_kill(pid)          # Kill the process
 processes_list()         # Returns [(pid, cmd, description, status), ...]
 ```
+
+#### Sub-agents
+
+```python
+# Spawn a child agent to handle a task in parallel
+spawn_agent(
+    task="Summarize the API documentation at /tmp/api-docs.md",
+    model="claude-sonnet-4-5-20250929",   # Optional, defaults to parent's model
+    memory={"file_path": "/tmp/api-docs.md"},  # Seed memory for the child
+    max_turns=20,                          # Max turns before forced stop (max 50)
+    priority=6                             # Priority of the ChildAgentCompleted work item
+)
+```
+
+Children are sandboxed: no message sending, no process spawning. Max 3 concurrent
+children (`CLAUDE_SERVER_MAX_CHILDREN`), no recursion (children cannot spawn children).
+When a child finishes, a `ChildAgentCompleted` work item arrives with `result_memory`,
+`turns_used`, `success`, and `summary`.
 
 #### Context Management
 
@@ -1361,7 +1385,8 @@ claude-server/
     db.rs                 -- SQLite persistence (state JSON blob, process output, messages)
     process.rs            -- Tokio process spawning/monitoring (output capture, completion events)
     compaction.rs         -- Compaction state machine (trigger, script accumulation, execution)
-    http_server.rs        -- Axum HTTP API (POST /message, GET /status, GET /messages/:chat_id)
+    child_agent.rs        -- Sub-agent loop (simplified core loop, sandboxed: no msgs, no procs)
+    http_server.rs        -- Axum HTTP API (POST /message, GET /status, GET /messages/:chat_id, SSE stream)
     chat.rs               -- Chat UI subcommand (serves embedded HTML)
     chat.html             -- Single-file HTML/CSS/JS chat interface
 ```
@@ -1400,8 +1425,8 @@ claude-server chat --api-url http://myhost:4000  # custom API URL
 The chat UI:
 - Generates a stable UUID chat_id per browser session
 - Sends messages via POST /message to the daemon API
-- Polls GET /messages/:chat_id every 1.5s for agent responses
-- Tracks seen message IDs to avoid duplicates
+- Streams agent responses in real time via SSE (`GET /messages/:chat_id/stream`)
+- Shows typing indicators (thinking.../executing...) during agent turns
 - Auto-scrolls on new messages
 
 ### HTTP API
@@ -1411,6 +1436,7 @@ The chat UI:
 | `/message` | POST | Send a user message `{ chat_id?, user, content }` |
 | `/status` | GET | Health check `{ status, model }` |
 | `/messages/:chat_id` | GET | Get agent responses for a chat `{ messages: [...] }` |
+| `/messages/:chat_id/stream` | GET | SSE stream of `message` and `status` events |
 | `/shutdown` | POST | Graceful shutdown |
 
 All endpoints have CORS enabled (permissive).
@@ -1427,6 +1453,8 @@ All endpoints have CORS enabled (permissive).
 | `CLAUDE_SERVER_DEPLOYMENT_CONTEXT` | (none) | Deployment context file |
 | `CLAUDE_SERVER_CONTEXT_WINDOW` | `200000` | Model context window size |
 | `CLAUDE_SERVER_MAX_TOKENS` | `16384` | Max output tokens per turn |
+| `CLAUDE_SERVER_PYTHON_TIMEOUT` | `5` | Python script execution timeout (seconds) |
+| `CLAUDE_SERVER_MAX_CHILDREN` | `3` | Max concurrent sub-agent children |
 
 ### Building
 

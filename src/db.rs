@@ -127,13 +127,13 @@ impl Database {
 
     // ---- Outbound Messages ----
 
-    pub fn save_outbound_message(&self, chat_id: &str, content: &str) -> Result<()> {
+    pub fn save_outbound_message(&self, chat_id: &str, content: &str) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO outbound_messages (chat_id, content) VALUES (?1, ?2)",
             rusqlite::params![chat_id, content],
         )?;
-        Ok(())
+        Ok(conn.last_insert_rowid())
     }
 
     pub fn load_outbound_messages(&self, chat_id: &str) -> Result<Vec<OutboundMessage>> {

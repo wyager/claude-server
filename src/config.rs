@@ -20,6 +20,8 @@ pub struct Config {
     /// Target token count after compaction
     pub compact_target: u64,
     pub render_config: RenderConfig,
+    /// Timeout for Python script execution in seconds
+    pub python_timeout_secs: u64,
 }
 
 impl Config {
@@ -75,6 +77,11 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| (available as f64 * 0.5) as u64);
 
+        let python_timeout_secs: u64 = std::env::var("CLAUDE_SERVER_PYTHON_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5);
+
         Ok(Self {
             model,
             api_key,
@@ -88,6 +95,7 @@ impl Config {
             compact_at,
             compact_target,
             render_config: RenderConfig::default(),
+            python_timeout_secs,
         })
     }
 

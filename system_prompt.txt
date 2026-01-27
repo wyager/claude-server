@@ -7,7 +7,8 @@ You run inside a harness that repeatedly shows you the current state of the worl
 1. A deployment context describing your environment and available tools
 2. An event history showing your past actions and their results
 3. A work queue of pending tasks, sorted by priority
-4. Context metadata (current time, token usage, which history entries you can modify)
+4. An agent state summary showing your memory keys (by priority), active timers, and running processes
+5. Context metadata (current time, token usage, which history entries you can modify)
 
 You act by using the `execute` tool to run a Python script. After each script runs, the harness records the code and output in your event history, then shows you the updated state on your next turn.
 
@@ -101,7 +102,7 @@ type: strings, numbers, booleans, lists, or dicts. Values are preserved exactly 
 stored — a dict comes back as a dict, a string comes back as a string.
 
 ```python
-memory["name"] = "Steve"                   # string
+memory["name"] = "Steve"                   # string (default priority 5)
 memory["count"] = 42                       # number
 memory["prefs"] = {"theme": "dark"}        # dict
 memory["tags"] = ["urgent", "home"]        # list
@@ -110,7 +111,17 @@ print(memory.get("missing"))              # None
 print(memory.get("missing", "fallback"))  # "fallback"
 del memory["name"]
 "count" in memory                          # True
+
+# Priority-aware storage (higher priority = shown first in context, survives truncation)
+memory.set("watch_task", {"timer": "982a", "chat": "81d4"}, priority=8)
+memory.set_priority("count", 3)           # lower priority for less important keys
+memory.get_priority("watch_task")         # returns 8
 ```
+
+**Priority guidance**: Your memory keys are shown in the `<agent_state>` block each turn,
+sorted by priority (highest first), truncated to fit. Set high priority (7-9) for things
+you'll need after compaction: timer IDs, active task contexts, user info, process PIDs.
+Use low priority (1-3) for nice-to-have context that can be dropped from the display.
 
 ### timers
 
@@ -213,6 +224,38 @@ includes an `output_preview` field with the last ~500 characters of output. You 
 read it directly from the work item (`work_queue[i].output_preview`) instead of calling
 `shell_output()`. Only use `shell_output()` if you need the full output and it was truncated.
 ```
+
+### Sub-agents
+
+Spawn child agent loops for parallel work. Each child runs independently with its own
+context, makes API calls, and returns its memory to you when complete.
+
+```python
+child_id = spawn_agent(
+    task="Write unit tests for the auth module in /project/src/auth.py",
+    model="claude-sonnet-4-5-20250929",             # Required: choose the model
+    memory={"project_dir": "/project"},             # Optional: seed child memory
+    max_turns=20,                                    # Max turns (default 20, hard cap 50)
+    priority=6,                                      # Priority of completion work item
+)
+# Store the child ID so you can match it when the result arrives
+memory.set("test_writer", child_id, priority=7)
+```
+
+When the child finishes, you receive a `ChildAgentCompleted` work item:
+```python
+item.type           # "ChildAgentCompleted"
+item.child_id       # Hex ID matching what spawn_agent returned
+item.success        # True if child completed normally, False if error/max_turns exceeded
+item.turns_used     # How many turns the child took
+item.summary        # Short text describing what happened
+item.result_memory  # Dict of the child's final memory (all keys/values it stored)
+```
+
+**Limits**: Max 3 concurrent children. Children cannot spawn their own children.
+Children cannot send messages to users or spawn processes — they can only use memory,
+timers, and the work queue within their own context. Store results in memory for the
+parent to retrieve.
 
 ### Context management
 

@@ -35,6 +35,9 @@ pub fn render_context(
     // Work queue
     render_work_queue(&mut out, &state.work_queue, config);
 
+    // Agent state (memory, timers, processes)
+    render_agent_state(&mut out, state, config);
+
     // Context metadata
     render_context_metadata(&mut out, state, compaction, compact_at);
 
@@ -189,6 +192,22 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
             out.push_str("type: ProcessTimeout\n");
             out.push_str(&format!("pid: {}\n", pid));
         }
+        WorkItemType::ChildAgentCompleted {
+            child_id,
+            turns_used,
+            success,
+            summary,
+            ..
+        } => {
+            out.push_str("type: ChildAgentCompleted\n");
+            out.push_str(&format!("child_id: {}\n", child_id));
+            out.push_str(&format!("success: {}\n", success));
+            out.push_str(&format!("turns_used: {}\n", turns_used));
+            out.push_str(&format!(
+                "summary: {}\n",
+                truncate_with_note(summary, content_limit)
+            ));
+        }
         WorkItemType::Compaction => {
             out.push_str("type: Compaction\n");
             out.push_str("description: \"You must compact your context.\"\n");
@@ -196,6 +215,154 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
     }
 
     out.push_str("</work_item>\n");
+}
+
+fn render_agent_state(out: &mut String, state: &HarnessState, config: &RenderConfig) {
+    let has_memory = !state.memory.is_empty();
+    let has_timers = !state.timer_manager.list().is_empty();
+    let running_processes: Vec<_> = state
+        .process_manager
+        .processes()
+        .iter()
+        .filter(|p| matches!(p.status, ProcessStatus::Running))
+        .collect();
+    let has_processes = !running_processes.is_empty();
+
+    // Skip the block entirely if there's nothing to show
+    if !has_memory && !has_timers && !has_processes {
+        return;
+    }
+
+    out.push_str("<agent_state>\n");
+
+    // Memory: sorted by priority (desc), then alphabetically
+    if has_memory {
+        let mut entries: Vec<(&String, &serde_json::Value)> = state.memory.iter().collect();
+        let priorities = &state.memory_priorities;
+        entries.sort_by(|(k1, _), (k2, _)| {
+            let p1 = priorities.get(*k1).copied().unwrap_or(5);
+            let p2 = priorities.get(*k2).copied().unwrap_or(5);
+            p2.cmp(&p1).then_with(|| k1.cmp(k2))
+        });
+
+        let total = entries.len();
+        let display_count = total.min(config.agent_state_memory_max_display);
+
+        out.push_str(&format!(
+            "Memory ({} of {} keys, by priority):\n",
+            display_count, total
+        ));
+
+        for (key, value) in entries.iter().take(display_count) {
+            let prio = priorities.get(*key).copied().unwrap_or(5);
+            let val_str = serde_json::to_string(value).unwrap_or_else(|_| "?".to_string());
+            let truncated = if val_str.len() > config.agent_state_memory_value_max_chars {
+                format!(
+                    "{}...",
+                    &val_str[..config.agent_state_memory_value_max_chars]
+                )
+            } else {
+                val_str
+            };
+            out.push_str(&format!("  [{}] {}: {}\n", prio, key, truncated));
+        }
+
+        if total > display_count {
+            let min_shown_prio = entries
+                .get(display_count - 1)
+                .map(|(k, _)| priorities.get(*k).copied().unwrap_or(5))
+                .unwrap_or(0);
+            out.push_str(&format!(
+                "  ... {} more keys at priority <={}\n",
+                total - display_count,
+                min_shown_prio
+            ));
+        }
+        out.push('\n');
+    }
+
+    // Timers
+    let timers = state.timer_manager.list();
+    if has_timers {
+        let display_count = timers.len().min(config.agent_state_timer_max_display);
+        out.push_str(&format!("Active timers ({}):\n", timers.len()));
+
+        for timer in timers.iter().take(display_count) {
+            let schedule_str = match &timer.schedule {
+                TimerSchedule::OneShot { at } => {
+                    format!("one-shot at {}", format_time(at))
+                }
+                TimerSchedule::Recurring { every, .. } => {
+                    let secs = every.as_secs();
+                    if secs >= 3600 {
+                        format!("every {}h", secs / 3600)
+                    } else if secs >= 60 {
+                        format!("every {}m", secs / 60)
+                    } else {
+                        format!("every {}s", secs)
+                    }
+                }
+            };
+            let ack_str = if timer.pending_ack {
+                " [awaiting ack]"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "  {}: \"{}\" | {} | priority {}{}\n",
+                timer.id, timer.description, schedule_str, timer.priority, ack_str
+            ));
+        }
+        if timers.len() > display_count {
+            out.push_str(&format!(
+                "  ... {} more timers\n",
+                timers.len() - display_count
+            ));
+        }
+        out.push('\n');
+    }
+
+    // Running processes
+    if has_processes {
+        let display_count = running_processes
+            .len()
+            .min(config.agent_state_process_max_display);
+        out.push_str(&format!("Running processes ({}):\n", running_processes.len()));
+
+        let now = Utc::now();
+        for proc in running_processes.iter().take(display_count) {
+            let elapsed = now - proc.started_at;
+            let elapsed_str = if elapsed.num_hours() > 0 {
+                format!("{}h {}m", elapsed.num_hours(), elapsed.num_minutes() % 60)
+            } else if elapsed.num_minutes() > 0 {
+                format!(
+                    "{}m {}s",
+                    elapsed.num_minutes(),
+                    elapsed.num_seconds() % 60
+                )
+            } else {
+                format!("{}s", elapsed.num_seconds())
+            };
+            let desc = if proc.description.is_empty() {
+                String::new()
+            } else {
+                format!(" \"{}\"", proc.description)
+            };
+            out.push_str(&format!(
+                "  {}: \"{}\"{} | running {}\n",
+                proc.id, proc.cmd, desc, elapsed_str
+            ));
+        }
+        if running_processes.len() > display_count {
+            out.push_str(&format!(
+                "  ... {} more processes\n",
+                running_processes.len() - display_count
+            ));
+        }
+        out.push('\n');
+    }
+
+    out.push_str("</agent_state>\n");
 }
 
 fn render_context_metadata(
@@ -404,5 +571,60 @@ mod tests {
         let long = "a".repeat(200);
         let result = truncate_with_note(&long, 50);
         assert!(result.contains("[truncated, 200 chars]"));
+    }
+
+    #[test]
+    fn test_render_agent_state_with_memory_and_timers() {
+        let mut state = HarnessState::new(200_000, 16384);
+
+        // Add memory with priorities
+        state.memory.insert("high_prio".to_string(), serde_json::json!("important value"));
+        state.memory_priorities.insert("high_prio".to_string(), 8);
+        state.memory.insert("low_prio".to_string(), serde_json::json!("less important"));
+        state.memory_priorities.insert("low_prio".to_string(), 3);
+        state.memory.insert("default_prio".to_string(), serde_json::json!({"nested": true}));
+        // No priority set — defaults to 5
+
+        // Add a timer
+        state.timer_manager.add(Timer {
+            id: AgentId("982a".to_string()),
+            description: "Check driveway camera".to_string(),
+            priority: 6,
+            schedule: TimerSchedule::Recurring {
+                every: std::time::Duration::from_secs(30),
+                next_fire: Utc::now() + chrono::Duration::seconds(30),
+            },
+            created_at: Utc::now(),
+            pending_ack: false,
+        });
+
+        let config = RenderConfig::default();
+        let rendered = render_context(&state, "", None, &config, 150_000);
+
+        // Agent state should appear
+        assert!(rendered.text.contains("<agent_state>"), "Missing agent_state block");
+        assert!(rendered.text.contains("</agent_state>"), "Missing closing agent_state tag");
+
+        // Memory should be sorted by priority (high first)
+        let high_pos = rendered.text.find("[8] high_prio").expect("high_prio not found");
+        let default_pos = rendered.text.find("[5] default_prio").expect("default_prio not found");
+        let low_pos = rendered.text.find("[3] low_prio").expect("low_prio not found");
+        assert!(high_pos < default_pos, "high_prio should appear before default_prio");
+        assert!(default_pos < low_pos, "default_prio should appear before low_prio");
+
+        // Timer should appear
+        assert!(rendered.text.contains("982a: \"Check driveway camera\""));
+        assert!(rendered.text.contains("every 30s"));
+        assert!(rendered.text.contains("priority 6"));
+    }
+
+    #[test]
+    fn test_render_no_agent_state_when_empty() {
+        let state = HarnessState::new(200_000, 16384);
+        let config = RenderConfig::default();
+        let rendered = render_context(&state, "", None, &config, 150_000);
+
+        // No agent_state block when nothing to show
+        assert!(!rendered.text.contains("<agent_state>"));
     }
 }

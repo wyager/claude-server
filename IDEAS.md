@@ -2,7 +2,7 @@
 
 ## Context Window Improvements
 
-- **Show agent state in context**: Render memory keys (with truncated values), active timers, and running processes in the `<context>` block. After compaction or restart, the agent currently has no idea what state it's in without writing discovery scripts. This was the #1 usability issue we observed during testing.
+- ~~**Show agent state in context**~~: DONE — `<agent_state>` block rendered between work_queue and context with memory (sorted by priority), active timers, running processes. Bounded by RenderConfig limits.
 
 - **Smarter token estimation**: Replace `chars / 4` approximation with actual tokenizer (tiktoken or the Anthropic counting endpoint). The compaction dry-run estimate would be more accurate, and we could avoid the "compaction loop" issue where thresholds are set too close to base context overhead.
 
@@ -14,7 +14,7 @@
 
 - **Self-improvement**: Let the agent edit its own system prompt or add custom Python functions that persist across turns (like Conway's self-improvement). The agent could learn project-specific patterns and optimize its own workflow.
 
-- **Sub-agents**: Spawn child agent loops for parallel work (like Conway's `agent()` function). The root agent delegates a task, continues working, and gets notified when the child completes.
+- ~~**Sub-agents**~~: DONE — `spawn_agent(task, model, memory, max_turns, priority)` launches child agents via `child_agent.rs`. Max 3 concurrent, max 50 turns, no recursion. Children sandboxed (no message sending, no process spawning). Returns `ChildAgentCompleted` work item.
 
 - **Structured tool outputs**: Instead of just stdout strings, let Python scripts return structured data (JSON) that gets rendered more usefully in history and work items.
 
@@ -32,7 +32,7 @@
 
 ## Security & Sandboxing
 
-- **Python execution timeout**: Add a configurable timeout (e.g., 5 seconds) on Python script execution. Currently a `time.sleep(60)` in agent code blocks the entire core loop with no protection.
+- ~~**Python execution timeout**~~: DONE — `CLAUDE_SERVER_PYTHON_TIMEOUT` env var (default 5s). Uses `PyErr_SetInterrupt` to interrupt blocked scripts.
 
 - **Import restrictions**: Optionally block dangerous imports (`subprocess`, `os.system`, `socket`) to prevent the agent from bypassing harness controls. Could use a custom import hook or a restricted `__builtins__`.
 
@@ -64,7 +64,7 @@
 
 ## Architecture
 
-- **Streaming responses**: Add SSE or WebSocket support so the chat UI can show agent messages as they arrive instead of polling every 1.5 seconds.
+- ~~**Streaming responses**~~: DONE — SSE via `GET /messages/:chat_id/stream` with `message` and `status` events. Chat UI uses EventSource with typing indicators. Uses `tokio::sync::broadcast`.
 
 - **Multi-turn conversation mode**: Optional mode that uses actual multi-turn API messages instead of single-message rebuild. Better quality for interactive conversations, at the cost of losing the stable-prefix caching advantage.
 

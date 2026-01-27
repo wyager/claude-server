@@ -1,15 +1,18 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use chrono::Utc;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::api_client::ApiClient;
+use crate::child_agent;
 use crate::compaction::CompactionManager;
 use crate::config::Config;
 use crate::db::Database;
+use crate::http_server::BroadcastMsg;
 use crate::process::{ProcessEvent, ProcessSupervisor};
 use crate::python;
 use crate::renderer;
@@ -24,6 +27,14 @@ pub enum HarnessEvent {
         content: String,
     },
     Process(ProcessEvent),
+    ChildCompleted {
+        child_id: AgentId,
+        result_memory: HashMap<String, serde_json::Value>,
+        turns_used: u32,
+        success: bool,
+        summary: String,
+        priority: u8,
+    },
     Shutdown,
 }
 
@@ -35,8 +46,14 @@ pub struct CoreLoop {
     process_supervisor: ProcessSupervisor,
     compaction: CompactionManager,
     event_rx: mpsc::UnboundedReceiver<HarnessEvent>,
+    event_tx: mpsc::UnboundedSender<HarnessEvent>,
     deployment_context: String,
     dump_turns: bool,
+    dump_dir: Option<PathBuf>,
+    turn_counter: u32,
+    broadcast_tx: broadcast::Sender<BroadcastMsg>,
+    active_children: u32,
+    max_children: u32,
 }
 
 impl CoreLoop {
@@ -47,9 +64,16 @@ impl CoreLoop {
         api_client: ApiClient,
         process_supervisor: ProcessSupervisor,
         event_rx: mpsc::UnboundedReceiver<HarnessEvent>,
+        event_tx: mpsc::UnboundedSender<HarnessEvent>,
         deployment_context: String,
         dump_turns: bool,
+        dump_dir: Option<PathBuf>,
+        broadcast_tx: broadcast::Sender<BroadcastMsg>,
     ) -> Self {
+        let max_children: u32 = std::env::var("CLAUDE_SERVER_MAX_CHILDREN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
         Self {
             state,
             config,
@@ -58,8 +82,14 @@ impl CoreLoop {
             process_supervisor,
             compaction: CompactionManager::new(),
             event_rx,
+            event_tx,
             deployment_context,
             dump_turns,
+            dump_dir,
+            turn_counter: 0,
+            broadcast_tx,
+            active_children: 0,
+            max_children,
         }
     }
 
@@ -89,6 +119,9 @@ impl CoreLoop {
                 if !idle {
                     println!("[core] Idle, waiting for events...");
                     idle = true;
+                    let _ = self.broadcast_tx.send(BroadcastMsg::Status {
+                        status: "idle".to_string(),
+                    });
                 }
 
                 // Sleep until the next timer deadline, or a long time if no timers
@@ -173,13 +206,10 @@ impl CoreLoop {
             self.state.work_queue.len()
         );
 
-        if self.dump_turns {
-            println!("\n{}", "=".repeat(80));
-            println!("CONTEXT SENT TO MODEL ({} chars)", rendered.text.len());
-            println!("{}\n", "=".repeat(80));
-            println!("{}", rendered.text);
-            println!("{}\n", "-".repeat(80));
-        }
+        // Broadcast thinking status
+        let _ = self.broadcast_tx.send(BroadcastMsg::Status {
+            status: "thinking".to_string(),
+        });
 
         // Call Claude API
         let api_result = self.api_client.call(&rendered).await?;
@@ -192,19 +222,18 @@ impl CoreLoop {
             api_result.cache_read_tokens
         );
 
-        if self.dump_turns {
-            if let Some(thinking) = &api_result.thinking {
-                println!("\n{}", "=".repeat(80));
-                println!("AGENT THINKING");
-                println!("{}\n", "=".repeat(80));
-                println!("{}", thinking);
-                println!("{}\n", "-".repeat(80));
-            }
-            println!("\n{}", "=".repeat(80));
-            println!("AGENT RESPONSE (Python code)");
-            println!("{}\n", "=".repeat(80));
-            println!("{}", api_result.code);
-            println!("{}\n", "-".repeat(80));
+        // Dump turn (to stdout and/or file)
+        self.turn_counter += 1;
+        if self.dump_turns || self.dump_dir.is_some() {
+            write_turn_dump(
+                "parent",
+                self.turn_counter,
+                &rendered.text,
+                api_result.thinking.as_deref(),
+                &api_result.code,
+                self.dump_turns,
+                self.dump_dir.as_deref(),
+            );
         }
 
         // Update token tracking
@@ -213,12 +242,18 @@ impl CoreLoop {
         // Load process outputs for shell_output() calls
         let process_outputs = self.db.load_all_process_outputs().unwrap_or_default();
 
+        // Broadcast executing status
+        let _ = self.broadcast_tx.send(BroadcastMsg::Status {
+            status: "executing".to_string(),
+        });
+
         // Execute Python
-        let exec_result = python::execute(
+        let exec_result = python::execute_with_timeout(
             &self.state,
             &api_result.code,
             self.compaction.active,
             &process_outputs,
+            self.config.python_timeout_secs,
         );
 
         // Record in history
@@ -360,6 +395,33 @@ impl CoreLoop {
                     });
                 }
             },
+            HarnessEvent::ChildCompleted {
+                child_id,
+                result_memory,
+                turns_used,
+                success,
+                summary,
+                priority,
+            } => {
+                self.active_children = self.active_children.saturating_sub(1);
+                let id = self.state.id_generator.next();
+                println!(
+                    "[core] Child agent {} completed (success={}, turns={})",
+                    child_id, success, turns_used
+                );
+                self.state.work_queue.push(WorkItem {
+                    id,
+                    priority,
+                    time: Utc::now(),
+                    item_type: WorkItemType::ChildAgentCompleted {
+                        child_id,
+                        result_memory,
+                        turns_used,
+                        success,
+                        summary,
+                    },
+                });
+            }
             HarnessEvent::Shutdown => {} // handled in run()
         }
     }
@@ -390,6 +452,10 @@ impl CoreLoop {
         }
         for key in effects.memory_deletes {
             self.state.memory.remove(&key);
+            self.state.memory_priorities.remove(&key);
+        }
+        for (key, priority) in effects.memory_priority_sets {
+            self.state.memory_priorities.insert(key, priority);
         }
 
         // Queue removes
@@ -529,12 +595,75 @@ impl CoreLoop {
             }
         }
 
+        // Child agent spawns
+        for req in effects.child_agent_starts {
+            if self.active_children >= self.max_children {
+                eprintln!(
+                    "[core] Cannot spawn child agent: max {} concurrent children reached",
+                    self.max_children
+                );
+                // Insert an error work item so the agent knows
+                let wid = self.state.id_generator.next();
+                self.state.work_queue.push(WorkItem {
+                    id: wid,
+                    priority: req.priority,
+                    time: Utc::now(),
+                    item_type: WorkItemType::ChildAgentCompleted {
+                        child_id: req.id,
+                        result_memory: HashMap::new(),
+                        turns_used: 0,
+                        success: false,
+                        summary: format!(
+                            "Could not spawn: max {} concurrent children reached",
+                            self.max_children
+                        ),
+                    },
+                });
+                continue;
+            }
+
+            self.active_children += 1;
+            println!(
+                "[core] Spawning child agent {} (model={}, max_turns={})",
+                req.id, req.model, req.max_turns
+            );
+
+            let config = self.config.clone();
+            let db = self.db.clone();
+            let parent_tx = self.event_tx.clone();
+            let deployment_context = self.deployment_context.clone();
+            let system_prompt = config
+                .load_system_prompt()
+                .unwrap_or_else(|_| String::new());
+            let dump_dir = self.dump_dir.clone();
+
+            tokio::spawn(async move {
+                child_agent::run_child_agent(
+                    req,
+                    config,
+                    db,
+                    deployment_context,
+                    system_prompt,
+                    parent_tx,
+                    dump_dir,
+                )
+                .await;
+            });
+        }
+
         // Outbound messages
         for msg in effects.messages {
             println!("[message] -> chat:{} | {}", msg.chat_id, msg.content);
-            let _ = self
-                .db
-                .save_outbound_message(&msg.chat_id, &msg.content);
+            if let Ok(id) = self.db.save_outbound_message(&msg.chat_id, &msg.content) {
+                let _ = self.broadcast_tx.send(BroadcastMsg::Message {
+                    chat_id: msg.chat_id,
+                    content: msg.content,
+                    id,
+                    created_at: chrono::Utc::now()
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string(),
+                });
+            }
         }
 
         // Compaction script
@@ -544,11 +673,12 @@ impl CoreLoop {
         if effects.compact_called && self.compaction.active {
             println!("[core] Compaction executed");
             // Execute the compaction script by running it as Python against cloned state
-            let compact_result = python::execute(
+            let compact_result = python::execute_with_timeout(
                 &self.state,
                 &self.compaction.script,
                 true,
                 &HashMap::new(),
+                self.config.python_timeout_secs,
             );
 
             if compact_result.is_error {
@@ -600,6 +730,61 @@ impl CoreLoop {
                 self.compaction.complete();
                 println!("[core] Compaction complete");
             }
+        }
+    }
+}
+
+/// Write a turn dump to stdout and/or a file.
+pub fn write_turn_dump(
+    agent_name: &str,
+    turn_number: u32,
+    context: &str,
+    thinking: Option<&str>,
+    code: &str,
+    to_stdout: bool,
+    dump_dir: Option<&std::path::Path>,
+) {
+    let sep = "=".repeat(80);
+    let dash = "-".repeat(80);
+
+    let mut dump = String::with_capacity(context.len() + code.len() + 512);
+    dump.push_str(&format!("{}\n", sep));
+    dump.push_str(&format!(
+        "[{}] Turn {} — CONTEXT SENT TO MODEL ({} chars)\n",
+        agent_name,
+        turn_number,
+        context.len()
+    ));
+    dump.push_str(&format!("{}\n\n", sep));
+    dump.push_str(context);
+    dump.push_str(&format!("\n{}\n", dash));
+
+    if let Some(thinking) = thinking {
+        dump.push_str(&format!("\n{}\n", sep));
+        dump.push_str(&format!("[{}] Turn {} — AGENT THINKING\n", agent_name, turn_number));
+        dump.push_str(&format!("{}\n\n", sep));
+        dump.push_str(thinking);
+        dump.push_str(&format!("\n{}\n", dash));
+    }
+
+    dump.push_str(&format!("\n{}\n", sep));
+    dump.push_str(&format!(
+        "[{}] Turn {} — AGENT RESPONSE (Python code)\n",
+        agent_name, turn_number
+    ));
+    dump.push_str(&format!("{}\n\n", sep));
+    dump.push_str(code);
+    dump.push_str(&format!("\n{}\n", dash));
+
+    if to_stdout {
+        println!("{}", dump);
+    }
+
+    if let Some(dir) = dump_dir {
+        let filename = format!("{}-{:03}-dump.txt", agent_name, turn_number);
+        let path = dir.join(&filename);
+        if let Err(e) = std::fs::write(&path, &dump) {
+            eprintln!("[dump] Failed to write {}: {}", path.display(), e);
         }
     }
 }

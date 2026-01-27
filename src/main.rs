@@ -1,5 +1,6 @@
 mod api_client;
 mod chat;
+mod child_agent;
 mod compaction;
 mod config;
 mod core_loop;
@@ -12,8 +13,10 @@ mod types;
 
 use std::sync::Arc;
 
+use std::path::PathBuf;
+
 use anyhow::Result;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -28,7 +31,8 @@ fn main() {
             println!("  chat        Start the chat web UI");
             println!();
             println!("Options (daemon mode):");
-            println!("  --dump-turns   Print the full context and agent response each turn");
+            println!("  --dump-turns          Print the full context and agent response each turn");
+            println!("  --dump-dir <path>     Write turn dumps to files in <path> (parent + children)");
             println!();
             println!("Environment variables:");
             println!("  ANTHROPIC_API_KEY             API key (required for daemon)");
@@ -40,8 +44,12 @@ fn main() {
         }
         _ => {
             let dump_turns = args.iter().any(|a| a == "--dump-turns");
+            let dump_dir = args
+                .windows(2)
+                .find(|w| w[0] == "--dump-dir")
+                .map(|w| PathBuf::from(&w[1]));
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-            if let Err(e) = rt.block_on(run_daemon(dump_turns)) {
+            if let Err(e) = rt.block_on(run_daemon(dump_turns, dump_dir)) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -49,7 +57,7 @@ fn main() {
     }
 }
 
-async fn run_daemon(dump_turns: bool) -> Result<()> {
+async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>) -> Result<()> {
     let config = Arc::new(config::Config::from_env()?);
 
     println!("Claude Server starting...");
@@ -57,6 +65,11 @@ async fn run_daemon(dump_turns: bool) -> Result<()> {
     println!("  Listen: {}", config.listen_addr);
     println!("  DB: {:?}", config.db_path);
     println!("  Compact at: {} tokens, target: {} tokens", config.compact_at, config.compact_target);
+    println!("  Python timeout: {}s", config.python_timeout_secs);
+    if let Some(ref dir) = dump_dir {
+        std::fs::create_dir_all(dir)?;
+        println!("  Dump dir: {:?}", dir);
+    }
 
     // Initialize Python
     python::initialize_python();
@@ -95,6 +108,7 @@ async fn run_daemon(dump_turns: bool) -> Result<()> {
     // Create event channels
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (process_event_tx, mut process_event_rx) = mpsc::unbounded_channel();
+    let (broadcast_tx, _) = broadcast::channel::<http_server::BroadcastMsg>(256);
 
     // Create API client
     let api_client = api_client::ApiClient::new(config.clone())?;
@@ -111,8 +125,11 @@ async fn run_daemon(dump_turns: bool) -> Result<()> {
         api_client,
         process_supervisor,
         event_rx,
+        event_tx.clone(),
         deployment_context,
         dump_turns,
+        dump_dir,
+        broadcast_tx.clone(),
     );
 
     // Forward process events to the main event channel
@@ -137,7 +154,7 @@ async fn run_daemon(dump_turns: bool) -> Result<()> {
     });
 
     // Start HTTP server
-    let router = http_server::create_router(event_tx.clone(), database.clone());
+    let router = http_server::create_router(event_tx.clone(), database.clone(), broadcast_tx);
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     println!("  HTTP server listening on {}", config.listen_addr);
     tokio::spawn(async move {

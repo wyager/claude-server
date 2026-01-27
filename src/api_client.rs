@@ -36,6 +36,19 @@ impl ApiClient {
         })
     }
 
+    /// Create an API client with a pre-loaded system prompt (used by child agents).
+    pub fn new_with_prompt(config: Arc<Config>, system_prompt: &str) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .build()?;
+
+        Ok(Self {
+            client,
+            config,
+            system_prompt: system_prompt.to_string(),
+        })
+    }
+
     pub async fn call(&self, rendered: &RenderedContext) -> Result<ApiTurnResult> {
         let request = self.build_request(rendered);
         let mut retries = 0;

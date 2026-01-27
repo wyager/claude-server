@@ -94,6 +94,10 @@ body {
 }
 #send:hover { background: #1d4ed8; }
 #send:disabled { background: #555; cursor: not-allowed; }
+.msg.typing {
+    opacity: 0.6;
+    font-style: italic;
+}
 </style>
 </head>
 <body>
@@ -111,9 +115,8 @@ body {
 const API_URL = "{{API_URL}}";
 const CHAT_ID = crypto.randomUUID();
 const seenIds = new Set();
-let pollTimer = null;
-let lastNewMsg = 0;
-let polling = false;
+let eventSource = null;
+let typingEl = null;
 
 const messagesEl = document.getElementById("messages");
 const inputEl = document.getElementById("input");
@@ -133,24 +136,8 @@ inputEl.addEventListener("keydown", (e) => {
     }
 });
 
-// Check API connectivity
-async function checkStatus() {
-    try {
-        const res = await fetch(`${API_URL}/status`);
-        if (res.ok) {
-            statusEl.textContent = "connected";
-            statusEl.className = "connected";
-        } else {
-            statusEl.textContent = "server error";
-            statusEl.className = "error";
-        }
-    } catch {
-        statusEl.textContent = "disconnected";
-        statusEl.className = "error";
-    }
-}
-
 function appendMessage(role, content, time) {
+    removeTypingIndicator();
     const div = document.createElement("div");
     div.className = `msg ${role}`;
     div.textContent = content;
@@ -162,6 +149,85 @@ function appendMessage(role, content, time) {
     }
     messagesEl.appendChild(div);
     messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function showTypingIndicator() {
+    if (typingEl) return;
+    typingEl = document.createElement("div");
+    typingEl.className = "msg agent typing";
+    typingEl.textContent = "thinking...";
+    messagesEl.appendChild(typingEl);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function updateTypingIndicator(status) {
+    if (status === "thinking") {
+        showTypingIndicator();
+        if (typingEl) typingEl.textContent = "thinking...";
+    } else if (status === "executing") {
+        showTypingIndicator();
+        if (typingEl) typingEl.textContent = "executing...";
+    } else if (status === "idle") {
+        removeTypingIndicator();
+    }
+}
+
+function removeTypingIndicator() {
+    if (typingEl) {
+        typingEl.remove();
+        typingEl = null;
+    }
+}
+
+// Connect SSE for real-time messages and status
+function connectSSE() {
+    if (eventSource) eventSource.close();
+
+    eventSource = new EventSource(`${API_URL}/messages/${CHAT_ID}/stream`);
+
+    eventSource.addEventListener("message", (e) => {
+        const msg = JSON.parse(e.data);
+        if (!seenIds.has(msg.id)) {
+            seenIds.add(msg.id);
+            appendMessage("agent", msg.content, msg.created_at);
+        }
+    });
+
+    eventSource.addEventListener("status", (e) => {
+        const data = JSON.parse(e.data);
+        updateTypingIndicator(data.status);
+    });
+
+    eventSource.addEventListener("open", () => {
+        statusEl.textContent = "connected";
+        statusEl.className = "connected";
+    });
+
+    eventSource.addEventListener("error", () => {
+        statusEl.textContent = "reconnecting...";
+        statusEl.className = "error";
+        // EventSource auto-reconnects
+    });
+}
+
+// Load any existing messages (catch-up) then connect SSE
+async function init() {
+    try {
+        const res = await fetch(`${API_URL}/messages/${CHAT_ID}`);
+        const data = await res.json();
+        for (const msg of data.messages) {
+            if (!seenIds.has(msg.id)) {
+                seenIds.add(msg.id);
+                appendMessage("agent", msg.content, msg.created_at);
+            }
+        }
+        statusEl.textContent = "connected";
+        statusEl.className = "connected";
+    } catch {
+        statusEl.textContent = "disconnected";
+        statusEl.className = "error";
+    }
+    connectSSE();
 }
 
 async function sendMessage() {
@@ -182,53 +248,12 @@ async function sendMessage() {
                 content: content
             })
         });
-        startPolling();
     } catch (err) {
         appendMessage("agent", `[Error sending message: ${err.message}]`);
     }
 }
 
-async function poll() {
-    try {
-        const res = await fetch(`${API_URL}/messages/${CHAT_ID}`);
-        const data = await res.json();
-        let hasNew = false;
-
-        for (const msg of data.messages) {
-            if (!seenIds.has(msg.id)) {
-                seenIds.add(msg.id);
-                appendMessage("agent", msg.content, msg.created_at);
-                hasNew = true;
-            }
-        }
-
-        if (hasNew) {
-            lastNewMsg = Date.now();
-        } else if (Date.now() - lastNewMsg > 30000 && polling) {
-            stopPolling();
-        }
-    } catch {
-        // silently retry next interval
-    }
-}
-
-function startPolling() {
-    if (pollTimer) clearInterval(pollTimer);
-    polling = true;
-    lastNewMsg = Date.now();
-    pollTimer = setInterval(poll, 1500);
-    poll(); // immediate first poll
-}
-
-function stopPolling() {
-    if (pollTimer) clearInterval(pollTimer);
-    pollTimer = null;
-    polling = false;
-}
-
-// Initial status check
-checkStatus();
-setInterval(checkStatus, 10000);
+init();
 </script>
 </body>
 </html>
