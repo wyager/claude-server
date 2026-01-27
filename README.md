@@ -505,8 +505,8 @@ spawn_agent(
 )
 ```
 
-Children can send messages via `send_message()` but cannot spawn processes
-(`shell_exec`) or spawn their own children (`spawn_agent` raises `RuntimeError`).
+Children have full `shell_exec` support (own ProcessSupervisor + event loop).
+Recursion depth is controlled by `child_depth_remaining: u32` in `AgentPermissions`.
 Max 3 concurrent children (`CLAUDE_SERVER_MAX_CHILDREN`).
 When a child finishes, a `ChildAgentCompleted` work item arrives with `result_memory`,
 `turns_used`, `success`, and `summary`.
@@ -1394,7 +1394,7 @@ claude-server/
     db.rs                 -- SQLite persistence (state JSON blob, process output, messages)
     process.rs            -- Tokio process spawning/monitoring (output capture, completion events)
     compaction.rs         -- Compaction state machine (trigger, script accumulation, execution)
-    child_agent.rs        -- Sub-agent loop (simplified core loop, can send msgs, no procs/children)
+    agent_loop.rs         -- Unified agent loop (AgentLoop parameterized by AgentPermissions, used by parent + children)
     http_server.rs        -- Axum HTTP API (POST /message, GET /status, GET /messages/:chat_id, SSE stream)
     chat.rs               -- Chat UI subcommand (serves embedded HTML)
     chat.html             -- Single-file HTML/CSS/JS chat interface
@@ -1436,6 +1436,7 @@ The chat UI:
 - Sends messages via POST /message to the daemon API
 - Streams agent responses in real time via SSE (`GET /messages/:chat_id/stream`)
 - Shows typing indicators (thinking.../executing...) during agent turns
+- Displays session cost and turn count in header (`$X.XX | N turns`)
 - Auto-scrolls on new messages
 
 ### HTTP API
@@ -1446,6 +1447,7 @@ The chat UI:
 | `/status` | GET | Health check `{ status, model }` |
 | `/messages/:chat_id` | GET | Get agent responses for a chat `{ messages: [...] }` |
 | `/messages/:chat_id/stream` | GET | SSE stream of `message` and `status` events |
+| `/cost` | GET | Token usage + estimated USD cost `{ input_tokens, output_tokens, ..., estimated_cost_usd }` |
 | `/shutdown` | POST | Graceful shutdown |
 
 All endpoints have CORS enabled (permissive).
@@ -1464,6 +1466,10 @@ All endpoints have CORS enabled (permissive).
 | `CLAUDE_SERVER_MAX_TOKENS` | `16384` | Max output tokens per turn |
 | `CLAUDE_SERVER_PYTHON_TIMEOUT` | `5` | Python script execution timeout (seconds) |
 | `CLAUDE_SERVER_MAX_CHILDREN` | `3` | Max concurrent sub-agent children |
+| `CLAUDE_SERVER_COST_INPUT` | `3.0` | Input token cost per million tokens (USD) |
+| `CLAUDE_SERVER_COST_OUTPUT` | `15.0` | Output token cost per million tokens (USD) |
+| `CLAUDE_SERVER_COST_CACHE_READ` | `0.30` | Cache read token cost per million tokens (USD) |
+| `CLAUDE_SERVER_COST_CACHE_WRITE` | `3.75` | Cache write token cost per million tokens (USD) |
 
 ### Building
 

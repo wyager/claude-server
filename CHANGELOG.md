@@ -2,6 +2,23 @@
 
 ## 2026-01-27 (cont.)
 
+### Unified Agent Loop
+- `agent_loop.rs` replaces `child_agent.rs` — single `AgentLoop` type parameterized by `AgentPermissions`
+- `core_loop.rs` is now a thin wrapper that creates an `AgentLoop` with parent permissions
+- Children now have full `shell_exec` support (own ProcessSupervisor + event loop)
+- `child_depth_remaining: u32` replaces the old boolean — configurable recursion depth
+- `AgentPermissions` struct in `types.rs` controls: `can_compact`, `max_turns`, `child_depth_remaining`
+
+### Cost Tracking
+- `TokenAccumulator` tracks input/output/cache tokens per session
+- `GET /cost` endpoint returns token counts + estimated USD cost
+- Chat UI header shows `$X.XX | N turns`
+- Pricing configurable via env vars: `CLAUDE_SERVER_COST_INPUT` (default $3/M), `CLAUDE_SERVER_COST_OUTPUT` ($15/M), `CLAUDE_SERVER_COST_CACHE_READ` ($0.30/M), `CLAUDE_SERVER_COST_CACHE_WRITE` ($3.75/M)
+
+### Non-blocking Design Principle
+- Added to CLAUDE.md key design patterns and IDEAS.md header
+- HTTP request tool marked as REJECTED in IDEAS.md (violates non-blocking principle)
+
 ### Child Agent Deployment Preamble Fix
 - Updated child agent deployment preamble to accurately tell children they can `send_message()`
 - Previously the preamble told children they were fully sandboxed (no messaging), causing

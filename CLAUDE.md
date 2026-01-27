@@ -48,14 +48,14 @@ See `INTERPRETER.md` for details on the Python integration.
 | `main.rs` | CLI dispatch: default runs daemon, `chat` runs web UI |
 | `config.rs` | Config from env vars (`ANTHROPIC_API_KEY`, model, ports, paths) |
 | `types.rs` | Core types: WorkQueue, EventHistory, TimerManager, ProcessManager, Memory, HarnessState, API request/response types |
-| `core_loop.rs` | Main event loop: drain events → check timers → render → API call → Python exec → apply side effects → persist |
+| `core_loop.rs` | Thin wrapper: creates an `AgentLoop` with parent permissions and runs it |
 | `python.rs` | PyO3 executor: #[pyclass] wrappers for work_queue, memory, timers, history, harness functions. SideEffectCollector pattern. |
 | `renderer.rs` | Serialize HarnessState into XML-formatted context text for the API call |
 | `api_client.rs` | Claude Messages API client (reqwest, retry logic, tool_use extraction) |
 | `db.rs` | SQLite persistence (state as JSON blob, process output, outbound messages) |
 | `process.rs` | Tokio-based process spawning, output capture, completion/failure/timeout events |
 | `compaction.rs` | Compaction state machine (trigger detection, script accumulation, execution) |
-| `child_agent.rs` | Sub-agent loop: simplified core loop for spawned child agents (can send messages, no process spawning/child spawning) |
+| `agent_loop.rs` | Unified agent loop: single `AgentLoop` type parameterized by `AgentPermissions`. Used by both parent and child agents. Children get own ProcessSupervisor + event loop. |
 | `http_server.rs` | Axum HTTP API: POST /message, GET /status, GET /messages/:chat_id, GET /messages/:chat_id/stream (SSE), POST /shutdown |
 | `chat.rs` | Chat UI subcommand: serves embedded HTML with API URL injection |
 | `chat.html` | Single-file HTML/CSS/JS chat interface (embedded via include_str!) |
@@ -109,11 +109,11 @@ and running processes. Bounded by RenderConfig limits (20 memory keys, 20 timers
 10 processes).
 
 **Sub-agents**: `spawn_agent(task, model, memory, max_turns, priority)` launches
-a child agent loop (`child_agent.rs`) that runs independently and returns a
+a child agent via the unified `AgentLoop` (in `agent_loop.rs`), parameterized by
+`AgentPermissions`. Children have full `shell_exec` support (own ProcessSupervisor
++ event loop). `child_depth_remaining: u32` controls recursion depth. Returns a
 `ChildAgentCompleted` work item with `result_memory`, `turns_used`, `success`,
-and `summary`. Max 3 concurrent children, max 50 turns, no recursion. Children
-can send messages via `send_message()` but cannot spawn processes (`shell_exec`)
-or spawn their own children (`spawn_agent` raises `RuntimeError`).
+and `summary`. Max 3 concurrent children.
 
 **Streaming responses (SSE)**: A `tokio::sync::broadcast` channel delivers
 messages in real time. The SSE endpoint (`GET /messages/:chat_id/stream`)
@@ -127,6 +127,7 @@ POST /message                    { chat_id?, user, content } → { status, chat_
 GET  /status                     → { status, model }
 GET  /messages/:chat_id          → { messages: [...] }
 GET  /messages/:chat_id/stream   SSE stream (message + status events)
+GET  /cost                       → { input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, estimated_cost_usd }
 POST /shutdown                   → { status }
 ```
 
@@ -147,3 +148,7 @@ All endpoints have CORS enabled (permissive). The chat UI uses these directly.
 | `CLAUDE_SERVER_MAX_TOKENS` | `16384` | Max output tokens per turn |
 | `CLAUDE_SERVER_PYTHON_TIMEOUT` | `5` | Python script execution timeout (seconds) |
 | `CLAUDE_SERVER_MAX_CHILDREN` | `3` | Max concurrent sub-agent children |
+| `CLAUDE_SERVER_COST_INPUT` | `3.0` | Input token cost per million tokens (USD) |
+| `CLAUDE_SERVER_COST_OUTPUT` | `15.0` | Output token cost per million tokens (USD) |
+| `CLAUDE_SERVER_COST_CACHE_READ` | `0.30` | Cache read token cost per million tokens (USD) |
+| `CLAUDE_SERVER_COST_CACHE_WRITE` | `3.75` | Cache write token cost per million tokens (USD) |

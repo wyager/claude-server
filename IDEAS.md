@@ -22,7 +22,7 @@ with `block_for` instead.
 
 - ~~**Sub-agents**~~: DONE — `spawn_agent(task, model, memory, max_turns, priority)` launches child agents via `child_agent.rs`. Max 3 concurrent, max 50 turns, no recursion. Children can `send_message()` but cannot `shell_exec()` or `spawn_agent()`. Returns `ChildAgentCompleted` work item.
 
-- **Child process support**: Give child agents full `shell_exec` with their own ProcessSupervisor and event loop, so they can run commands, wait for results, etc. Currently children are limited to pure Python + memory + messaging.
+- ~~**Child process support**~~: DONE — Children now have full `shell_exec` via the unified `AgentLoop` in `agent_loop.rs`, with their own ProcessSupervisor + event loop. `child_depth_remaining: u32` controls recursion depth.
 
 - **Structured tool outputs**: Instead of just stdout strings, let Python scripts return structured data (JSON) that gets rendered more usefully in history and work items.
 
@@ -56,7 +56,7 @@ with `block_for` instead.
 
 - **Session replay**: Record the full sequence of rendered contexts and agent responses, then replay them for debugging or analysis without making API calls.
 
-- **Cost tracking**: Track API cost per session (input tokens × rate + output tokens × rate + thinking tokens). Show running total in the chat UI.
+- ~~**Cost tracking**~~: DONE — `TokenAccumulator` tracks input/output/cache tokens per session. `GET /cost` endpoint returns token counts + estimated USD cost. Chat UI header shows `$X.XX | N turns`. Pricing configurable via env vars.
 
 ## Chat UI
 
