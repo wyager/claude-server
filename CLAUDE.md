@@ -56,7 +56,7 @@ See `INTERPRETER.md` for details on the Python integration.
 | `process.rs` | Tokio-based process spawning, output capture, completion/failure/timeout events |
 | `compaction.rs` | Compaction state machine (trigger detection, script accumulation, execution) |
 | `agent_loop.rs` | Unified agent loop: single `AgentLoop` type parameterized by `AgentPermissions`. Used by both parent and child agents. Children get own ProcessSupervisor + event loop. |
-| `http_server.rs` | Axum HTTP API: POST /message, GET /status, GET /messages/:chat_id, GET /messages/:chat_id/stream (SSE), POST /shutdown |
+| `http_server.rs` | Axum HTTP API: POST /message, POST /event, GET /status, GET /messages/:chat_id, GET /messages/:chat_id/stream (SSE), POST /shutdown |
 | `chat.rs` | Chat UI subcommand: serves embedded HTML with API URL injection |
 | `chat.html` | Single-file HTML/CSS/JS chat interface (embedded via include_str!) |
 | `system_prompt.txt` | System prompt sent to Claude on every API call |
@@ -124,6 +124,7 @@ pushes `message` and `status` events to connected clients. The chat UI uses
 
 ```
 POST /message                    { chat_id?, user, content } → { status, chat_id }
+POST /event                      { source, type, data, priority? } → { status }
 GET  /status                     → { status, model }
 GET  /messages/:chat_id          → { messages: [...] }
 GET  /messages/:chat_id/stream   SSE stream (message + status events)

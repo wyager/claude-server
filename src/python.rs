@@ -127,6 +127,9 @@ struct PyWorkItem {
     turns_used: Option<u32>,
     success: Option<bool>,
     summary: Option<String>,
+    source: Option<String>,
+    event_type: Option<String>,
+    event_data: Option<serde_json::Value>,
 }
 
 #[pymethods]
@@ -161,6 +164,8 @@ impl PyWorkItem {
                 "output_preview" => self.output_preview.as_deref(),
                 "child_id" => self.child_id.as_deref(),
                 "summary" => self.summary.as_deref(),
+                "source" => self.source.as_deref(),
+                "event_type" => self.event_type.as_deref(),
                 _ => None,
             };
             if let Some(s) = val {
@@ -192,6 +197,16 @@ impl PyWorkItem {
                 "result_memory" => match &self.result_memory {
                     Some(mem) => {
                         let json_str = serde_json::to_string(mem).unwrap_or_default();
+                        let json_mod = py.import("json")?;
+                        Ok(json_mod.call_method1("loads", (json_str,))?.unbind())
+                    }
+                    None => Err(PyAttributeError::new_err(format!(
+                        "This {} item has no '{}' field", self.item_type, name
+                    ))),
+                },
+                "data" => match &self.event_data {
+                    Some(data) => {
+                        let json_str = serde_json::to_string(data).unwrap_or_default();
                         let json_mod = py.import("json")?;
                         Ok(json_mod.call_method1("loads", (json_str,))?.unbind())
                     }
@@ -298,6 +313,10 @@ fn work_item_to_py(item: &WorkItem) -> PyWorkItem {
                 "ChildAgentCompleted",
                 None, None, None, None, None, None, None, None, None,
             ),
+            WorkItemType::ExternalEvent { .. } => (
+                "ExternalEvent",
+                None, None, None, None, None, None, None, None, None,
+            ),
             WorkItemType::Compaction => (
                 "Compaction",
                 None,
@@ -337,6 +356,20 @@ fn work_item_to_py(item: &WorkItem) -> PyWorkItem {
         _ => (None, None, None, None, None),
     };
 
+    // Extract external event fields
+    let (source, event_type, event_data) = match &item.item_type {
+        WorkItemType::ExternalEvent {
+            source,
+            event_type,
+            data,
+        } => (
+            Some(source.clone()),
+            Some(event_type.clone()),
+            Some(data.clone()),
+        ),
+        _ => (None, None, None),
+    };
+
     PyWorkItem {
         id: item.id.0.clone(),
         priority: item.priority,
@@ -357,6 +390,9 @@ fn work_item_to_py(item: &WorkItem) -> PyWorkItem {
         turns_used,
         success,
         summary,
+        source,
+        event_type,
+        event_data,
     }
 }
 

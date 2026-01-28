@@ -34,6 +34,12 @@ pub enum HarnessEvent {
         child_cache_creation_tokens: u64,
         child_cache_read_tokens: u64,
     },
+    ExternalEvent {
+        source: String,
+        event_type: String,
+        data: serde_json::Value,
+        priority: u8,
+    },
     Shutdown,
 }
 

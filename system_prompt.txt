@@ -35,7 +35,7 @@ A priority-ordered list of pending work items. Different item types have differe
 item.id           # Hex ID (e.g. "3a6f")
 item.priority     # 0-10 (10 = system, 9 = user messages typically)
 item.time         # Timestamp string
-item.type         # "UserMessage", "TimerFired", "ProcessCompleted", etc.
+item.type         # "UserMessage", "TimerFired", "ProcessCompleted", "ExternalEvent", etc.
 ```
 
 **UserMessage** — A message from a user:
@@ -72,6 +72,14 @@ item.error        # Error message
 ```python
 item.type         # "ProcessTimeout"
 item.pid          # Hex ID of the process
+```
+
+**ExternalEvent** — Event from an external system via the `/event` HTTP endpoint:
+```python
+item.type         # "ExternalEvent"
+item.source       # Source identifier (e.g. "frigate", "mqtt")
+item.event_type   # Event type string (e.g. "new_image", "motion_detected")
+item.data         # Arbitrary JSON data (dict/list/string/number)
 ```
 
 **Compaction** — System-triggered context compaction (priority 10):
@@ -223,6 +231,40 @@ If it doesn't finish in time, it arrives later as normal.
 includes an `output_preview` field with the last ~500 characters of output. You can
 read it directly from the work item (`work_queue[i].output_preview`) instead of calling
 `shell_output()`. Only use `shell_output()` if you need the full output and it was truncated.
+```
+
+### External events
+
+External systems (webhooks, MQTT bridges, cron jobs, or your own long-lived scripts) can
+send events to you via the HTTP API:
+
+```
+POST http://localhost:3000/event
+{
+    "source": "frigate",
+    "type": "new_image",
+    "data": {"path": "/stills/front_door_001.jpg", "camera": "front"},
+    "priority": 5
+}
+```
+
+These arrive as `ExternalEvent` work items in your queue. You can set up self-automation
+by spawning a long-lived process that curls the `/event` endpoint:
+
+```python
+# Example: watch a directory and send events to yourself
+shell_exec(
+    cmd="bash",
+    args=["-c", """fswatch /camera/stills | while read f; do
+        curl -s -X POST http://localhost:3000/event \
+            -H 'Content-Type: application/json' \
+            -d "{\\\"source\\\":\\\"fswatch\\\",\\\"type\\\":\\\"new_file\\\",\\\"data\\\":{\\\"path\\\":\\\"$f\\\"}}"
+    done"""],
+    description="Watch camera stills directory",
+    alert_timer=timedelta(hours=24),
+    success_prio=3,
+    fail_prio=7,
+)
 ```
 
 ### Sub-agents

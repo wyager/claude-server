@@ -150,6 +150,38 @@ async fn handle_cost(
     }))
 }
 
+// ---- Event Handler ----
+
+#[derive(Deserialize)]
+struct EventRequest {
+    source: String,
+    #[serde(rename = "type")]
+    event_type: String,
+    data: serde_json::Value,
+    priority: Option<u8>,
+}
+
+async fn handle_event(
+    State(state): State<AppState>,
+    Json(body): Json<EventRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let priority = body.priority.unwrap_or(5);
+
+    state
+        .event_tx
+        .send(HarnessEvent::ExternalEvent {
+            source: body.source,
+            event_type: body.event_type,
+            data: body.data,
+            priority,
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({
+        "status": "queued",
+    })))
+}
+
 // ---- SSE Handler ----
 
 async fn handle_sse(
@@ -207,6 +239,7 @@ pub fn create_router(
 
     Router::new()
         .route("/message", post(handle_message))
+        .route("/event", post(handle_event))
         .route("/status", get(handle_status))
         .route("/cost", get(handle_cost))
         .route("/messages/{chat_id}", get(handle_get_messages))

@@ -1395,7 +1395,7 @@ claude-server/
     process.rs            -- Tokio process spawning/monitoring (output capture, completion events)
     compaction.rs         -- Compaction state machine (trigger, script accumulation, execution)
     agent_loop.rs         -- Unified agent loop (AgentLoop parameterized by AgentPermissions, used by parent + children)
-    http_server.rs        -- Axum HTTP API (POST /message, GET /status, GET /messages/:chat_id, SSE stream)
+    http_server.rs        -- Axum HTTP API (POST /message, POST /event, GET /status, GET /messages/:chat_id, SSE stream)
     chat.rs               -- Chat UI subcommand (serves embedded HTML)
     chat.html             -- Single-file HTML/CSS/JS chat interface
 ```
@@ -1444,6 +1444,7 @@ The chat UI:
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/message` | POST | Send a user message `{ chat_id?, user, content }` |
+| `/event` | POST | Send an external event `{ source, type, data, priority? }` — enqueued as `ExternalEvent` work item |
 | `/status` | GET | Health check `{ status, model }` |
 | `/messages/:chat_id` | GET | Get agent responses for a chat `{ messages: [...] }` |
 | `/messages/:chat_id/stream` | GET | SSE stream of `message` and `status` events |

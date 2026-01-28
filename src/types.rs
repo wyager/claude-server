@@ -104,6 +104,11 @@ pub enum WorkItemType {
         success: bool,
         summary: String,
     },
+    ExternalEvent {
+        source: String,
+        event_type: String,
+        data: serde_json::Value,
+    },
     Compaction,
 }
 

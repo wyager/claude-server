@@ -237,6 +237,20 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
                 truncate_with_note(summary, content_limit)
             ));
         }
+        WorkItemType::ExternalEvent {
+            source,
+            event_type,
+            data,
+        } => {
+            out.push_str("type: ExternalEvent\n");
+            out.push_str(&format!("source: \"{}\"\n", source));
+            out.push_str(&format!("event_type: \"{}\"\n", event_type));
+            let data_str = serde_json::to_string(data).unwrap_or_else(|_| "?".to_string());
+            out.push_str(&format!(
+                "data: {}\n",
+                truncate_with_note(&data_str, content_limit)
+            ));
+        }
         WorkItemType::Compaction => {
             out.push_str("type: Compaction\n");
             out.push_str("description: \"You must compact your context.\"\n");
