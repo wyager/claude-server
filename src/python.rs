@@ -47,20 +47,31 @@ pub struct SideEffectCollector {
     pub history_replaces: Vec<(String, String)>,
     pub history_adds: Vec<String>,
     pub show_in_context: Vec<String>,
-    pub child_agent_starts: Vec<ChildAgentRequest>,
+    pub fork_requests: Vec<ForkRequest>,
+    pub agent_messages: Vec<AgentMessageRequest>,
     pub compaction_script_appends: Vec<String>,
     pub compact_called: bool,
 }
 
 #[derive(Debug, Clone)]
-pub struct ChildAgentRequest {
-    pub id: AgentId,
+pub struct ForkChildSettings {
+    pub name: String,
     pub task: String,
-    pub model: String,
-    pub seed_memory: HashMap<String, serde_json::Value>,
+    pub model: Option<String>,  // None = inherit parent's model
     pub max_turns: u32,
+    pub can_compact: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForkRequest {
+    pub children: Vec<ForkChildSettings>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentMessageRequest {
+    pub recipient: String,
+    pub content: String,
     pub priority: u8,
-    pub child_depth_remaining: u32,
 }
 
 #[derive(Debug)]
@@ -155,6 +166,7 @@ impl PyWorkItem {
             let val = match name {
                 "chat_id" => self.chat_id.as_deref(),
                 "user" => self.user.as_deref(),
+                "from_agent" => self.user.as_deref(),  // alias for AgentMessage
                 "content" => self.content.as_deref(),
                 "timer_id" => self.timer_id.as_deref(),
                 "every" => self.every.as_deref(),
@@ -313,6 +325,10 @@ fn work_item_to_py(item: &WorkItem) -> PyWorkItem {
                 "ChildAgentCompleted",
                 None, None, None, None, None, None, None, None, None,
             ),
+            WorkItemType::AgentMessage { ref from, ref content } => (
+                "AgentMessage",
+                None, Some(from.clone()), Some(content.clone()), None, None, None, None, None, None,
+            ),
             WorkItemType::ExternalEvent { .. } => (
                 "ExternalEvent",
                 None, None, None, None, None, None, None, None, None,
@@ -341,13 +357,13 @@ fn work_item_to_py(item: &WorkItem) -> PyWorkItem {
     // Extract child agent fields
     let (child_id, result_memory, turns_used, success, summary) = match &item.item_type {
         WorkItemType::ChildAgentCompleted {
-            child_id,
+            child_name,
             result_memory,
             turns_used,
             success,
             summary,
         } => (
-            Some(child_id.0.clone()),
+            Some(child_name.clone()),
             Some(result_memory.clone()),
             Some(*turns_used),
             Some(*success),
@@ -672,6 +688,8 @@ struct PyHarness {
     /// (pid, cmd, description, status) for all tracked processes
     process_info: Vec<(String, String, String, String)>,
     child_depth_remaining: u32,
+    agent_name: String,
+    agent_lineage: String,
 }
 
 #[pymethods]
@@ -762,51 +780,75 @@ impl PyHarness {
         Ok(())
     }
 
-    #[pyo3(signature = (task, model, memory=None, max_turns=20, priority=6))]
-    fn spawn_agent<'py>(
+    /// Fork child agents. Takes a list of ChildSettings objects.
+    fn fork<'py>(
         &self,
         py: Python<'py>,
-        task: String,
-        model: String,
-        memory: Option<&Bound<'py, PyAny>>,
-        max_turns: u32,
-        priority: u8,
-    ) -> PyResult<String> {
+        children: &Bound<'py, PyAny>,
+    ) -> PyResult<Vec<String>> {
         if self.child_depth_remaining == 0 {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "Cannot spawn sub-agents at this depth",
+                "Cannot fork sub-agents at this depth",
             ));
         }
-        // Cap max_turns at 50
-        let max_turns = max_turns.min(50);
 
-        // Convert Python memory dict to serde_json Values
-        let seed_memory = if let Some(mem_obj) = memory {
-            let json_mod = py.import("json")?;
-            let json_str: String = json_mod.call_method1("dumps", (mem_obj,))?.extract()?;
-            let val: serde_json::Value = serde_json::from_str(&json_str)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("cannot serialize memory: {}", e)))?;
-            match val {
-                serde_json::Value::Object(map) => map.into_iter().map(|(k, v)| (k, v)).collect(),
-                _ => return Err(pyo3::exceptions::PyTypeError::new_err("memory must be a dict")),
-            }
-        } else {
-            HashMap::new()
-        };
+        let list = children.downcast::<pyo3::types::PyList>()
+            .map_err(|_| pyo3::exceptions::PyTypeError::new_err("fork() requires a list of ChildSettings"))?;
 
-        let mut col = self.collector.lock().unwrap();
-        let id = col.id_gen.next();
-        let id_str = id.0.clone();
-        col.child_agent_starts.push(ChildAgentRequest {
-            id,
-            task,
-            model,
-            seed_memory,
-            max_turns,
-            priority,
-            child_depth_remaining: self.child_depth_remaining - 1,
+        if list.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err("fork() requires at least one child"));
+        }
+
+        let mut child_settings = Vec::new();
+        let mut names = Vec::new();
+
+        for item in list.iter() {
+            let name: String = item.getattr("name")?.extract()?;
+            let task: String = item.getattr("task")?.extract()?;
+            let model_obj = item.getattr("model")?;
+            let model: Option<String> = if model_obj.is_none() {
+                None
+            } else {
+                Some(model_obj.extract()?)
+            };
+            let max_turns: u32 = item.getattr("max_turns")?.extract::<u32>()?.min(50);
+            let can_compact: bool = item.getattr("can_compact")?.extract()?;
+
+            names.push(name.clone());
+            child_settings.push(ForkChildSettings {
+                name,
+                task,
+                model,
+                max_turns,
+                can_compact,
+            });
+        }
+
+        self.collector.lock().unwrap().fork_requests.push(ForkRequest {
+            children: child_settings,
         });
-        Ok(id_str)
+
+        Ok(names)
+    }
+
+    #[pyo3(signature = (name, content, priority=6))]
+    fn message_agent(&self, name: String, content: String, priority: u8) -> PyResult<()> {
+        self.collector.lock().unwrap().agent_messages.push(AgentMessageRequest {
+            recipient: name,
+            content,
+            priority,
+        });
+        Ok(())
+    }
+
+    #[getter]
+    fn agent_name(&self) -> &str {
+        &self.agent_name
+    }
+
+    #[getter]
+    fn agent_lineage(&self) -> &str {
+        &self.agent_lineage
     }
 }
 
@@ -831,6 +873,16 @@ impl StdoutCapture {
 
 const PREAMBLE: &str = r#"
 from datetime import timedelta, datetime
+from dataclasses import dataclass
+
+@dataclass
+class ChildSettings:
+    name: str
+    task: str
+    model: str | None = None
+    max_turns: int = 20
+    can_compact: bool = True
+
 send_message = _harness.send_message
 shell_exec = _harness.shell_exec
 shell_status = _harness.shell_status
@@ -839,7 +891,10 @@ shell_kill = _harness.shell_kill
 processes_list = _harness.processes_list
 acknowledge_timer = _harness.acknowledge_timer
 show_in_context = _harness.show_in_context
-spawn_agent = _harness.spawn_agent
+fork = _harness.fork
+message_agent = _harness.message_agent
+agent_name = _harness.agent_name
+agent_lineage = _harness.agent_lineage
 "#;
 
 const COMPACTION_PREAMBLE: &str = r#"
@@ -860,7 +915,7 @@ pub fn execute(
     is_compaction: bool,
     process_outputs: &HashMap<String, String>,
 ) -> ExecutionResult {
-    execute_with_timeout(state, code, is_compaction, process_outputs, 5, 1)
+    execute_with_timeout(state, code, is_compaction, process_outputs, 5, 1, "root", "root")
 }
 
 pub fn execute_with_timeout(
@@ -870,16 +925,20 @@ pub fn execute_with_timeout(
     process_outputs: &HashMap<String, String>,
     timeout_secs: u64,
     child_depth_remaining: u32,
+    agent_name: &str,
+    agent_lineage: &str,
 ) -> ExecutionResult {
     // Clone everything the thread needs (state is already Clone)
     let state = state.clone();
     let code = code.to_string();
     let process_outputs = process_outputs.clone();
+    let agent_name = agent_name.to_string();
+    let agent_lineage = agent_lineage.to_string();
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<ExecutionResult>(1);
 
     std::thread::spawn(move || {
-        let result = execute_inner(&state, &code, is_compaction, &process_outputs, child_depth_remaining);
+        let result = execute_inner(&state, &code, is_compaction, &process_outputs, child_depth_remaining, &agent_name, &agent_lineage);
         let _ = tx.send(result);
     });
 
@@ -941,6 +1000,8 @@ fn execute_inner(
     is_compaction: bool,
     process_outputs: &HashMap<String, String>,
     child_depth_remaining: u32,
+    agent_name: &str,
+    agent_lineage: &str,
 ) -> ExecutionResult {
     let collector = Arc::new(Mutex::new(SideEffectCollector {
         id_gen: state.id_generator.clone(),
@@ -1090,6 +1151,8 @@ fn execute_inner(
                 process_statuses,
                 process_info,
                 child_depth_remaining,
+                agent_name: agent_name.to_string(),
+                agent_lineage: agent_lineage.to_string(),
             },
         )?;
         locals.set_item("_harness", harness)?;
@@ -1380,6 +1443,8 @@ print("all passed")
             &HashMap::new(),
             0,
             1,
+            "root",
+            "root",
         );
         assert!(!result.is_error, "Error: {}", result.error_text);
         assert_eq!(result.stdout.trim(), "all passed");
@@ -1403,6 +1468,8 @@ print("all passed")
             &HashMap::new(),
             2, // 2 second timeout for test speed
             1,
+            "root",
+            "root",
         );
         let elapsed = start.elapsed();
         assert!(result.is_error, "Should have timed out");
@@ -1416,36 +1483,47 @@ print("all passed")
     }
 
     #[test]
-    fn test_spawn_agent() {
+    fn test_fork() {
         init();
         let state = HarnessState::new(200_000, 16384);
         let result = execute_with_timeout(
             &state,
             r#"
-child_id = spawn_agent(
-    task="Write tests",
-    model="claude-sonnet-4-5-20250929",
-    memory={"dir": "/tmp/project"},
-    max_turns=10,
-    priority=6,
-)
-print(child_id)
-memory["my_child"] = child_id
+fork([
+    ChildSettings(
+        name="test-runner",
+        task="Write tests",
+        model="claude-sonnet-4-5-20250929",
+        max_turns=10,
+    ),
+    ChildSettings(
+        name="linter",
+        task="Run linting",
+    ),
+])
+print("forked")
 "#,
             false,
             &HashMap::new(),
             0,
             1,
+            "root",
+            "root",
         );
         assert!(!result.is_error, "Error: {}", result.error_text);
-        assert!(!result.stdout.trim().is_empty());
-        assert_eq!(result.side_effects.child_agent_starts.len(), 1);
-        let req = &result.side_effects.child_agent_starts[0];
-        assert_eq!(req.task, "Write tests");
-        assert_eq!(req.model, "claude-sonnet-4-5-20250929");
-        assert_eq!(req.max_turns, 10);
-        assert_eq!(req.priority, 6);
-        assert_eq!(req.seed_memory.get("dir"), Some(&serde_json::json!("/tmp/project")));
+        assert_eq!(result.stdout.trim(), "forked");
+        assert_eq!(result.side_effects.fork_requests.len(), 1);
+        let req = &result.side_effects.fork_requests[0];
+        assert_eq!(req.children.len(), 2);
+        assert_eq!(req.children[0].name, "test-runner");
+        assert_eq!(req.children[0].task, "Write tests");
+        assert_eq!(req.children[0].model, Some("claude-sonnet-4-5-20250929".to_string()));
+        assert_eq!(req.children[0].max_turns, 10);
+        assert_eq!(req.children[1].name, "linter");
+        assert_eq!(req.children[1].task, "Run linting");
+        assert_eq!(req.children[1].model, None);
+        assert_eq!(req.children[1].max_turns, 20); // default
+        assert!(req.children[1].can_compact); // default is true
     }
 
     #[test]
@@ -1477,5 +1555,53 @@ pid2 = shell_exec("echo", ["hi"], alert_timer=300)
         assert_eq!(result.side_effects.process_starts.len(), 2);
         assert_eq!(result.side_effects.process_starts[0].alert_timer_secs, 300);
         assert_eq!(result.side_effects.process_starts[1].alert_timer_secs, 300);
+    }
+
+    #[test]
+    fn test_message_agent() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        let result = execute(
+            &state,
+            r#"
+message_agent("sibling-a", "check the API status")
+message_agent("sibling-b", "done with my part", priority=9)
+print(agent_name)
+print(agent_lineage)
+"#,
+            false,
+            &HashMap::new(),
+        );
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert_eq!(result.side_effects.agent_messages.len(), 2);
+        assert_eq!(result.side_effects.agent_messages[0].recipient, "sibling-a");
+        assert_eq!(result.side_effects.agent_messages[0].content, "check the API status");
+        assert_eq!(result.side_effects.agent_messages[0].priority, 6); // default
+        assert_eq!(result.side_effects.agent_messages[1].recipient, "sibling-b");
+        assert_eq!(result.side_effects.agent_messages[1].priority, 9);
+        assert_eq!(result.stdout.trim(), "root\nroot");
+    }
+
+    #[test]
+    fn test_agent_identity_in_child() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        let result = execute_with_timeout(
+            &state,
+            r#"
+print(agent_name)
+print(agent_lineage)
+"#,
+            false,
+            &HashMap::new(),
+            0,
+            1,
+            "api-checker",
+            "api-checker, child of plan-builder, child of root",
+        );
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        let lines: Vec<&str> = result.stdout.trim().lines().collect();
+        assert_eq!(lines[0], "api-checker");
+        assert_eq!(lines[1], "api-checker, child of plan-builder, child of root");
     }
 }

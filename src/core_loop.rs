@@ -23,7 +23,7 @@ pub enum HarnessEvent {
     },
     Process(ProcessEvent),
     ChildCompleted {
-        child_id: AgentId,
+        child_name: String,
         result_memory: HashMap<String, serde_json::Value>,
         turns_used: u32,
         success: bool,
@@ -33,6 +33,11 @@ pub enum HarnessEvent {
         child_output_tokens: u64,
         child_cache_creation_tokens: u64,
         child_cache_read_tokens: u64,
+    },
+    AgentMessage {
+        from: String,
+        content: String,
+        priority: u8,
     },
     ExternalEvent {
         source: String,
@@ -61,15 +66,23 @@ impl CoreLoop {
         dump_dir: Option<PathBuf>,
         broadcast_tx: broadcast::Sender<BroadcastMsg>,
         token_accumulator: Arc<Mutex<TokenAccumulator>>,
+        registry: Arc<AgentRegistry>,
     ) -> Self {
+        // Register root agent in the registry
+        registry
+            .register("root".to_string(), vec!["root".to_string()], event_tx.clone())
+            .expect("Failed to register root agent");
+
         let permissions = AgentPermissions {
             can_compact: true,
             max_turns: None,        // unlimited for parent
             child_depth_remaining: 1, // parent can spawn children, children can't spawn grandchildren
+            agent_name: "root".to_string(),
+            lineage: vec!["root".to_string()],
         };
 
         let agent_loop = AgentLoop::new(
-            "parent".to_string(),
+            "root".to_string(),
             permissions,
             state,
             config,
@@ -83,6 +96,7 @@ impl CoreLoop {
             dump_dir,
             dump_turns,
             Some(token_accumulator),
+            registry,
         );
 
         Self { agent_loop }

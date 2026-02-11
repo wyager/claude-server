@@ -18,6 +18,21 @@ use crate::python;
 use crate::renderer;
 use crate::types::*;
 
+/// Format a lineage vector into a human-readable string.
+/// e.g. vec!["root", "planner", "worker"] → "worker, child of planner, child of root"
+pub fn format_lineage(lineage: &[String]) -> String {
+    if lineage.len() <= 1 {
+        return lineage.first().cloned().unwrap_or_default();
+    }
+    let name = &lineage[lineage.len() - 1];
+    let ancestors: Vec<String> = lineage[..lineage.len() - 1]
+        .iter()
+        .rev()
+        .map(|a| format!("child of {}", a))
+        .collect();
+    format!("{}, {}", name, ancestors.join(", "))
+}
+
 pub struct AgentLoop {
     pub name: String,
     pub permissions: AgentPermissions,
@@ -43,6 +58,8 @@ pub struct AgentLoop {
     local_output_tokens: u64,
     local_cache_creation_tokens: u64,
     local_cache_read_tokens: u64,
+    /// Shared agent registry for naming and inter-agent messaging.
+    registry: Arc<AgentRegistry>,
 }
 
 impl AgentLoop {
@@ -61,6 +78,7 @@ impl AgentLoop {
         dump_dir: Option<PathBuf>,
         dump_to_stdout: bool,
         token_accumulator: Option<Arc<Mutex<TokenAccumulator>>>,
+        registry: Arc<AgentRegistry>,
     ) -> Self {
         let max_children: u32 = std::env::var("CLAUDE_SERVER_MAX_CHILDREN")
             .ok()
@@ -89,6 +107,7 @@ impl AgentLoop {
             local_output_tokens: 0,
             local_cache_creation_tokens: 0,
             local_cache_read_tokens: 0,
+            registry,
         }
     }
 
@@ -259,12 +278,20 @@ impl AgentLoop {
         };
 
         // Render context
+        let lineage_str = format_lineage(&self.permissions.lineage);
+        let agent_identity = renderer::AgentIdentity {
+            name: &self.permissions.agent_name,
+            lineage: &lineage_str,
+            turn_counter: self.turn_counter,
+            max_turns: self.permissions.max_turns,
+        };
         let rendered = renderer::render_context(
             &self.state,
             &self.deployment_context,
             compaction_state.as_ref(),
             &self.config.render_config,
             self.config.compact_at,
+            Some(&agent_identity),
         );
 
         println!(
@@ -320,6 +347,7 @@ impl AgentLoop {
         });
 
         // Execute Python
+        let lineage_str = format_lineage(&self.permissions.lineage);
         let exec_result = python::execute_with_timeout(
             &self.state,
             &api_result.code,
@@ -327,11 +355,13 @@ impl AgentLoop {
             &process_outputs,
             self.config.python_timeout_secs,
             self.permissions.child_depth_remaining,
+            &self.permissions.agent_name,
+            &lineage_str,
         );
 
-        let is_error = exec_result.is_error;
+        let mut is_error = exec_result.is_error;
         let stdout = exec_result.stdout.clone();
-        let error_text = exec_result.error_text.clone();
+        let mut error_text = exec_result.error_text.clone();
 
         println!(
             "[{}] Executed (error={}): {}",
@@ -346,8 +376,15 @@ impl AgentLoop {
 
         // Apply side effects (only if no error)
         if !is_error {
-            let deferred = self.apply_side_effects(exec_result.side_effects);
-            self.perform_deferred_ops(deferred).await;
+            match self.apply_side_effects(exec_result.side_effects) {
+                Ok(deferred) => {
+                    self.perform_deferred_ops(deferred).await;
+                }
+                Err(msg) => {
+                    is_error = true;
+                    error_text = msg;
+                }
+            }
         }
 
         // Record in history (after side effects so entry_id is fresh)
@@ -494,7 +531,7 @@ impl AgentLoop {
                 }
             },
             HarnessEvent::ChildCompleted {
-                child_id,
+                child_name,
                 result_memory,
                 turns_used,
                 success,
@@ -509,7 +546,7 @@ impl AgentLoop {
                 let id = self.state.id_generator.next();
                 println!(
                     "[{}] Child agent {} completed (success={}, turns={})",
-                    self.name, child_id, success, turns_used
+                    self.name, child_name, success, turns_used
                 );
 
                 // Add child's accumulated tokens to the shared accumulator
@@ -526,12 +563,31 @@ impl AgentLoop {
                     priority,
                     time: Utc::now(),
                     item_type: WorkItemType::ChildAgentCompleted {
-                        child_id,
+                        child_name,
                         result_memory,
                         turns_used,
                         success,
                         summary,
                     },
+                });
+            }
+            HarnessEvent::AgentMessage {
+                from,
+                content,
+                priority,
+            } => {
+                let id = self.state.id_generator.next();
+                println!(
+                    "[{}] Agent message from {}: {}",
+                    self.name,
+                    from,
+                    &content[..content.len().min(50)]
+                );
+                self.state.work_queue.push(WorkItem {
+                    id,
+                    priority,
+                    time: Utc::now(),
+                    item_type: WorkItemType::AgentMessage { from, content },
                 });
             }
             HarnessEvent::ExternalEvent {
@@ -578,10 +634,22 @@ impl AgentLoop {
 
     /// Apply side effects synchronously, returning any deferred async operations
     /// (block_for waiters and process kills) to be awaited by the caller.
+    /// Returns Err if message validation fails (recipient not found), in which
+    /// case NO side effects have been applied (atomic rollback).
     fn apply_side_effects(
         &mut self,
         effects: python::SideEffectCollector,
-    ) -> DeferredOps {
+    ) -> Result<DeferredOps, String> {
+        // Validate all agent message recipients BEFORE applying anything
+        for msg in &effects.agent_messages {
+            if !self.registry.exists(&msg.recipient) {
+                return Err(format!(
+                    "message_agent failed: agent '{}' not found",
+                    msg.recipient
+                ));
+            }
+        }
+
         let mut deferred = DeferredOps::default();
 
         // Update ID generator
@@ -722,174 +790,222 @@ impl AgentLoop {
         // Process kills
         deferred.process_kills = effects.process_kills;
 
-        // Child agent spawns
-        for req in effects.child_agent_starts {
-            if self.active_children >= self.max_children {
-                eprintln!(
-                    "[{}] Cannot spawn child agent: max {} concurrent children reached",
-                    self.name, self.max_children
-                );
+        // Fork requests (child agent spawns)
+        for req in effects.fork_requests {
+            // Build channels and registration entries for atomic registration
+            let mut child_channels = Vec::new();
+            let mut registration_entries = Vec::new();
+            for child in &req.children {
+                let child_lineage = {
+                    let mut l = self.permissions.lineage.clone();
+                    l.push(child.name.clone());
+                    l
+                };
+                let (child_event_tx, child_event_rx) = mpsc::unbounded_channel::<HarnessEvent>();
+                registration_entries.push((child.name.clone(), child_lineage.clone(), child_event_tx.clone()));
+                child_channels.push((child_event_tx, child_event_rx, child_lineage));
+            }
+
+            if let Err(e) = self.registry.register_batch(registration_entries) {
+                eprintln!("[{}] Fork failed: {}", self.name, e);
+                // Push a single error work item
                 let wid = self.state.id_generator.next();
                 self.state.work_queue.push(WorkItem {
                     id: wid,
-                    priority: req.priority,
+                    priority: 7,
                     time: Utc::now(),
                     item_type: WorkItemType::ChildAgentCompleted {
-                        child_id: req.id,
+                        child_name: format!("fork-failed"),
                         result_memory: HashMap::new(),
                         turns_used: 0,
                         success: false,
-                        summary: format!(
-                            "Could not spawn: max {} concurrent children reached",
-                            self.max_children
-                        ),
+                        summary: format!("Fork failed: {}", e),
                     },
                 });
                 continue;
             }
 
-            self.active_children += 1;
-            println!(
-                "[{}] Spawning child agent {} (model={}, max_turns={}, depth_remaining={})",
-                self.name, req.id, req.model, req.max_turns, req.child_depth_remaining
-            );
-
-            let child_name = format!("child-{}", req.id);
-            let child_id = req.id.clone();
-            let priority = req.priority;
-            let max_turns = req.max_turns;
-            let child_depth = req.child_depth_remaining;
-
-            // Create child's own event channels
-            let (child_event_tx, child_event_rx) = mpsc::unbounded_channel::<HarnessEvent>();
-
-            // Create child's own process event channel and supervisor
-            let (child_process_event_tx, mut child_process_event_rx) =
-                mpsc::unbounded_channel::<ProcessEvent>();
-            let child_process_supervisor =
-                ProcessSupervisor::new(child_process_event_tx, self.db.clone());
-
-            // Forward process events to child's main event channel
-            let child_event_tx_for_process = child_event_tx.clone();
-            tokio::spawn(async move {
-                while let Some(pe) = child_process_event_rx.recv().await {
-                    if child_event_tx_for_process
-                        .send(HarnessEvent::Process(pe))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
-
-            // Create child state
-            let mut child_state =
-                HarnessState::new(self.config.context_window, self.config.max_tokens);
-            child_state.memory = req.seed_memory;
-
-            // Seed work queue
-            let task_id = child_state.id_generator.next();
-            child_state.work_queue.push(WorkItem {
-                id: task_id,
-                priority: 9,
+            // Insert SystemAlert describing the fork
+            let names: Vec<&str> = req.children.iter().map(|c| c.name.as_str()).collect();
+            let alert_id = self.state.id_generator.next();
+            self.state.event_history.push(HistoryEntry::SystemAlert {
+                id: alert_id,
                 time: Utc::now(),
-                item_type: WorkItemType::UserMessage {
-                    chat_id: "child-agent".to_string(),
-                    user: "parent-agent".to_string(),
-                    content: req.task,
-                },
+                message: format!("Forked {} children: {}", req.children.len(), names.join(", ")),
             });
 
-            // Child deployment context
-            let child_deployment = format!(
-                "You are a sub-agent spawned by a parent agent to complete a specific task.\n\
-                Complete the assigned task, store your results in memory, and stop.\n\
-                You have full access to send_message() and shell_exec().\n\
-                {}\n\
-                Your parent receives your final memory contents when you complete.\n\
-                \n{}",
-                if child_depth == 0 {
-                    "You cannot use spawn_agent() \u{2014} that will raise an error."
-                } else {
-                    "You can use spawn_agent() to spawn sub-agents."
-                },
-                self.deployment_context
-            );
+            // Spawn each child
+            for child_settings in req.children.into_iter() {
+                if self.active_children >= self.max_children {
+                    eprintln!(
+                        "[{}] Cannot spawn child '{}': max {} concurrent children reached",
+                        self.name, child_settings.name, self.max_children
+                    );
+                    self.registry.deregister(&child_settings.name);
+                    let wid = self.state.id_generator.next();
+                    self.state.work_queue.push(WorkItem {
+                        id: wid,
+                        priority: 7,
+                        time: Utc::now(),
+                        item_type: WorkItemType::ChildAgentCompleted {
+                            child_name: child_settings.name,
+                            result_memory: HashMap::new(),
+                            turns_used: 0,
+                            success: false,
+                            summary: format!(
+                                "Could not spawn: max {} concurrent children reached",
+                                self.max_children
+                            ),
+                        },
+                    });
+                    continue;
+                }
 
-            // Create child API client
-            let child_config = Arc::new(Config {
-                model: req.model.clone(),
-                api_key: self.config.api_key.clone(),
-                api_base_url: self.config.api_base_url.clone(),
-                max_tokens: self.config.max_tokens,
-                context_window: self.config.context_window,
-                db_path: self.config.db_path.clone(),
-                system_prompt_path: self.config.system_prompt_path.clone(),
-                deployment_context_path: self.config.deployment_context_path.clone(),
-                listen_addr: self.config.listen_addr,
-                compact_at: self.config.compact_at,
-                compact_target: self.config.compact_target,
-                render_config: self.config.render_config.clone(),
-                python_timeout_secs: self.config.python_timeout_secs,
-                cost_per_m_input: self.config.cost_per_m_input,
-                cost_per_m_output: self.config.cost_per_m_output,
-                cost_per_m_cache_read: self.config.cost_per_m_cache_read,
-                cost_per_m_cache_write: self.config.cost_per_m_cache_write,
-            });
+                self.active_children += 1;
+                let (child_event_tx, child_event_rx, child_lineage) = child_channels.remove(0);
 
-            let system_prompt = self
-                .config
-                .load_system_prompt()
-                .unwrap_or_else(|_| String::new());
+                let child_name_str = child_settings.name.clone();
+                let max_turns = child_settings.max_turns;
+                let child_depth = self.permissions.child_depth_remaining.saturating_sub(1);
+                let model = child_settings.model.unwrap_or_else(|| self.config.model.clone());
 
-            let child_api_client =
-                match ApiClient::new_with_prompt(child_config.clone(), &system_prompt) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        self.active_children = self.active_children.saturating_sub(1);
-                        let wid = self.state.id_generator.next();
-                        self.state.work_queue.push(WorkItem {
-                            id: wid,
-                            priority,
-                            time: Utc::now(),
-                            item_type: WorkItemType::ChildAgentCompleted {
-                                child_id: child_id.clone(),
-                                result_memory: HashMap::new(),
-                                turns_used: 0,
-                                success: false,
-                                summary: format!("Failed to create API client: {}", e),
-                            },
-                        });
-                        continue;
+                println!(
+                    "[{}] Forking child '{}' (model={}, max_turns={}, depth_remaining={})",
+                    self.name, child_name_str, model, max_turns, child_depth
+                );
+
+                // Create child's own process event channel and supervisor
+                let (child_process_event_tx, mut child_process_event_rx) =
+                    mpsc::unbounded_channel::<ProcessEvent>();
+                let child_process_supervisor =
+                    ProcessSupervisor::new(child_process_event_tx, self.db.clone());
+
+                // Forward process events to child's main event channel
+                let child_event_tx_for_process = child_event_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(pe) = child_process_event_rx.recv().await {
+                        if child_event_tx_for_process
+                            .send(HarnessEvent::Process(pe))
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
+                });
+
+                // Clone parent state, then clear timers/processes/queue
+                let mut child_state = self.state.clone();
+                child_state.work_queue = WorkQueue::new();
+                child_state.timer_manager = TimerManager::new();
+                child_state.process_manager = ProcessManager::new();
+                child_state.last_input_tokens = 0;
+
+                // Add task as work item
+                let task_id = child_state.id_generator.next();
+                child_state.work_queue.push(WorkItem {
+                    id: task_id,
+                    priority: 9,
+                    time: Utc::now(),
+                    item_type: WorkItemType::UserMessage {
+                        chat_id: "child-agent".to_string(),
+                        user: self.permissions.agent_name.clone(),
+                        content: child_settings.task,
+                    },
+                });
+
+                // Create child API client
+                let child_config = Arc::new(Config {
+                    model: model.clone(),
+                    api_key: self.config.api_key.clone(),
+                    api_base_url: self.config.api_base_url.clone(),
+                    max_tokens: self.config.max_tokens,
+                    context_window: self.config.context_window,
+                    db_path: self.config.db_path.clone(),
+                    system_prompt_path: self.config.system_prompt_path.clone(),
+                    deployment_context_path: self.config.deployment_context_path.clone(),
+                    listen_addr: self.config.listen_addr,
+                    compact_at: self.config.compact_at,
+                    compact_target: self.config.compact_target,
+                    render_config: self.config.render_config.clone(),
+                    python_timeout_secs: self.config.python_timeout_secs,
+                    cost_per_m_input: self.config.cost_per_m_input,
+                    cost_per_m_output: self.config.cost_per_m_output,
+                    cost_per_m_cache_read: self.config.cost_per_m_cache_read,
+                    cost_per_m_cache_write: self.config.cost_per_m_cache_write,
+                });
+
+                let system_prompt = self
+                    .config
+                    .load_system_prompt()
+                    .unwrap_or_else(|_| String::new());
+
+                let child_api_client =
+                    match ApiClient::new_with_prompt(child_config.clone(), &system_prompt) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            self.active_children = self.active_children.saturating_sub(1);
+                            self.registry.deregister(&child_name_str);
+                            let wid = self.state.id_generator.next();
+                            self.state.work_queue.push(WorkItem {
+                                id: wid,
+                                priority: 7,
+                                time: Utc::now(),
+                                item_type: WorkItemType::ChildAgentCompleted {
+                                    child_name: child_name_str,
+                                    result_memory: HashMap::new(),
+                                    turns_used: 0,
+                                    success: false,
+                                    summary: format!("Failed to create API client: {}", e),
+                                },
+                            });
+                            continue;
+                        }
+                    };
+
+                let child_permissions = AgentPermissions {
+                    can_compact: child_settings.can_compact,
+                    max_turns: Some(max_turns),
+                    child_depth_remaining: child_depth,
+                    agent_name: child_name_str.clone(),
+                    lineage: child_lineage,
                 };
 
-            let child_permissions = AgentPermissions {
-                can_compact: false,
-                max_turns: Some(max_turns),
-                child_depth_remaining: child_depth,
-            };
+                let dump_dir = self.dump_dir.clone();
+                let db = self.db.clone();
+                let parent_tx = self.event_tx.clone();
+                let registry = self.registry.clone();
 
-            let dump_dir = self.dump_dir.clone();
-            let db = self.db.clone();
-            let parent_tx = self.event_tx.clone();
+                tokio::spawn(run_child_agent_loop(
+                    child_name_str,
+                    child_permissions,
+                    child_state,
+                    child_config,
+                    db,
+                    child_api_client,
+                    child_process_supervisor,
+                    child_event_rx,
+                    child_event_tx,
+                    self.deployment_context.clone(),
+                    dump_dir,
+                    7, // default priority for ChildAgentCompleted
+                    parent_tx,
+                    registry,
+                ));
+            }
+        }
 
-            tokio::spawn(run_child_agent_loop(
-                child_name,
-                child_permissions,
-                child_state,
-                child_config,
-                db,
-                child_api_client,
-                child_process_supervisor,
-                child_event_rx,
-                child_event_tx,
-                child_deployment,
-                dump_dir,
-                child_id,
-                priority,
-                parent_tx,
-            ));
+        // Agent messages (already validated above)
+        for msg in effects.agent_messages {
+            if let Err(e) = self.registry.send_to(
+                &msg.recipient,
+                HarnessEvent::AgentMessage {
+                    from: self.permissions.agent_name.clone(),
+                    content: msg.content,
+                    priority: msg.priority,
+                },
+            ) {
+                eprintln!("[{}] Failed to deliver agent message: {}", self.name, e);
+            }
         }
 
         // Outbound messages
@@ -920,6 +1036,8 @@ impl AgentLoop {
                 &HashMap::new(),
                 self.config.python_timeout_secs,
                 0, // compaction doesn't need to spawn children
+                &self.permissions.agent_name,
+                &format_lineage(&self.permissions.lineage),
             );
 
             if compact_result.is_error {
@@ -971,7 +1089,7 @@ impl AgentLoop {
             }
         }
 
-        deferred
+        Ok(deferred)
     }
 
     /// Perform the deferred async operations returned by apply_side_effects.
@@ -1015,9 +1133,9 @@ async fn run_child_agent_loop(
     child_event_tx: mpsc::UnboundedSender<HarnessEvent>,
     child_deployment: String,
     dump_dir: Option<PathBuf>,
-    child_id: AgentId,
     priority: u8,
     parent_tx: mpsc::UnboundedSender<HarnessEvent>,
+    registry: Arc<AgentRegistry>,
 ) {
     let mut child_loop = AgentLoop::new(
         child_name.clone(),
@@ -1034,6 +1152,7 @@ async fn run_child_agent_loop(
         dump_dir,
         false, // children don't dump to stdout
         None,  // children track tokens locally
+        registry.clone(),
     );
 
     let result = child_loop.run().await;
@@ -1077,8 +1196,11 @@ async fn run_child_agent_loop(
         child_name, final_success, turns_used
     );
 
+    // Deregister from the agent registry
+    registry.deregister(&child_name);
+
     let _ = parent_tx.send(HarnessEvent::ChildCompleted {
-        child_id,
+        child_name,
         result_memory: child_loop.state.memory,
         turns_used,
         success: final_success,

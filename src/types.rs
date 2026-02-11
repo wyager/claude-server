@@ -98,11 +98,15 @@ pub enum WorkItemType {
         pid: AgentId,
     },
     ChildAgentCompleted {
-        child_id: AgentId,
+        child_name: String,
         result_memory: HashMap<String, serde_json::Value>,
         turns_used: u32,
         success: bool,
         summary: String,
+    },
+    AgentMessage {
+        from: String,
+        content: String,
     },
     ExternalEvent {
         source: String,
@@ -619,6 +623,8 @@ pub struct AgentPermissions {
     pub can_compact: bool,
     pub max_turns: Option<u32>,      // None = unlimited (parent)
     pub child_depth_remaining: u32,  // 0 = can't spawn children
+    pub agent_name: String,
+    pub lineage: Vec<String>,
 }
 
 // ---- Token Accumulator ----
@@ -632,6 +638,108 @@ pub struct TokenAccumulator {
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
     pub turns: u32,
+}
+
+// ---- Agent Registry ----
+
+use std::sync::Mutex;
+use tokio::sync::mpsc;
+
+/// Thread-safe registry mapping agent names to event channels.
+/// Shared across all agent loops for inter-agent messaging and fork validation.
+pub struct AgentRegistry {
+    agents: Mutex<HashMap<String, AgentEntry>>,
+}
+
+struct AgentEntry {
+    pub lineage: Vec<String>,
+    pub event_tx: mpsc::UnboundedSender<crate::core_loop::HarnessEvent>,
+}
+
+impl AgentRegistry {
+    pub fn new() -> Self {
+        Self {
+            agents: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Register a single agent. Fails if the name is already taken.
+    pub fn register(
+        &self,
+        name: String,
+        lineage: Vec<String>,
+        event_tx: mpsc::UnboundedSender<crate::core_loop::HarnessEvent>,
+    ) -> Result<(), String> {
+        let mut agents = self.agents.lock().unwrap();
+        if agents.contains_key(&name) {
+            return Err(format!("Name '{}' is already in use by a running agent", name));
+        }
+        agents.insert(name, AgentEntry { lineage, event_tx });
+        Ok(())
+    }
+
+    /// Register a batch of agents atomically. If any name collides, none are registered.
+    pub fn register_batch(
+        &self,
+        entries: Vec<(String, Vec<String>, mpsc::UnboundedSender<crate::core_loop::HarnessEvent>)>,
+    ) -> Result<(), String> {
+        let mut agents = self.agents.lock().unwrap();
+
+        // Check for collisions with existing agents
+        let mut collisions = Vec::new();
+        for (name, _, _) in &entries {
+            if agents.contains_key(name) {
+                collisions.push(name.clone());
+            }
+        }
+
+        // Check for collisions within the batch itself
+        let mut seen = std::collections::HashSet::new();
+        for (name, _, _) in &entries {
+            if !seen.insert(name.clone()) {
+                collisions.push(format!("{} (duplicate in batch)", name));
+            }
+        }
+
+        if !collisions.is_empty() {
+            return Err(format!(
+                "Name collision: {}",
+                collisions.join(", ")
+            ));
+        }
+
+        // All clear — register all
+        for (name, lineage, event_tx) in entries {
+            agents.insert(name, AgentEntry { lineage, event_tx });
+        }
+        Ok(())
+    }
+
+    /// Remove an agent from the registry.
+    pub fn deregister(&self, name: &str) {
+        self.agents.lock().unwrap().remove(name);
+    }
+
+    /// Send an event to a named agent. Fails if the agent doesn't exist.
+    pub fn send_to(
+        &self,
+        name: &str,
+        event: crate::core_loop::HarnessEvent,
+    ) -> Result<(), String> {
+        let agents = self.agents.lock().unwrap();
+        match agents.get(name) {
+            Some(entry) => entry
+                .event_tx
+                .send(event)
+                .map_err(|_| format!("Agent '{}' channel closed", name)),
+            None => Err(format!("Agent '{}' not found", name)),
+        }
+    }
+
+    /// Check if an agent name exists in the registry.
+    pub fn exists(&self, name: &str) -> bool {
+        self.agents.lock().unwrap().contains_key(name)
+    }
 }
 
 // ---- Deployment Plugin ----

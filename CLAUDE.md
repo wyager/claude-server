@@ -108,12 +108,20 @@ queue and context metadata, showing memory (sorted by priority), active timers,
 and running processes. Bounded by RenderConfig limits (20 memory keys, 20 timers,
 10 processes).
 
-**Sub-agents**: `spawn_agent(task, model, memory, max_turns, priority)` launches
-a child agent via the unified `AgentLoop` (in `agent_loop.rs`), parameterized by
-`AgentPermissions`. Children have full `shell_exec` support (own ProcessSupervisor
-+ event loop). `child_depth_remaining: u32` controls recursion depth. Returns a
-`ChildAgentCompleted` work item with `result_memory`, `turns_used`, `success`,
-and `summary`. Max 3 concurrent children.
+**Sub-agents (fork model)**: `fork([ChildSettings(...), ...])` spawns child agents
+that inherit the parent's full context (event history + memory) for KV cache reuse.
+Children start with a clean work queue, timers, and processes. Each agent has a
+globally unique name and lineage (e.g., `"api-checker, child of plan-builder,
+child of root"`). The root agent is always named `"root"`. Names are registered
+atomically via `AgentRegistry` — if any name collides, the entire fork fails.
+`ChildSettings` fields: `name`, `task`, `model` (Optional, inherits parent),
+`max_turns` (default 20), `can_compact` (default True). Children can compact
+their own context. `message_agent(name, content, priority=6)` enables inter-agent
+messaging (parent↔child, sibling↔sibling). If any message targets a nonexistent
+agent, the entire turn's side effects roll back. Children return a
+`ChildAgentCompleted` work item with `child_name`, `result_memory`, `turns_used`,
+`success`, and `summary`. Max 3 concurrent children. `child_depth_remaining: u32`
+controls recursion depth.
 
 **Streaming responses (SSE)**: A `tokio::sync::broadcast` channel delivers
 messages in real time. The SSE endpoint (`GET /messages/:chat_id/stream`)

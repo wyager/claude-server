@@ -122,6 +122,9 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>) -> Result<()> {
     // Create token accumulator
     let token_accumulator = Arc::new(Mutex::new(TokenAccumulator::default()));
 
+    // Create agent registry
+    let registry = Arc::new(types::AgentRegistry::new());
+
     // Create core loop
     let mut core = core_loop::CoreLoop::new(
         state,
@@ -136,6 +139,7 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>) -> Result<()> {
         dump_dir,
         broadcast_tx.clone(),
         token_accumulator.clone(),
+        registry,
     );
 
     // Forward process events to the main event channel

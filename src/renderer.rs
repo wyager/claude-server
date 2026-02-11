@@ -17,29 +17,39 @@ pub struct RenderedContext {
     // Future: images from show_in_context
 }
 
+/// Agent identity info for rendering into context.
+pub struct AgentIdentity<'a> {
+    pub name: &'a str,
+    pub lineage: &'a str,
+    pub turn_counter: u32,
+    pub max_turns: Option<u32>,
+}
+
 pub fn render_context(
     state: &HarnessState,
     deployment_context: &str,
     compaction: Option<&CompactionState>,
     config: &RenderConfig,
     compact_at: u64,
+    agent: Option<&AgentIdentity>,
 ) -> RenderedContext {
     let mut out = String::with_capacity(8192);
 
-    // Deployment context
+    // Deployment context (stable prefix for KV cache)
     render_deployment_context(&mut out, deployment_context);
 
     // Event history
     render_event_history(&mut out, &state.event_history, config);
 
-    // Work queue
-    render_work_queue(&mut out, &state.work_queue, config);
-
     // Agent state (memory, timers, processes)
     render_agent_state(&mut out, state, config);
 
     // Context metadata
-    render_context_metadata(&mut out, state, compaction, compact_at);
+    render_context_metadata(&mut out, state, compaction, compact_at, agent);
+
+    // Work queue (last — changes every turn, so placing it at the end
+    // maximizes KV cache reuse for the stable prefix above)
+    render_work_queue(&mut out, &state.work_queue, config);
 
     RenderedContext { text: out }
 }
@@ -193,14 +203,14 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
             out.push_str(&format!("pid: {}\n", pid));
         }
         WorkItemType::ChildAgentCompleted {
-            child_id,
+            child_name,
             turns_used,
             success,
             summary,
             result_memory,
         } => {
             out.push_str("type: ChildAgentCompleted\n");
-            out.push_str(&format!("child_id: {}\n", child_id));
+            out.push_str(&format!("child_name: {}\n", child_name));
             out.push_str(&format!("success: {}\n", success));
             out.push_str(&format!("turns_used: {}\n", turns_used));
 
@@ -249,6 +259,14 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
             out.push_str(&format!(
                 "data: {}\n",
                 truncate_with_note(&data_str, content_limit)
+            ));
+        }
+        WorkItemType::AgentMessage { from, content } => {
+            out.push_str("type: AgentMessage\n");
+            out.push_str(&format!("from: {}\n", from));
+            out.push_str(&format!(
+                "content: {}\n",
+                truncate_with_note(content, content_limit)
             ));
         }
         WorkItemType::Compaction => {
@@ -413,8 +431,25 @@ fn render_context_metadata(
     state: &HarnessState,
     compaction: Option<&CompactionState>,
     compact_at: u64,
+    agent: Option<&AgentIdentity>,
 ) {
     out.push_str("<context>\n");
+
+    // Agent identity
+    if let Some(a) = agent {
+        out.push_str(&format!("Agent: {}\n", a.name));
+        out.push_str(&format!("Lineage: {}\n", a.lineage));
+        if let Some(max) = a.max_turns {
+            out.push_str(&format!(
+                "Turns: {}/{} ({} remaining)\n",
+                a.turn_counter,
+                max,
+                max.saturating_sub(a.turn_counter)
+            ));
+        } else {
+            out.push_str(&format!("Turns: {} (no limit)\n", a.turn_counter));
+        }
+    }
 
     let now: DateTime<Local> = Utc::now().into();
     out.push_str(&format!(
@@ -556,7 +591,7 @@ mod tests {
     fn test_render_produces_expected_structure() {
         let state = make_test_state();
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "Test deployment.", None, &config, 150_000);
+        let rendered = render_context(&state, "Test deployment.", None, &config, 150_000, None);
 
         assert!(rendered.text.contains("<deployment_context>"));
         assert!(rendered.text.contains("Test deployment."));
@@ -577,13 +612,21 @@ mod tests {
         assert!(rendered.text.contains("Compaction threshold:"));
         assert!(rendered.text.contains("Can modify entries from: 3a6f"));
         assert!(rendered.text.contains("</context>"));
+
+        // Work queue should come after context metadata (for KV cache optimization)
+        let context_pos = rendered.text.find("</context>").unwrap();
+        let work_queue_pos = rendered.text.find("<work_queue>").unwrap();
+        assert!(
+            context_pos < work_queue_pos,
+            "context metadata should appear before work queue"
+        );
     }
 
     #[test]
     fn test_render_empty_state() {
         let state = HarnessState::new(200_000, 16384);
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000);
+        let rendered = render_context(&state, "", None, &config, 150_000, None);
 
         assert!(rendered.text.contains("<deployment_context>\n</deployment_context>"));
         assert!(rendered.text.contains("<event_history>\n</event_history>"));
@@ -600,7 +643,7 @@ mod tests {
             compaction_script: String::new(),
             estimated_post_compaction: 142000,
         };
-        let rendered = render_context(&state, "", Some(&compaction), &config, 150_000);
+        let rendered = render_context(&state, "", Some(&compaction), &config, 150_000, None);
 
         assert!(rendered.text.contains("COMPACTION MODE:"));
         assert!(rendered.text.contains("Current usage: 142000 tokens"));
@@ -642,7 +685,7 @@ mod tests {
         });
 
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000);
+        let rendered = render_context(&state, "", None, &config, 150_000, None);
 
         // Agent state should appear
         assert!(rendered.text.contains("<agent_state>"), "Missing agent_state block");
@@ -665,9 +708,42 @@ mod tests {
     fn test_render_no_agent_state_when_empty() {
         let state = HarnessState::new(200_000, 16384);
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000);
+        let rendered = render_context(&state, "", None, &config, 150_000, None);
 
         // No agent_state block when nothing to show
         assert!(!rendered.text.contains("<agent_state>"));
+    }
+
+    #[test]
+    fn test_render_agent_identity() {
+        let state = HarnessState::new(200_000, 16384);
+        let config = RenderConfig::default();
+        let agent = AgentIdentity {
+            name: "api-checker",
+            lineage: "api-checker, child of plan-builder, child of root",
+            turn_counter: 3,
+            max_turns: Some(10),
+        };
+        let rendered = render_context(&state, "", None, &config, 150_000, Some(&agent));
+
+        assert!(rendered.text.contains("Agent: api-checker"));
+        assert!(rendered.text.contains("Lineage: api-checker, child of plan-builder, child of root"));
+        assert!(rendered.text.contains("Turns: 3/10 (7 remaining)"));
+    }
+
+    #[test]
+    fn test_render_agent_identity_no_limit() {
+        let state = HarnessState::new(200_000, 16384);
+        let config = RenderConfig::default();
+        let agent = AgentIdentity {
+            name: "root",
+            lineage: "root",
+            turn_counter: 5,
+            max_turns: None,
+        };
+        let rendered = render_context(&state, "", None, &config, 150_000, Some(&agent));
+
+        assert!(rendered.text.contains("Agent: root"));
+        assert!(rendered.text.contains("Turns: 5 (no limit)"));
     }
 }

@@ -51,7 +51,7 @@ impl CompactionManager {
     ) -> u64 {
         if self.script.is_empty() {
             let rendered =
-                renderer::render_context(state, deployment_context, None, config, compact_at);
+                renderer::render_context(state, deployment_context, None, config, compact_at, None);
             return (rendered.text.len() as u64) / 4;
         }
 
@@ -81,7 +81,7 @@ impl CompactionManager {
 
         // Re-render and estimate
         let rendered =
-            renderer::render_context(&clone, deployment_context, None, config, compact_at);
+            renderer::render_context(&clone, deployment_context, None, config, compact_at, None);
         (rendered.text.len() as u64) / 4
     }
 
