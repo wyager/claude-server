@@ -51,6 +51,7 @@ pub struct SideEffectCollector {
     pub agent_messages: Vec<AgentMessageRequest>,
     pub compaction_script_appends: Vec<String>,
     pub compact_called: bool,
+    pub done_called: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -841,6 +842,11 @@ impl PyHarness {
         Ok(())
     }
 
+    fn done(&self) -> PyResult<()> {
+        self.collector.lock().unwrap().done_called = true;
+        Ok(())
+    }
+
     #[getter]
     fn agent_name(&self) -> &str {
         &self.agent_name
@@ -893,6 +899,7 @@ acknowledge_timer = _harness.acknowledge_timer
 show_in_context = _harness.show_in_context
 fork = _harness.fork
 message_agent = _harness.message_agent
+done = _harness.done
 agent_name = _harness.agent_name
 agent_lineage = _harness.agent_lineage
 "#;

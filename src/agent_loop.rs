@@ -18,6 +18,18 @@ use crate::python;
 use crate::renderer;
 use crate::types::*;
 
+/// Why an agent's run loop ended.
+pub enum FinishReason {
+    /// Agent called done() explicitly.
+    Done,
+    /// Max turns exceeded.
+    MaxTurns(u32),
+    /// Shutdown signal received.
+    Shutdown,
+    /// Event channel closed (parent dropped).
+    ChannelClosed,
+}
+
 /// Format a lineage vector into a human-readable string.
 /// e.g. vec!["root", "planner", "worker"] → "worker, child of planner, child of root"
 pub fn format_lineage(lineage: &[String]) -> String {
@@ -117,9 +129,10 @@ impl AgentLoop {
         }
     }
 
-    pub async fn run(&mut self) -> Result<()> {
+    pub async fn run(&mut self) -> FinishReason {
         println!("[{}] Agent loop started", self.name);
         let mut idle = false;
+        let mut finish_reason = FinishReason::Shutdown; // default
 
         loop {
             // Drain any pending events
@@ -141,93 +154,48 @@ impl AgentLoop {
                     .trigger(&mut self.state, self.config.compact_target);
             }
 
-            // If work queue is empty
+            // If work queue is empty, wait for events (messages, process
+            // completions, timer fires). Agents exit explicitly via done().
             if self.state.work_queue.is_empty() {
-                if self.permissions.max_turns.is_some() {
-                    // Child agent: exit when queue is empty and no pending processes/timers
-                    let has_running_processes = self
-                        .state
-                        .process_manager
-                        .processes()
-                        .iter()
-                        .any(|p| matches!(p.status, ProcessStatus::Running));
-                    let has_timers = !self.state.timer_manager.list().is_empty();
-
-                    if !has_running_processes && !has_timers {
-                        println!("[{}] Queue empty, no pending work, exiting", self.name);
-                        break;
-                    }
-
-                    // Still have pending processes/timers — wait for events
-                    let timer_sleep = match self.state.timer_manager.next_deadline() {
-                        Some(deadline) => {
-                            let duration = (deadline - Utc::now())
-                                .to_std()
-                                .unwrap_or(Duration::ZERO);
-                            tokio::time::sleep(duration)
-                        }
-                        None => tokio::time::sleep(Duration::from_secs(60)),
-                    };
-
-                    tokio::select! {
-                        event = self.event_rx.recv() => {
-                            match event {
-                                Some(HarnessEvent::Shutdown) => {
-                                    println!("[{}] Shutdown requested", self.name);
-                                    break;
-                                }
-                                Some(event) => self.apply_event(event),
-                                None => {
-                                    println!("[{}] Event channel closed", self.name);
-                                    break;
-                                }
-                            }
-                        }
-                        _ = timer_sleep => {
-                            self.check_timers();
-                        }
-                    }
-                    continue;
-                } else {
-                    // Parent agent: block until an event arrives or a timer fires
-                    if !idle {
-                        println!("[{}] Idle, waiting for events...", self.name);
-                        idle = true;
-                        self.broadcast(BroadcastMsg::Status {
-                            status: "idle".to_string(),
-                        });
-                    }
-
-                    let timer_sleep = match self.state.timer_manager.next_deadline() {
-                        Some(deadline) => {
-                            let duration = (deadline - Utc::now())
-                                .to_std()
-                                .unwrap_or(Duration::ZERO);
-                            tokio::time::sleep(duration)
-                        }
-                        None => tokio::time::sleep(Duration::from_secs(86400)),
-                    };
-
-                    tokio::select! {
-                        event = self.event_rx.recv() => {
-                            match event {
-                                Some(HarnessEvent::Shutdown) => {
-                                    println!("[{}] Shutdown requested", self.name);
-                                    break;
-                                }
-                                Some(event) => self.apply_event(event),
-                                None => {
-                                    println!("[{}] Event channel closed, shutting down", self.name);
-                                    break;
-                                }
-                            }
-                        }
-                        _ = timer_sleep => {
-                            self.check_timers();
-                        }
-                    }
-                    continue;
+                if !idle {
+                    println!("[{}] Idle, waiting for events...", self.name);
+                    idle = true;
+                    self.broadcast(BroadcastMsg::Status {
+                        status: "idle".to_string(),
+                    });
                 }
+
+                let timer_sleep = match self.state.timer_manager.next_deadline() {
+                    Some(deadline) => {
+                        let duration = (deadline - Utc::now())
+                            .to_std()
+                            .unwrap_or(Duration::ZERO);
+                        tokio::time::sleep(duration)
+                    }
+                    None => tokio::time::sleep(Duration::from_secs(86400)),
+                };
+
+                tokio::select! {
+                    event = self.event_rx.recv() => {
+                        match event {
+                            Some(HarnessEvent::Shutdown) => {
+                                println!("[{}] Shutdown requested", self.name);
+                                finish_reason = FinishReason::Shutdown;
+                                break;
+                            }
+                            Some(event) => self.apply_event(event),
+                            None => {
+                                println!("[{}] Event channel closed, shutting down", self.name);
+                                finish_reason = FinishReason::ChannelClosed;
+                                break;
+                            }
+                        }
+                    }
+                    _ = timer_sleep => {
+                        self.check_timers();
+                    }
+                }
+                continue;
             }
 
             idle = false;
@@ -239,14 +207,23 @@ impl AgentLoop {
                         "[{}] Max turns ({}) reached, exiting",
                         self.name, max
                     );
+                    finish_reason = FinishReason::MaxTurns(max);
                     break;
                 }
             }
 
             // Run a turn
-            if let Err(e) = self.run_turn().await {
-                eprintln!("[{}] Turn error: {}", self.name, e);
-                tokio::time::sleep(Duration::from_secs(5)).await;
+            match self.run_turn().await {
+                Ok(true) => {
+                    println!("[{}] done() called, exiting", self.name);
+                    finish_reason = FinishReason::Done;
+                    break;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("[{}] Turn error: {}", self.name, e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
             }
 
             // Persist state (parent only — children don't persist)
@@ -257,10 +234,11 @@ impl AgentLoop {
             }
         }
 
-        Ok(())
+        finish_reason
     }
 
-    async fn run_turn(&mut self) -> Result<()> {
+    /// Run a single turn. Returns Ok(true) if the agent called done().
+    async fn run_turn(&mut self) -> Result<bool> {
         // Build compaction state if active
         let compaction_state = if self.compaction.active {
             let mut cs = self
@@ -375,7 +353,9 @@ impl AgentLoop {
         }
 
         // Apply side effects (only if no error)
+        let mut done_called = false;
         if !is_error {
+            done_called = exec_result.side_effects.done_called;
             match self.apply_side_effects(exec_result.side_effects) {
                 Ok(deferred) => {
                     self.perform_deferred_ops(deferred).await;
@@ -383,6 +363,7 @@ impl AgentLoop {
                 Err(msg) => {
                     is_error = true;
                     error_text = msg;
+                    done_called = false; // rollback — don't honor done() on error
                 }
             }
         }
@@ -418,7 +399,7 @@ impl AgentLoop {
             );
         }
 
-        Ok(())
+        Ok(done_called)
     }
 
     fn drain_events(&mut self) {
@@ -1164,45 +1145,19 @@ async fn run_child_agent_loop(
         registry.clone(),
     );
 
-    let result = child_loop.run().await;
-
-    let success = result.is_ok();
-    let summary = match result {
-        Ok(()) => "Completed successfully".to_string(),
-        Err(e) => {
-            let msg = format!("{}", e);
-            if msg.len() > 200 {
-                format!("{}...", &msg[..200])
-            } else {
-                msg
-            }
-        }
-    };
-
+    let reason = child_loop.run().await;
     let turns_used = child_loop.turn_counter;
-    let final_success = if let Some(max) = child_loop.permissions.max_turns {
-        if turns_used >= max {
-            false
-        } else {
-            success
-        }
-    } else {
-        success
-    };
 
-    let final_summary = if let Some(max) = child_loop.permissions.max_turns {
-        if turns_used >= max && success {
-            format!("Max turns ({}) exceeded", max)
-        } else {
-            summary
-        }
-    } else {
-        summary
+    let (final_success, final_summary) = match reason {
+        FinishReason::Done => (true, "Called done()".to_string()),
+        FinishReason::MaxTurns(max) => (false, format!("Max turns ({}) exceeded", max)),
+        FinishReason::Shutdown => (false, "Shutdown".to_string()),
+        FinishReason::ChannelClosed => (false, "Parent disconnected".to_string()),
     };
 
     println!(
-        "[{}] Finished (success={}, turns={})",
-        child_name, final_success, turns_used
+        "[{}] Finished (success={}, turns={}, reason={})",
+        child_name, final_success, turns_used, final_summary
     );
 
     // Deregister from the agent registry

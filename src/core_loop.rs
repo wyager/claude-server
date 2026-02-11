@@ -103,7 +103,8 @@ impl CoreLoop {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        self.agent_loop.run().await
+        let _reason = self.agent_loop.run().await;
+        Ok(())
     }
 
     pub fn state(&self) -> &HarnessState {

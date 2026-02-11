@@ -304,14 +304,26 @@ message_agent("root", "Need clarification on the task", priority=9)
 
 Messages arrive as `AgentMessage` work items with `from` and `content` fields.
 If you message a nonexistent agent, the entire turn's side effects are rolled back.
+Messages to agents that have already called `done()` are silently dropped.
+
+**Finishing**: Call `done()` when your task is complete. Agents do NOT auto-exit when the
+work queue is empty — they wait for incoming messages. You must explicitly call `done()`
+to signal completion. If you run out of turns without calling `done()`, the parent sees
+`success: false` with `summary: "Max turns (N) exceeded"`.
+
+```python
+# Store your results in memory, then exit
+memory["result"] = {"answer": 42}
+done()  # signals completion, agent exits
+```
 
 When a child finishes, the parent receives a `ChildAgentCompleted` work item:
 ```python
 item.type           # "ChildAgentCompleted"
 item.child_name     # Name of the child that completed
-item.success        # True if child completed normally, False if error/max_turns exceeded
+item.success        # True if child called done(), False if max_turns/shutdown
 item.turns_used     # How many turns the child took
-item.summary        # Short text describing what happened
+item.summary        # "Called done()" or "Max turns (N) exceeded" or "Shutdown"
 item.result_memory  # Dict of the child's final memory (all keys/values it stored)
 ```
 
