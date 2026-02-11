@@ -1,0 +1,1092 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use anyhow::Result;
+use chrono::Utc;
+use tokio::sync::{broadcast, mpsc};
+
+use crate::api_client::ApiClient;
+use crate::compaction::CompactionManager;
+use crate::config::Config;
+use crate::core_loop::{write_turn_dump, HarnessEvent};
+use crate::db::Database;
+use crate::http_server::BroadcastMsg;
+use crate::process::{ProcessEvent, ProcessSupervisor};
+use crate::python;
+use crate::renderer;
+use crate::types::*;
+
+pub struct AgentLoop {
+    pub name: String,
+    pub permissions: AgentPermissions,
+    pub state: HarnessState,
+    config: Arc<Config>,
+    db: Arc<Database>,
+    api_client: ApiClient,
+    process_supervisor: ProcessSupervisor,
+    compaction: CompactionManager,
+    event_rx: mpsc::UnboundedReceiver<HarnessEvent>,
+    event_tx: mpsc::UnboundedSender<HarnessEvent>,
+    deployment_context: String,
+    broadcast_tx: Option<broadcast::Sender<BroadcastMsg>>,
+    dump_dir: Option<PathBuf>,
+    dump_to_stdout: bool,
+    turn_counter: u32,
+    active_children: u32,
+    max_children: u32,
+    /// Shared accumulator for the parent agent (None for children).
+    token_accumulator: Option<Arc<Mutex<TokenAccumulator>>>,
+    /// Local token accumulators for child agents (not shared).
+    local_input_tokens: u64,
+    local_output_tokens: u64,
+    local_cache_creation_tokens: u64,
+    local_cache_read_tokens: u64,
+}
+
+impl AgentLoop {
+    pub fn new(
+        name: String,
+        permissions: AgentPermissions,
+        state: HarnessState,
+        config: Arc<Config>,
+        db: Arc<Database>,
+        api_client: ApiClient,
+        process_supervisor: ProcessSupervisor,
+        event_rx: mpsc::UnboundedReceiver<HarnessEvent>,
+        event_tx: mpsc::UnboundedSender<HarnessEvent>,
+        deployment_context: String,
+        broadcast_tx: Option<broadcast::Sender<BroadcastMsg>>,
+        dump_dir: Option<PathBuf>,
+        dump_to_stdout: bool,
+        token_accumulator: Option<Arc<Mutex<TokenAccumulator>>>,
+    ) -> Self {
+        let max_children: u32 = std::env::var("CLAUDE_SERVER_MAX_CHILDREN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        Self {
+            name,
+            permissions,
+            state,
+            config,
+            db,
+            api_client,
+            process_supervisor,
+            compaction: CompactionManager::new(),
+            event_rx,
+            event_tx,
+            deployment_context,
+            broadcast_tx,
+            dump_dir,
+            dump_to_stdout,
+            turn_counter: 0,
+            active_children: 0,
+            max_children,
+            token_accumulator,
+            local_input_tokens: 0,
+            local_output_tokens: 0,
+            local_cache_creation_tokens: 0,
+            local_cache_read_tokens: 0,
+        }
+    }
+
+    fn broadcast(&self, msg: BroadcastMsg) {
+        if let Some(ref tx) = self.broadcast_tx {
+            let _ = tx.send(msg);
+        }
+    }
+
+    pub async fn run(&mut self) -> Result<()> {
+        println!("[{}] Agent loop started", self.name);
+        let mut idle = false;
+
+        loop {
+            // Drain any pending events
+            self.drain_events();
+
+            // Check timers
+            self.check_timers();
+
+            // Check if compaction needed (only if permitted)
+            if self.permissions.can_compact
+                && !self.compaction.active
+                && CompactionManager::should_trigger(&self.state, self.config.compact_at)
+            {
+                println!(
+                    "[{}] Triggering compaction (input_tokens {} > threshold {})",
+                    self.name, self.state.last_input_tokens, self.config.compact_at
+                );
+                self.compaction
+                    .trigger(&mut self.state, self.config.compact_target);
+            }
+
+            // If work queue is empty
+            if self.state.work_queue.is_empty() {
+                if self.permissions.max_turns.is_some() {
+                    // Child agent: exit when queue is empty and no pending processes/timers
+                    let has_running_processes = self
+                        .state
+                        .process_manager
+                        .processes()
+                        .iter()
+                        .any(|p| matches!(p.status, ProcessStatus::Running));
+                    let has_timers = !self.state.timer_manager.list().is_empty();
+
+                    if !has_running_processes && !has_timers {
+                        println!("[{}] Queue empty, no pending work, exiting", self.name);
+                        break;
+                    }
+
+                    // Still have pending processes/timers — wait for events
+                    let timer_sleep = match self.state.timer_manager.next_deadline() {
+                        Some(deadline) => {
+                            let duration = (deadline - Utc::now())
+                                .to_std()
+                                .unwrap_or(Duration::ZERO);
+                            tokio::time::sleep(duration)
+                        }
+                        None => tokio::time::sleep(Duration::from_secs(60)),
+                    };
+
+                    tokio::select! {
+                        event = self.event_rx.recv() => {
+                            match event {
+                                Some(HarnessEvent::Shutdown) => {
+                                    println!("[{}] Shutdown requested", self.name);
+                                    break;
+                                }
+                                Some(event) => self.apply_event(event),
+                                None => {
+                                    println!("[{}] Event channel closed", self.name);
+                                    break;
+                                }
+                            }
+                        }
+                        _ = timer_sleep => {
+                            self.check_timers();
+                        }
+                    }
+                    continue;
+                } else {
+                    // Parent agent: block until an event arrives or a timer fires
+                    if !idle {
+                        println!("[{}] Idle, waiting for events...", self.name);
+                        idle = true;
+                        self.broadcast(BroadcastMsg::Status {
+                            status: "idle".to_string(),
+                        });
+                    }
+
+                    let timer_sleep = match self.state.timer_manager.next_deadline() {
+                        Some(deadline) => {
+                            let duration = (deadline - Utc::now())
+                                .to_std()
+                                .unwrap_or(Duration::ZERO);
+                            tokio::time::sleep(duration)
+                        }
+                        None => tokio::time::sleep(Duration::from_secs(86400)),
+                    };
+
+                    tokio::select! {
+                        event = self.event_rx.recv() => {
+                            match event {
+                                Some(HarnessEvent::Shutdown) => {
+                                    println!("[{}] Shutdown requested", self.name);
+                                    break;
+                                }
+                                Some(event) => self.apply_event(event),
+                                None => {
+                                    println!("[{}] Event channel closed, shutting down", self.name);
+                                    break;
+                                }
+                            }
+                        }
+                        _ = timer_sleep => {
+                            self.check_timers();
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            idle = false;
+
+            // Check max_turns limit
+            if let Some(max) = self.permissions.max_turns {
+                if self.turn_counter >= max {
+                    println!(
+                        "[{}] Max turns ({}) reached, exiting",
+                        self.name, max
+                    );
+                    break;
+                }
+            }
+
+            // Run a turn
+            if let Err(e) = self.run_turn().await {
+                eprintln!("[{}] Turn error: {}", self.name, e);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+
+            // Persist state (parent only — children don't persist)
+            if self.permissions.max_turns.is_none() {
+                if let Err(e) = self.db.save_state(&self.state) {
+                    eprintln!("[{}] Failed to persist state: {}", self.name, e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn run_turn(&mut self) -> Result<()> {
+        // Build compaction state if active
+        let compaction_state = if self.compaction.active {
+            let mut cs = self
+                .compaction
+                .compaction_state(self.state.last_input_tokens);
+            cs.estimated_post_compaction = self.compaction.estimate_post_compaction(
+                &self.state,
+                &self.deployment_context,
+                &self.config.render_config,
+                self.config.compact_at,
+            );
+            Some(cs)
+        } else {
+            None
+        };
+
+        // Render context
+        let rendered = renderer::render_context(
+            &self.state,
+            &self.deployment_context,
+            compaction_state.as_ref(),
+            &self.config.render_config,
+            self.config.compact_at,
+        );
+
+        println!(
+            "[{}] Rendered context: {} chars, queue: {} items",
+            self.name,
+            rendered.text.len(),
+            self.state.work_queue.len()
+        );
+
+        // Broadcast thinking status
+        self.broadcast(BroadcastMsg::Status {
+            status: "thinking".to_string(),
+        });
+
+        // Call Claude API
+        let api_result = self.api_client.call(&rendered).await?;
+
+        println!(
+            "[{}] API response: {} input tokens, {} output tokens (cache: {} created, {} read)",
+            self.name,
+            api_result.input_tokens,
+            api_result.output_tokens,
+            api_result.cache_creation_tokens,
+            api_result.cache_read_tokens
+        );
+
+        // Update token tracking
+        self.state.last_input_tokens = api_result.input_tokens;
+        self.turn_counter += 1;
+
+        // Accumulate tokens
+        if let Some(ref acc) = self.token_accumulator {
+            let mut acc = acc.lock().unwrap();
+            acc.input_tokens += api_result.input_tokens;
+            acc.output_tokens += api_result.output_tokens;
+            acc.cache_creation_tokens += api_result.cache_creation_tokens;
+            acc.cache_read_tokens += api_result.cache_read_tokens;
+            acc.turns += 1;
+        } else {
+            // Child agent: track locally
+            self.local_input_tokens += api_result.input_tokens;
+            self.local_output_tokens += api_result.output_tokens;
+            self.local_cache_creation_tokens += api_result.cache_creation_tokens;
+            self.local_cache_read_tokens += api_result.cache_read_tokens;
+        }
+
+        // Load process outputs for shell_output() calls
+        let process_outputs = self.db.load_all_process_outputs().unwrap_or_default();
+
+        // Broadcast executing status
+        self.broadcast(BroadcastMsg::Status {
+            status: "executing".to_string(),
+        });
+
+        // Execute Python
+        let exec_result = python::execute_with_timeout(
+            &self.state,
+            &api_result.code,
+            self.compaction.active,
+            &process_outputs,
+            self.config.python_timeout_secs,
+            self.permissions.child_depth_remaining,
+        );
+
+        let is_error = exec_result.is_error;
+        let stdout = exec_result.stdout.clone();
+        let error_text = exec_result.error_text.clone();
+
+        println!(
+            "[{}] Executed (error={}): {}",
+            self.name,
+            is_error,
+            &api_result.code.lines().next().unwrap_or("(empty)")
+        );
+
+        if !stdout.is_empty() {
+            print!("[stdout] {}", stdout);
+        }
+
+        // Apply side effects (only if no error)
+        if !is_error {
+            let deferred = self.apply_side_effects(exec_result.side_effects);
+            self.perform_deferred_ops(deferred).await;
+        }
+
+        // Record in history (after side effects so entry_id is fresh)
+        let entry_id = self.state.id_generator.next();
+        let output = if is_error {
+            format!("[ERROR]\n{}", error_text)
+        } else {
+            stdout
+        };
+
+        self.state.event_history.push(HistoryEntry::Execution {
+            id: entry_id,
+            time: Utc::now(),
+            code: api_result.code.clone(),
+            output: output.clone(),
+            is_error,
+        });
+
+        // Dump turn
+        if self.dump_to_stdout || self.dump_dir.is_some() {
+            write_turn_dump(
+                &self.name,
+                self.turn_counter,
+                &rendered.text,
+                api_result.thinking.as_deref(),
+                &api_result.code,
+                &output,
+                is_error,
+                self.dump_to_stdout,
+                self.dump_dir.as_deref(),
+            );
+        }
+
+        Ok(())
+    }
+
+    fn drain_events(&mut self) {
+        while let Ok(event) = self.event_rx.try_recv() {
+            self.apply_event(event);
+        }
+    }
+
+    fn check_timers(&mut self) {
+        let now = Utc::now();
+        let fired = self
+            .state
+            .timer_manager
+            .check_and_fire(now, &mut self.state.id_generator);
+        for item in fired {
+            println!("[{}] Timer fired: {}", self.name, item.id);
+            self.state.work_queue.push(item);
+        }
+    }
+
+    fn apply_event(&mut self, event: HarnessEvent) {
+        match event {
+            HarnessEvent::UserMessage {
+                chat_id,
+                user,
+                content,
+            } => {
+                let id = self.state.id_generator.next();
+                println!(
+                    "[{}] User message from {}: {} (id={})",
+                    self.name,
+                    user,
+                    &content[..content.len().min(50)],
+                    id
+                );
+                self.state.work_queue.push(WorkItem {
+                    id,
+                    priority: 9,
+                    time: Utc::now(),
+                    item_type: WorkItemType::UserMessage {
+                        chat_id,
+                        user,
+                        content,
+                    },
+                });
+            }
+            HarnessEvent::Process(pe) => match pe {
+                ProcessEvent::Completed { pid, exit_code } => {
+                    let prio = self
+                        .state
+                        .process_manager
+                        .get(&pid)
+                        .map(|p| p.success_prio)
+                        .unwrap_or(5);
+                    if let Some(p) = self.state.process_manager.get_mut(&pid) {
+                        p.status = ProcessStatus::Completed { exit_code };
+                    }
+                    let output_preview = self.load_output_preview(&pid.0);
+                    let id = self.state.id_generator.next();
+                    self.state.work_queue.push(WorkItem {
+                        id,
+                        priority: prio,
+                        time: Utc::now(),
+                        item_type: WorkItemType::ProcessCompleted {
+                            pid,
+                            exit_code,
+                            output_preview,
+                        },
+                    });
+                }
+                ProcessEvent::Failed { pid, error } => {
+                    let prio = self
+                        .state
+                        .process_manager
+                        .get(&pid)
+                        .map(|p| p.fail_prio)
+                        .unwrap_or(7);
+                    if let Some(p) = self.state.process_manager.get_mut(&pid) {
+                        p.status = ProcessStatus::Failed {
+                            error: error.clone(),
+                        };
+                    }
+                    let output_preview = self.load_output_preview(&pid.0);
+                    let id = self.state.id_generator.next();
+                    self.state.work_queue.push(WorkItem {
+                        id,
+                        priority: prio,
+                        time: Utc::now(),
+                        item_type: WorkItemType::ProcessFailed {
+                            pid,
+                            error,
+                            output_preview,
+                        },
+                    });
+                }
+                ProcessEvent::Timeout { pid } => {
+                    let prio = self
+                        .state
+                        .process_manager
+                        .get(&pid)
+                        .map(|p| p.fail_prio)
+                        .unwrap_or(7);
+                    let id = self.state.id_generator.next();
+                    self.state.work_queue.push(WorkItem {
+                        id,
+                        priority: prio,
+                        time: Utc::now(),
+                        item_type: WorkItemType::ProcessTimeout { pid },
+                    });
+                }
+            },
+            HarnessEvent::ChildCompleted {
+                child_id,
+                result_memory,
+                turns_used,
+                success,
+                summary,
+                priority,
+                child_input_tokens,
+                child_output_tokens,
+                child_cache_creation_tokens,
+                child_cache_read_tokens,
+            } => {
+                self.active_children = self.active_children.saturating_sub(1);
+                let id = self.state.id_generator.next();
+                println!(
+                    "[{}] Child agent {} completed (success={}, turns={})",
+                    self.name, child_id, success, turns_used
+                );
+
+                // Add child's accumulated tokens to the shared accumulator
+                if let Some(ref acc) = self.token_accumulator {
+                    let mut acc = acc.lock().unwrap();
+                    acc.input_tokens += child_input_tokens;
+                    acc.output_tokens += child_output_tokens;
+                    acc.cache_creation_tokens += child_cache_creation_tokens;
+                    acc.cache_read_tokens += child_cache_read_tokens;
+                }
+
+                self.state.work_queue.push(WorkItem {
+                    id,
+                    priority,
+                    time: Utc::now(),
+                    item_type: WorkItemType::ChildAgentCompleted {
+                        child_id,
+                        result_memory,
+                        turns_used,
+                        success,
+                        summary,
+                    },
+                });
+            }
+            HarnessEvent::ExternalEvent {
+                source,
+                event_type,
+                data,
+                priority,
+            } => {
+                let id = self.state.id_generator.next();
+                println!(
+                    "[{}] External event from {}: {} (id={})",
+                    self.name, source, event_type, id
+                );
+                self.state.work_queue.push(WorkItem {
+                    id,
+                    priority,
+                    time: Utc::now(),
+                    item_type: WorkItemType::ExternalEvent {
+                        source,
+                        event_type,
+                        data,
+                    },
+                });
+            }
+            HarnessEvent::Shutdown => {} // handled in run()
+        }
+    }
+
+    /// Load the last ~500 chars of process output as a preview.
+    fn load_output_preview(&self, pid: &str) -> Option<String> {
+        self.db
+            .load_process_output(pid)
+            .ok()
+            .map(|o| {
+                let trimmed = o.trim_end();
+                if trimmed.len() > 500 {
+                    format!("...{}", &trimmed[trimmed.len() - 500..])
+                } else {
+                    trimmed.to_string()
+                }
+            })
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Apply side effects synchronously, returning any deferred async operations
+    /// (block_for waiters and process kills) to be awaited by the caller.
+    fn apply_side_effects(
+        &mut self,
+        effects: python::SideEffectCollector,
+    ) -> DeferredOps {
+        let mut deferred = DeferredOps::default();
+
+        // Update ID generator
+        self.state.id_generator = effects.id_gen;
+
+        // Memory operations
+        for (key, value) in effects.memory_sets {
+            self.state.memory.insert(key, value);
+        }
+        for key in effects.memory_deletes {
+            self.state.memory.remove(&key);
+            self.state.memory_priorities.remove(&key);
+        }
+        for (key, priority) in effects.memory_priority_sets {
+            self.state.memory_priorities.insert(key, priority);
+        }
+
+        // Queue removes
+        for id in effects.queue_removes {
+            self.state.work_queue.remove(&AgentId(id));
+        }
+
+        // Timer operations
+        for req in effects.timer_adds {
+            let schedule = if let Some(secs) = req.every_secs {
+                TimerSchedule::Recurring {
+                    every: Duration::from_secs(secs),
+                    next_fire: Utc::now()
+                        + chrono::Duration::from_std(Duration::from_secs(secs))
+                            .unwrap_or(chrono::Duration::seconds(1)),
+                }
+            } else if let Some(epoch) = req.at_epoch {
+                let at = chrono::DateTime::from_timestamp(epoch as i64, 0)
+                    .unwrap_or_else(|| Utc::now() + chrono::Duration::minutes(1));
+                TimerSchedule::OneShot { at }
+            } else {
+                let at = Utc::now() + chrono::Duration::minutes(1);
+                TimerSchedule::OneShot { at }
+            };
+
+            let timer = Timer {
+                id: req.id,
+                description: req.description,
+                priority: req.priority,
+                schedule,
+                created_at: Utc::now(),
+                pending_ack: false,
+            };
+            self.state.timer_manager.add(timer);
+        }
+        for id in effects.timer_cancels {
+            self.state.timer_manager.cancel(&AgentId(id));
+        }
+
+        // Timer acknowledgments
+        for id in effects.timer_acks {
+            self.state.timer_manager.acknowledge(&AgentId(id));
+        }
+
+        // Filter operations
+        for filter in effects.filter_adds {
+            self.state.work_queue.add_filter(filter);
+        }
+        for name in effects.filter_removes {
+            self.state.work_queue.remove_filter(&name);
+        }
+
+        // History operations
+        for id in effects.history_removes {
+            let aid = AgentId(id);
+            if self.state.event_history.is_modifiable(&aid) || self.compaction.active {
+                self.state.event_history.remove(&aid);
+            }
+        }
+        for (id, desc) in effects.history_replaces {
+            let aid = AgentId(id);
+            if self.state.event_history.is_modifiable(&aid) || self.compaction.active {
+                self.state.event_history.replace_with_summary(&aid, desc);
+            }
+        }
+        for text in effects.history_adds {
+            if self.compaction.active {
+                let id = self.state.id_generator.next();
+                self.state.event_history.push(HistoryEntry::Summary {
+                    id,
+                    time: Utc::now(),
+                    description: text,
+                });
+            }
+        }
+
+        // Process starts
+        for req in effects.process_starts {
+            let managed = ManagedProcess {
+                id: req.id.clone(),
+                cmd: req.cmd.clone(),
+                args: req.args.clone(),
+                env: req.env.clone(),
+                description: req.description.clone(),
+                status: ProcessStatus::Running,
+                alert_timer: Duration::from_secs(req.alert_timer_secs),
+                success_prio: req.success_prio,
+                fail_prio: req.fail_prio,
+                started_at: Utc::now(),
+                os_pid: None,
+            };
+            self.state.process_manager.add(managed);
+
+            let block_for_ms = req.block_for_ms;
+            match self.process_supervisor.spawn(req.clone()) {
+                Ok(completion_rx) => {
+                    if let (Some(ms), Some(rx)) = (block_for_ms, completion_rx) {
+                        deferred.block_for_waiters.push((ms, rx));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[{}] Failed to spawn process: {}", self.name, e);
+                    if let Some(p) = self.state.process_manager.get_mut(&req.id) {
+                        p.status = ProcessStatus::Failed {
+                            error: format!("spawn failed: {}", e),
+                        };
+                    }
+                    let wid = self.state.id_generator.next();
+                    self.state.work_queue.push(WorkItem {
+                        id: wid,
+                        priority: req.fail_prio,
+                        time: Utc::now(),
+                        item_type: WorkItemType::ProcessFailed {
+                            pid: req.id,
+                            error: format!("spawn failed: {}", e),
+                            output_preview: None,
+                        },
+                    });
+                }
+            }
+        }
+
+        // Process kills
+        deferred.process_kills = effects.process_kills;
+
+        // Child agent spawns
+        for req in effects.child_agent_starts {
+            if self.active_children >= self.max_children {
+                eprintln!(
+                    "[{}] Cannot spawn child agent: max {} concurrent children reached",
+                    self.name, self.max_children
+                );
+                let wid = self.state.id_generator.next();
+                self.state.work_queue.push(WorkItem {
+                    id: wid,
+                    priority: req.priority,
+                    time: Utc::now(),
+                    item_type: WorkItemType::ChildAgentCompleted {
+                        child_id: req.id,
+                        result_memory: HashMap::new(),
+                        turns_used: 0,
+                        success: false,
+                        summary: format!(
+                            "Could not spawn: max {} concurrent children reached",
+                            self.max_children
+                        ),
+                    },
+                });
+                continue;
+            }
+
+            self.active_children += 1;
+            println!(
+                "[{}] Spawning child agent {} (model={}, max_turns={}, depth_remaining={})",
+                self.name, req.id, req.model, req.max_turns, req.child_depth_remaining
+            );
+
+            let child_name = format!("child-{}", req.id);
+            let child_id = req.id.clone();
+            let priority = req.priority;
+            let max_turns = req.max_turns;
+            let child_depth = req.child_depth_remaining;
+
+            // Create child's own event channels
+            let (child_event_tx, child_event_rx) = mpsc::unbounded_channel::<HarnessEvent>();
+
+            // Create child's own process event channel and supervisor
+            let (child_process_event_tx, mut child_process_event_rx) =
+                mpsc::unbounded_channel::<ProcessEvent>();
+            let child_process_supervisor =
+                ProcessSupervisor::new(child_process_event_tx, self.db.clone());
+
+            // Forward process events to child's main event channel
+            let child_event_tx_for_process = child_event_tx.clone();
+            tokio::spawn(async move {
+                while let Some(pe) = child_process_event_rx.recv().await {
+                    if child_event_tx_for_process
+                        .send(HarnessEvent::Process(pe))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+
+            // Create child state
+            let mut child_state =
+                HarnessState::new(self.config.context_window, self.config.max_tokens);
+            child_state.memory = req.seed_memory;
+
+            // Seed work queue
+            let task_id = child_state.id_generator.next();
+            child_state.work_queue.push(WorkItem {
+                id: task_id,
+                priority: 9,
+                time: Utc::now(),
+                item_type: WorkItemType::UserMessage {
+                    chat_id: "child-agent".to_string(),
+                    user: "parent-agent".to_string(),
+                    content: req.task,
+                },
+            });
+
+            // Child deployment context
+            let child_deployment = format!(
+                "You are a sub-agent spawned by a parent agent to complete a specific task.\n\
+                Complete the assigned task, store your results in memory, and stop.\n\
+                You have full access to send_message() and shell_exec().\n\
+                {}\n\
+                Your parent receives your final memory contents when you complete.\n\
+                \n{}",
+                if child_depth == 0 {
+                    "You cannot use spawn_agent() \u{2014} that will raise an error."
+                } else {
+                    "You can use spawn_agent() to spawn sub-agents."
+                },
+                self.deployment_context
+            );
+
+            // Create child API client
+            let child_config = Arc::new(Config {
+                model: req.model.clone(),
+                api_key: self.config.api_key.clone(),
+                api_base_url: self.config.api_base_url.clone(),
+                max_tokens: self.config.max_tokens,
+                context_window: self.config.context_window,
+                db_path: self.config.db_path.clone(),
+                system_prompt_path: self.config.system_prompt_path.clone(),
+                deployment_context_path: self.config.deployment_context_path.clone(),
+                listen_addr: self.config.listen_addr,
+                compact_at: self.config.compact_at,
+                compact_target: self.config.compact_target,
+                render_config: self.config.render_config.clone(),
+                python_timeout_secs: self.config.python_timeout_secs,
+                cost_per_m_input: self.config.cost_per_m_input,
+                cost_per_m_output: self.config.cost_per_m_output,
+                cost_per_m_cache_read: self.config.cost_per_m_cache_read,
+                cost_per_m_cache_write: self.config.cost_per_m_cache_write,
+            });
+
+            let system_prompt = self
+                .config
+                .load_system_prompt()
+                .unwrap_or_else(|_| String::new());
+
+            let child_api_client =
+                match ApiClient::new_with_prompt(child_config.clone(), &system_prompt) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.active_children = self.active_children.saturating_sub(1);
+                        let wid = self.state.id_generator.next();
+                        self.state.work_queue.push(WorkItem {
+                            id: wid,
+                            priority,
+                            time: Utc::now(),
+                            item_type: WorkItemType::ChildAgentCompleted {
+                                child_id: child_id.clone(),
+                                result_memory: HashMap::new(),
+                                turns_used: 0,
+                                success: false,
+                                summary: format!("Failed to create API client: {}", e),
+                            },
+                        });
+                        continue;
+                    }
+                };
+
+            let child_permissions = AgentPermissions {
+                can_compact: false,
+                max_turns: Some(max_turns),
+                child_depth_remaining: child_depth,
+            };
+
+            let dump_dir = self.dump_dir.clone();
+            let db = self.db.clone();
+            let parent_tx = self.event_tx.clone();
+
+            tokio::spawn(run_child_agent_loop(
+                child_name,
+                child_permissions,
+                child_state,
+                child_config,
+                db,
+                child_api_client,
+                child_process_supervisor,
+                child_event_rx,
+                child_event_tx,
+                child_deployment,
+                dump_dir,
+                child_id,
+                priority,
+                parent_tx,
+            ));
+        }
+
+        // Outbound messages
+        for msg in effects.messages {
+            println!("[message] -> chat:{} | {}", msg.chat_id, msg.content);
+            if let Ok(id) = self.db.save_outbound_message(&msg.chat_id, &msg.content) {
+                self.broadcast(BroadcastMsg::Message {
+                    chat_id: msg.chat_id,
+                    content: msg.content,
+                    id,
+                    created_at: chrono::Utc::now()
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string(),
+                });
+            }
+        }
+
+        // Compaction script
+        for append in effects.compaction_script_appends {
+            self.compaction.script.push_str(&append);
+        }
+        if effects.compact_called && self.compaction.active {
+            println!("[{}] Compaction executed", self.name);
+            let compact_result = python::execute_with_timeout(
+                &self.state,
+                &self.compaction.script,
+                true,
+                &HashMap::new(),
+                self.config.python_timeout_secs,
+                0, // compaction doesn't need to spawn children
+            );
+
+            if compact_result.is_error {
+                eprintln!(
+                    "[{}] Compaction script error: {}",
+                    self.name, compact_result.error_text
+                );
+                let id = self.state.id_generator.next();
+                self.state.event_history.push(HistoryEntry::Execution {
+                    id,
+                    time: Utc::now(),
+                    code: "compact()".to_string(),
+                    output: format!("[ERROR]\n{}", compact_result.error_text),
+                    is_error: true,
+                });
+            } else {
+                for id in compact_result.side_effects.history_removes {
+                    self.state.event_history.remove(&AgentId(id));
+                }
+                for (id, desc) in compact_result.side_effects.history_replaces {
+                    self.state
+                        .event_history
+                        .replace_with_summary(&AgentId(id), desc);
+                }
+                for text in compact_result.side_effects.history_adds {
+                    let id = self.state.id_generator.next();
+                    self.state.event_history.push(HistoryEntry::Summary {
+                        id,
+                        time: Utc::now(),
+                        description: text,
+                    });
+                }
+
+                // Remove the Compaction work item
+                let compaction_items: Vec<AgentId> = self
+                    .state
+                    .work_queue
+                    .items()
+                    .iter()
+                    .filter(|i| matches!(i.item_type, WorkItemType::Compaction))
+                    .map(|i| i.id.clone())
+                    .collect();
+                for id in compaction_items {
+                    self.state.work_queue.remove(&id);
+                }
+
+                self.compaction.complete();
+                println!("[{}] Compaction complete", self.name);
+            }
+        }
+
+        deferred
+    }
+
+    /// Perform the deferred async operations returned by apply_side_effects.
+    async fn perform_deferred_ops(&mut self, deferred: DeferredOps) {
+        // Wait for block_for processes
+        for (ms, rx) in deferred.block_for_waiters {
+            let _ = tokio::time::timeout(Duration::from_millis(ms), rx).await;
+            self.drain_events();
+        }
+
+        // Process kills
+        for id in deferred.process_kills {
+            if let Err(e) = self.process_supervisor.kill(&id).await {
+                eprintln!("[{}] Failed to kill process {}: {}", self.name, id, e);
+            }
+        }
+    }
+}
+
+/// Deferred async operations collected during apply_side_effects.
+#[derive(Default)]
+struct DeferredOps {
+    /// (timeout_ms, oneshot_receiver) pairs for block_for process waits
+    block_for_waiters: Vec<(u64, tokio::sync::oneshot::Receiver<()>)>,
+    /// Process IDs to kill
+    process_kills: Vec<String>,
+}
+
+/// Standalone async function to run a child agent loop.
+/// Extracted from AgentLoop::apply_side_effects to break the recursive type
+/// dependency that would otherwise make the future from AgentLoop::run() not Send.
+async fn run_child_agent_loop(
+    child_name: String,
+    child_permissions: AgentPermissions,
+    child_state: HarnessState,
+    child_config: Arc<Config>,
+    db: Arc<Database>,
+    child_api_client: ApiClient,
+    child_process_supervisor: ProcessSupervisor,
+    child_event_rx: mpsc::UnboundedReceiver<HarnessEvent>,
+    child_event_tx: mpsc::UnboundedSender<HarnessEvent>,
+    child_deployment: String,
+    dump_dir: Option<PathBuf>,
+    child_id: AgentId,
+    priority: u8,
+    parent_tx: mpsc::UnboundedSender<HarnessEvent>,
+) {
+    let mut child_loop = AgentLoop::new(
+        child_name.clone(),
+        child_permissions,
+        child_state,
+        child_config,
+        db,
+        child_api_client,
+        child_process_supervisor,
+        child_event_rx,
+        child_event_tx,
+        child_deployment,
+        None,  // children don't broadcast
+        dump_dir,
+        false, // children don't dump to stdout
+        None,  // children track tokens locally
+    );
+
+    let result = child_loop.run().await;
+
+    let success = result.is_ok();
+    let summary = match result {
+        Ok(()) => "Completed successfully".to_string(),
+        Err(e) => {
+            let msg = format!("{}", e);
+            if msg.len() > 200 {
+                format!("{}...", &msg[..200])
+            } else {
+                msg
+            }
+        }
+    };
+
+    let turns_used = child_loop.turn_counter;
+    let final_success = if let Some(max) = child_loop.permissions.max_turns {
+        if turns_used >= max {
+            false
+        } else {
+            success
+        }
+    } else {
+        success
+    };
+
+    let final_summary = if let Some(max) = child_loop.permissions.max_turns {
+        if turns_used >= max && success {
+            format!("Max turns ({}) exceeded", max)
+        } else {
+            summary
+        }
+    } else {
+        summary
+    };
+
+    println!(
+        "[{}] Finished (success={}, turns={})",
+        child_name, final_success, turns_used
+    );
+
+    let _ = parent_tx.send(HarnessEvent::ChildCompleted {
+        child_id,
+        result_memory: child_loop.state.memory,
+        turns_used,
+        success: final_success,
+        summary: final_summary,
+        priority,
+        child_input_tokens: child_loop.local_input_tokens,
+        child_output_tokens: child_loop.local_output_tokens,
+        child_cache_creation_tokens: child_loop.local_cache_creation_tokens,
+        child_cache_read_tokens: child_loop.local_cache_read_tokens,
+    });
+}
