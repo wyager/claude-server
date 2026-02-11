@@ -654,6 +654,10 @@ pub struct AgentRegistry {
 struct AgentEntry {
     pub lineage: Vec<String>,
     pub event_tx: mpsc::UnboundedSender<crate::core_loop::HarnessEvent>,
+    /// True if the agent has completed and deregistered. The name stays in the
+    /// registry so siblings can still message it (messages are silently dropped)
+    /// without causing a "not found" transaction failure.
+    pub completed: bool,
 }
 
 impl AgentRegistry {
@@ -663,7 +667,7 @@ impl AgentRegistry {
         }
     }
 
-    /// Register a single agent. Fails if the name is already taken.
+    /// Register a single agent. Fails if the name is already taken by a running agent.
     pub fn register(
         &self,
         name: String,
@@ -671,25 +675,31 @@ impl AgentRegistry {
         event_tx: mpsc::UnboundedSender<crate::core_loop::HarnessEvent>,
     ) -> Result<(), String> {
         let mut agents = self.agents.lock().unwrap();
-        if agents.contains_key(&name) {
-            return Err(format!("Name '{}' is already in use by a running agent", name));
+        if let Some(existing) = agents.get(&name) {
+            if !existing.completed {
+                return Err(format!("Name '{}' is already in use by a running agent", name));
+            }
+            // Completed agents can be replaced (name reuse)
         }
-        agents.insert(name, AgentEntry { lineage, event_tx });
+        agents.insert(name, AgentEntry { lineage, event_tx, completed: false });
         Ok(())
     }
 
-    /// Register a batch of agents atomically. If any name collides, none are registered.
+    /// Register a batch of agents atomically. If any name collides with a
+    /// *running* agent, none are registered. Completed agent names can be reused.
     pub fn register_batch(
         &self,
         entries: Vec<(String, Vec<String>, mpsc::UnboundedSender<crate::core_loop::HarnessEvent>)>,
     ) -> Result<(), String> {
         let mut agents = self.agents.lock().unwrap();
 
-        // Check for collisions with existing agents
+        // Check for collisions with running agents
         let mut collisions = Vec::new();
         for (name, _, _) in &entries {
-            if agents.contains_key(name) {
-                collisions.push(name.clone());
+            if let Some(existing) = agents.get(name) {
+                if !existing.completed {
+                    collisions.push(name.clone());
+                }
             }
         }
 
@@ -710,33 +720,41 @@ impl AgentRegistry {
 
         // All clear — register all
         for (name, lineage, event_tx) in entries {
-            agents.insert(name, AgentEntry { lineage, event_tx });
+            agents.insert(name, AgentEntry { lineage, event_tx, completed: false });
         }
         Ok(())
     }
 
-    /// Remove an agent from the registry.
+    /// Mark an agent as completed. The name stays in the registry so siblings
+    /// can still validate against it, but messages are silently dropped.
     pub fn deregister(&self, name: &str) {
-        self.agents.lock().unwrap().remove(name);
+        let mut agents = self.agents.lock().unwrap();
+        if let Some(entry) = agents.get_mut(name) {
+            entry.completed = true;
+        }
     }
 
-    /// Send an event to a named agent. Fails if the agent doesn't exist.
+    /// Send an event to a named agent.
+    /// - Returns Ok(true) if delivered.
+    /// - Returns Ok(false) if agent completed (message silently dropped).
+    /// - Returns Err if agent name never existed.
     pub fn send_to(
         &self,
         name: &str,
         event: crate::core_loop::HarnessEvent,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let agents = self.agents.lock().unwrap();
         match agents.get(name) {
-            Some(entry) => entry
-                .event_tx
-                .send(event)
-                .map_err(|_| format!("Agent '{}' channel closed", name)),
-            None => Err(format!("Agent '{}' not found", name)),
+            Some(entry) if entry.completed => Ok(false), // silently drop
+            Some(entry) => {
+                let _ = entry.event_tx.send(event);
+                Ok(true)
+            }
+            None => Err(format!("Agent '{}' not found (never registered)", name)),
         }
     }
 
-    /// Check if an agent name exists in the registry.
+    /// Check if an agent name exists in the registry (including completed agents).
     pub fn exists(&self, name: &str) -> bool {
         self.agents.lock().unwrap().contains_key(name)
     }

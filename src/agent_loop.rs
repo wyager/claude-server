@@ -996,7 +996,7 @@ impl AgentLoop {
 
         // Agent messages (already validated above)
         for msg in effects.agent_messages {
-            if let Err(e) = self.registry.send_to(
+            match self.registry.send_to(
                 &msg.recipient,
                 HarnessEvent::AgentMessage {
                     from: self.permissions.agent_name.clone(),
@@ -1004,7 +1004,16 @@ impl AgentLoop {
                     priority: msg.priority,
                 },
             ) {
-                eprintln!("[{}] Failed to deliver agent message: {}", self.name, e);
+                Ok(true) => {} // delivered
+                Ok(false) => {
+                    println!(
+                        "[{}] Message to '{}' dropped (agent completed)",
+                        self.name, msg.recipient
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[{}] Failed to deliver agent message: {}", self.name, e);
+                }
             }
         }
 

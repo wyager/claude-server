@@ -267,27 +267,48 @@ shell_exec(
 )
 ```
 
-### Sub-agents
+### Sub-agents (fork)
 
-Spawn child agent loops for parallel work. Each child runs independently with its own
-context, makes API calls, and returns its memory to you when complete.
+Fork child agents for parallel work. Children inherit your full context (event history
+and memory) so they have complete awareness of what's happened so far. Each child runs
+independently with its own context and API calls.
 
 ```python
-child_id = spawn_agent(
-    task="Write unit tests for the auth module in /project/src/auth.py",
-    model="claude-sonnet-4-5-20250929",             # Required: choose the model
-    memory={"project_dir": "/project"},             # Optional: seed child memory
-    max_turns=20,                                    # Max turns (default 20, hard cap 50)
-    priority=6,                                      # Priority of completion work item
-)
-# Store the child ID so you can match it when the result arrives
-memory.set("test_writer", child_id, priority=7)
+fork([
+    ChildSettings(
+        name="test-writer",                              # Globally unique name (required)
+        task="Write unit tests for the auth module",     # Task description (required)
+        model="claude-sonnet-4-5-20250929",              # Model (default: inherit parent)
+        max_turns=20,                                    # Max turns (default 20)
+        can_compact=True,                                # Can compact context (default True)
+    ),
+    ChildSettings(
+        name="linter",
+        task="Run linting on the project",
+    ),
+])
+# fork() is a no-op for you (the parent). Children see the fork as a SystemAlert
+# in their history, then receive their task as a work item from you.
 ```
 
-When the child finishes, you receive a `ChildAgentCompleted` work item:
+**Agent identity**: Every agent has a name and lineage. Access via `agent_name` and
+`agent_lineage`. The root agent is always named `"root"`. Names must be globally
+unique — if any name in a fork collides with an existing agent, the entire fork fails.
+
+**Inter-agent messaging**: Agents can send messages to any other agent by name.
+
+```python
+message_agent("sibling-name", "I found the bug, it's in auth.py line 42")
+message_agent("root", "Need clarification on the task", priority=9)
+```
+
+Messages arrive as `AgentMessage` work items with `from` and `content` fields.
+If you message a nonexistent agent, the entire turn's side effects are rolled back.
+
+When a child finishes, the parent receives a `ChildAgentCompleted` work item:
 ```python
 item.type           # "ChildAgentCompleted"
-item.child_id       # Hex ID matching what spawn_agent returned
+item.child_name     # Name of the child that completed
 item.success        # True if child completed normally, False if error/max_turns exceeded
 item.turns_used     # How many turns the child took
 item.summary        # Short text describing what happened
@@ -295,9 +316,8 @@ item.result_memory  # Dict of the child's final memory (all keys/values it store
 ```
 
 **Limits**: Max 3 concurrent children. Children have full access to `shell_exec()` and
-`send_message()`. Children cannot spawn their own children (`spawn_agent` raises
-RuntimeError — spawn depth is restricted). Store results in memory for the parent to
-retrieve via `item.result_memory`.
+`send_message()`. Children can fork their own children if `child_depth_remaining > 0`.
+Store results in memory for the parent to retrieve via `item.result_memory`.
 
 ### Context management
 
