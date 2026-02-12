@@ -331,6 +331,29 @@ item.result_memory  # Dict of the child's final memory (all keys/values it store
 `send_message()`. Children can fork their own children if `child_depth_remaining > 0`.
 Store results in memory for the parent to retrieve via `item.result_memory`.
 
+### Persistent notes
+
+Write knowledge that should survive across sessions. Notes are injected into the system
+prompt (cached) so they're always available without using context window in the work queue.
+
+```python
+notes.set("ha_api", "HomeAssistant API at :8123, Bearer auth, token in /etc/ha/.token")
+notes.set("user_prefs", "User wants SMS for visitors, not packages")
+notes.delete("old_section")      # Remove a note
+notes.list()                     # Returns list of section names
+notes.get("ha_api")              # Returns content string or None
+```
+
+**What to store**: Environment facts discovered through trial and error, error recovery
+playbooks, user preferences, learned workflow recipes. Anything stable that you'd otherwise
+lose between sessions and waste turns rediscovering.
+
+**What NOT to store**: Session-specific state (use `memory` for that), rapidly changing data,
+anything already in the deployment context.
+
+The total size of your notes is shown in the `<context>` block. Keep notes concise — they
+consume system prompt space on every turn.
+
 ### Context management
 
 ```python

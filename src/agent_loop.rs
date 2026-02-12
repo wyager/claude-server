@@ -257,6 +257,16 @@ impl AgentLoop {
 
         // Render context
         let lineage_str = format_lineage(&self.permissions.lineage);
+        // Load agent notes from DB (needed for both rendering and API call)
+        let notes = self.db.load_notes().unwrap_or_default();
+        let notes_snapshot: HashMap<String, String> = notes.iter().cloned().collect();
+        let notes_summary = if notes.is_empty() {
+            None
+        } else {
+            let total_chars: usize = notes.iter().map(|(s, c)| s.len() + c.len()).sum();
+            Some((notes.len(), total_chars))
+        };
+
         let agent_identity = renderer::AgentIdentity {
             name: &self.permissions.agent_name,
             lineage: &lineage_str,
@@ -270,6 +280,7 @@ impl AgentLoop {
             &self.config.render_config,
             self.config.compact_at,
             Some(&agent_identity),
+            notes_summary,
         );
 
         println!(
@@ -285,7 +296,7 @@ impl AgentLoop {
         });
 
         // Call Claude API
-        let api_result = self.api_client.call(&rendered).await?;
+        let api_result = self.api_client.call(&rendered, &notes).await?;
 
         println!(
             "[{}] API response: {} input tokens, {} output tokens (cache: {} created, {} read)",
@@ -335,6 +346,7 @@ impl AgentLoop {
             self.permissions.child_depth_remaining,
             &self.permissions.agent_name,
             &lineage_str,
+            &notes_snapshot,
         );
 
         let mut is_error = exec_result.is_error;
@@ -1013,6 +1025,18 @@ impl AgentLoop {
             }
         }
 
+        // Agent notes
+        for (section, content) in effects.note_sets {
+            if let Err(e) = self.db.save_note(&section, &content) {
+                eprintln!("[{}] Failed to save note '{}': {}", self.name, section, e);
+            }
+        }
+        for section in effects.note_deletes {
+            if let Err(e) = self.db.delete_note(&section) {
+                eprintln!("[{}] Failed to delete note '{}': {}", self.name, section, e);
+            }
+        }
+
         // Compaction script
         for append in effects.compaction_script_appends {
             self.compaction.script.push_str(&append);
@@ -1028,6 +1052,7 @@ impl AgentLoop {
                 0, // compaction doesn't need to spawn children
                 &self.permissions.agent_name,
                 &format_lineage(&self.permissions.lineage),
+                &HashMap::new(), // compaction doesn't need notes
             );
 
             if compact_result.is_error {

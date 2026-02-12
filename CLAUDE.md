@@ -123,6 +123,14 @@ agent, the entire turn's side effects roll back. Children return a
 `success`, and `summary`. Max 3 concurrent children. `child_depth_remaining: u32`
 controls recursion depth.
 
+**Agent notes (self-improving system prompt)**: `notes.set(section, content)` writes
+persistent notes stored in SQLite (`agent_notes` table). Notes are injected into the
+system prompt on every API call (cached via `cache_control: ephemeral`), so the agent
+accumulates knowledge across sessions. `notes.get()`, `notes.list()`, `notes.delete()`
+for reads and cleanup. Writes are side effects (atomic with the rest of the turn).
+Notes size is shown in context metadata for self-regulation. Children inherit notes
+automatically (shared DB).
+
 **Streaming responses (SSE)**: A `tokio::sync::broadcast` channel delivers
 messages in real time. The SSE endpoint (`GET /messages/:chat_id/stream`)
 pushes `message` and `status` events to connected clients. The chat UI uses

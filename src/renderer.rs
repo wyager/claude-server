@@ -25,6 +25,10 @@ pub struct AgentIdentity<'a> {
     pub max_turns: Option<u32>,
 }
 
+/// Summary of agent notes for rendering in context metadata.
+/// (section_count, total_chars)
+pub type NotesSummary = Option<(usize, usize)>;
+
 pub fn render_context(
     state: &HarnessState,
     deployment_context: &str,
@@ -32,6 +36,7 @@ pub fn render_context(
     config: &RenderConfig,
     compact_at: u64,
     agent: Option<&AgentIdentity>,
+    notes_summary: NotesSummary,
 ) -> RenderedContext {
     let mut out = String::with_capacity(8192);
 
@@ -45,7 +50,7 @@ pub fn render_context(
     render_agent_state(&mut out, state, config);
 
     // Context metadata
-    render_context_metadata(&mut out, state, compaction, compact_at, agent);
+    render_context_metadata(&mut out, state, compaction, compact_at, agent, notes_summary);
 
     // Work queue (last — changes every turn, so placing it at the end
     // maximizes KV cache reuse for the stable prefix above)
@@ -432,6 +437,7 @@ fn render_context_metadata(
     compaction: Option<&CompactionState>,
     compact_at: u64,
     agent: Option<&AgentIdentity>,
+    notes_summary: NotesSummary,
 ) {
     out.push_str("<context>\n");
 
@@ -462,6 +468,15 @@ fn render_context_metadata(
     ));
 
     out.push_str(&format!("Compaction threshold: {} tokens\n", compact_at));
+
+    // Agent notes summary
+    if let Some((count, chars)) = notes_summary {
+        out.push_str(&format!("Agent notes: {} {}, {} chars\n",
+            count,
+            if count == 1 { "section" } else { "sections" },
+            chars,
+        ));
+    }
 
     // Modification boundary
     if let Some(boundary) = state.event_history.modification_boundary() {
@@ -591,7 +606,7 @@ mod tests {
     fn test_render_produces_expected_structure() {
         let state = make_test_state();
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "Test deployment.", None, &config, 150_000, None);
+        let rendered = render_context(&state, "Test deployment.", None, &config, 150_000, None, None);
 
         assert!(rendered.text.contains("<deployment_context>"));
         assert!(rendered.text.contains("Test deployment."));
@@ -626,7 +641,7 @@ mod tests {
     fn test_render_empty_state() {
         let state = HarnessState::new(200_000, 16384);
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000, None);
+        let rendered = render_context(&state, "", None, &config, 150_000, None, None);
 
         assert!(rendered.text.contains("<deployment_context>\n</deployment_context>"));
         assert!(rendered.text.contains("<event_history>\n</event_history>"));
@@ -643,7 +658,7 @@ mod tests {
             compaction_script: String::new(),
             estimated_post_compaction: 142000,
         };
-        let rendered = render_context(&state, "", Some(&compaction), &config, 150_000, None);
+        let rendered = render_context(&state, "", Some(&compaction), &config, 150_000, None, None);
 
         assert!(rendered.text.contains("COMPACTION MODE:"));
         assert!(rendered.text.contains("Current usage: 142000 tokens"));
@@ -685,7 +700,7 @@ mod tests {
         });
 
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000, None);
+        let rendered = render_context(&state, "", None, &config, 150_000, None, None);
 
         // Agent state should appear
         assert!(rendered.text.contains("<agent_state>"), "Missing agent_state block");
@@ -708,7 +723,7 @@ mod tests {
     fn test_render_no_agent_state_when_empty() {
         let state = HarnessState::new(200_000, 16384);
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000, None);
+        let rendered = render_context(&state, "", None, &config, 150_000, None, None);
 
         // No agent_state block when nothing to show
         assert!(!rendered.text.contains("<agent_state>"));
@@ -724,7 +739,7 @@ mod tests {
             turn_counter: 3,
             max_turns: Some(10),
         };
-        let rendered = render_context(&state, "", None, &config, 150_000, Some(&agent));
+        let rendered = render_context(&state, "", None, &config, 150_000, Some(&agent), None);
 
         assert!(rendered.text.contains("Agent: api-checker"));
         assert!(rendered.text.contains("Lineage: api-checker, child of plan-builder, child of root"));
@@ -741,7 +756,7 @@ mod tests {
             turn_counter: 5,
             max_turns: None,
         };
-        let rendered = render_context(&state, "", None, &config, 150_000, Some(&agent));
+        let rendered = render_context(&state, "", None, &config, 150_000, Some(&agent), None);
 
         assert!(rendered.text.contains("Agent: root"));
         assert!(rendered.text.contains("Turns: 5 (no limit)"));

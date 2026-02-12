@@ -55,6 +55,12 @@ impl Database {
                 data_json TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS agent_notes (
+                section TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
             ",
         )?;
         Ok(())
@@ -163,6 +169,40 @@ impl Database {
         self.conn.lock().unwrap().execute(
             "INSERT INTO event_log (event_type, data_json) VALUES (?1, ?2)",
             rusqlite::params![event_type, json],
+        )?;
+        Ok(())
+    }
+
+    // ---- Agent Notes ----
+
+    /// Load all agent notes, sorted by section name.
+    pub fn load_notes(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT section, content FROM agent_notes ORDER BY section")?;
+        let mut notes = Vec::new();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            notes.push((row.get(0)?, row.get(1)?));
+        }
+        Ok(notes)
+    }
+
+    /// Save or update a note section.
+    pub fn save_note(&self, section: &str, content: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO agent_notes (section, content, updated_at)
+             VALUES (?1, ?2, datetime('now'))
+             ON CONFLICT(section) DO UPDATE SET content = ?2, updated_at = datetime('now')",
+            rusqlite::params![section, content],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a note section.
+    pub fn delete_note(&self, section: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM agent_notes WHERE section = ?1",
+            [section],
         )?;
         Ok(())
     }

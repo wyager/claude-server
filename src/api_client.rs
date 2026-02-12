@@ -9,7 +9,7 @@ use crate::types::*;
 pub struct ApiClient {
     client: reqwest::Client,
     config: Arc<Config>,
-    system_prompt: String,
+    base_system_prompt: String,
 }
 
 pub struct ApiTurnResult {
@@ -27,12 +27,12 @@ impl ApiClient {
             .timeout(Duration::from_secs(300))
             .build()?;
 
-        let system_prompt = config.load_system_prompt()?;
+        let base_system_prompt = config.load_system_prompt()?;
 
         Ok(Self {
             client,
             config,
-            system_prompt,
+            base_system_prompt,
         })
     }
 
@@ -45,12 +45,16 @@ impl ApiClient {
         Ok(Self {
             client,
             config,
-            system_prompt: system_prompt.to_string(),
+            base_system_prompt: system_prompt.to_string(),
         })
     }
 
-    pub async fn call(&self, rendered: &RenderedContext) -> Result<ApiTurnResult> {
-        let request = self.build_request(rendered);
+    pub async fn call(
+        &self,
+        rendered: &RenderedContext,
+        notes: &[(String, String)],
+    ) -> Result<ApiTurnResult> {
+        let request = self.build_request(rendered, notes);
         let mut retries = 0;
         let max_retries = 3;
 
@@ -94,10 +98,23 @@ impl ApiClient {
         }
     }
 
-    fn build_request(&self, rendered: &RenderedContext) -> ApiRequest {
+    fn build_system_prompt(&self, notes: &[(String, String)]) -> String {
+        if notes.is_empty() {
+            return self.base_system_prompt.clone();
+        }
+        let mut prompt = self.base_system_prompt.clone();
+        prompt.push_str("\n\n<agent_notes>\n");
+        for (section, content) in notes {
+            prompt.push_str(&format!("## {}\n{}\n\n", section, content));
+        }
+        prompt.push_str("</agent_notes>\n");
+        prompt
+    }
+
+    fn build_request(&self, rendered: &RenderedContext, notes: &[(String, String)]) -> ApiRequest {
         let system = vec![SystemBlock {
             block_type: "text".to_string(),
-            text: self.system_prompt.clone(),
+            text: self.build_system_prompt(notes),
             cache_control: Some(CacheControl {
                 control_type: "ephemeral".to_string(),
             }),

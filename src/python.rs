@@ -52,6 +52,8 @@ pub struct SideEffectCollector {
     pub compaction_script_appends: Vec<String>,
     pub compact_called: bool,
     pub done_called: bool,
+    pub note_sets: Vec<(String, String)>,    // (section, content)
+    pub note_deletes: Vec<String>,           // section names
 }
 
 #[derive(Debug, Clone)]
@@ -691,6 +693,7 @@ struct PyHarness {
     child_depth_remaining: u32,
     agent_name: String,
     agent_lineage: String,
+    notes_snapshot: HashMap<String, String>,
 }
 
 #[pymethods]
@@ -856,6 +859,44 @@ impl PyHarness {
     fn agent_lineage(&self) -> &str {
         &self.agent_lineage
     }
+
+    #[getter]
+    fn notes(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let notes_obj = PyNotes {
+            collector: self.collector.clone(),
+            snapshot: self.notes_snapshot.clone(),
+        };
+        Ok(Py::new(py, notes_obj)?.into_any().into())
+    }
+}
+
+#[pyclass]
+struct PyNotes {
+    collector: Collector,
+    snapshot: HashMap<String, String>,
+}
+
+#[pymethods]
+impl PyNotes {
+    fn set(&self, section: String, content: String) -> PyResult<()> {
+        self.collector.lock().unwrap().note_sets.push((section, content));
+        Ok(())
+    }
+
+    fn delete(&self, section: String) -> PyResult<()> {
+        self.collector.lock().unwrap().note_deletes.push(section);
+        Ok(())
+    }
+
+    fn list(&self) -> Vec<String> {
+        let mut sections: Vec<String> = self.snapshot.keys().cloned().collect();
+        sections.sort();
+        sections
+    }
+
+    fn get(&self, section: &str) -> Option<String> {
+        self.snapshot.get(section).cloned()
+    }
 }
 
 #[pyclass]
@@ -902,6 +943,7 @@ message_agent = _harness.message_agent
 done = _harness.done
 agent_name = _harness.agent_name
 agent_lineage = _harness.agent_lineage
+notes = _harness.notes
 "#;
 
 const COMPACTION_PREAMBLE: &str = r#"
@@ -922,7 +964,7 @@ pub fn execute(
     is_compaction: bool,
     process_outputs: &HashMap<String, String>,
 ) -> ExecutionResult {
-    execute_with_timeout(state, code, is_compaction, process_outputs, 5, 1, "root", "root")
+    execute_with_timeout(state, code, is_compaction, process_outputs, 5, 1, "root", "root", &HashMap::new())
 }
 
 pub fn execute_with_timeout(
@@ -934,6 +976,7 @@ pub fn execute_with_timeout(
     child_depth_remaining: u32,
     agent_name: &str,
     agent_lineage: &str,
+    notes_snapshot: &HashMap<String, String>,
 ) -> ExecutionResult {
     // Clone everything the thread needs (state is already Clone)
     let state = state.clone();
@@ -941,11 +984,12 @@ pub fn execute_with_timeout(
     let process_outputs = process_outputs.clone();
     let agent_name = agent_name.to_string();
     let agent_lineage = agent_lineage.to_string();
+    let notes_snapshot = notes_snapshot.clone();
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<ExecutionResult>(1);
 
     std::thread::spawn(move || {
-        let result = execute_inner(&state, &code, is_compaction, &process_outputs, child_depth_remaining, &agent_name, &agent_lineage);
+        let result = execute_inner(&state, &code, is_compaction, &process_outputs, child_depth_remaining, &agent_name, &agent_lineage, &notes_snapshot);
         let _ = tx.send(result);
     });
 
@@ -1009,6 +1053,7 @@ fn execute_inner(
     child_depth_remaining: u32,
     agent_name: &str,
     agent_lineage: &str,
+    notes_snapshot: &HashMap<String, String>,
 ) -> ExecutionResult {
     let collector = Arc::new(Mutex::new(SideEffectCollector {
         id_gen: state.id_generator.clone(),
@@ -1160,6 +1205,7 @@ fn execute_inner(
                 child_depth_remaining,
                 agent_name: agent_name.to_string(),
                 agent_lineage: agent_lineage.to_string(),
+                notes_snapshot: notes_snapshot.clone(),
             },
         )?;
         locals.set_item("_harness", harness)?;
@@ -1452,6 +1498,7 @@ print("all passed")
             1,
             "root",
             "root",
+            &HashMap::new(),
         );
         assert!(!result.is_error, "Error: {}", result.error_text);
         assert_eq!(result.stdout.trim(), "all passed");
@@ -1477,6 +1524,7 @@ print("all passed")
             1,
             "root",
             "root",
+            &HashMap::new(),
         );
         let elapsed = start.elapsed();
         assert!(result.is_error, "Should have timed out");
@@ -1516,6 +1564,7 @@ print("forked")
             1,
             "root",
             "root",
+            &HashMap::new(),
         );
         assert!(!result.is_error, "Error: {}", result.error_text);
         assert_eq!(result.stdout.trim(), "forked");
@@ -1605,10 +1654,55 @@ print(agent_lineage)
             1,
             "api-checker",
             "api-checker, child of plan-builder, child of root",
+            &HashMap::new(),
         );
         assert!(!result.is_error, "Error: {}", result.error_text);
         let lines: Vec<&str> = result.stdout.trim().lines().collect();
         assert_eq!(lines[0], "api-checker");
         assert_eq!(lines[1], "api-checker, child of plan-builder, child of root");
+    }
+
+    #[test]
+    fn test_notes_api() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        let mut snapshot = HashMap::new();
+        snapshot.insert("existing".to_string(), "old value".to_string());
+        let result = execute_with_timeout(
+            &state,
+            r#"
+# Read existing notes
+sections = notes.list()
+print(f"sections: {sections}")
+existing = notes.get("existing")
+print(f"existing: {existing}")
+missing = notes.get("missing")
+print(f"missing: {missing}")
+
+# Write new notes
+notes.set("api_info", "HA API at :8123")
+notes.set("user_prefs", "Prefers SMS alerts")
+
+# Delete a note
+notes.delete("existing")
+"#,
+            false,
+            &HashMap::new(),
+            0,
+            1,
+            "root",
+            "root",
+            &snapshot,
+        );
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert!(result.stdout.contains("sections: ['existing']"));
+        assert!(result.stdout.contains("existing: old value"));
+        assert!(result.stdout.contains("missing: None"));
+        assert_eq!(result.side_effects.note_sets.len(), 2);
+        assert_eq!(result.side_effects.note_sets[0].0, "api_info");
+        assert_eq!(result.side_effects.note_sets[0].1, "HA API at :8123");
+        assert_eq!(result.side_effects.note_sets[1].0, "user_prefs");
+        assert_eq!(result.side_effects.note_deletes.len(), 1);
+        assert_eq!(result.side_effects.note_deletes[0], "existing");
     }
 }

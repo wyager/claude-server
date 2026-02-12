@@ -18,9 +18,9 @@ with `block_for` instead.
 
 ## Agent Capabilities
 
-- **Self-improvement**: Let the agent edit its own system prompt or add custom Python functions that persist across turns (like Conway's self-improvement). The agent could learn project-specific patterns and optimize its own workflow.
+- ~~**Self-improvement**~~: DONE (partial) — `notes.set(section, content)` lets the agent write persistent notes stored in SQLite. Notes are injected into the system prompt (cached). Agent accumulates environment facts, error recovery playbooks, user preferences, workflow recipes across sessions. Custom Python functions not implemented (kept runtime stable).
 
-- ~~**Sub-agents**~~: DONE — `spawn_agent(task, model, memory, max_turns, priority)` launches child agents via `child_agent.rs`. Max 3 concurrent, max 50 turns, no recursion. Children can `send_message()` but cannot `shell_exec()` or `spawn_agent()`. Returns `ChildAgentCompleted` work item.
+- ~~**Sub-agents**~~: DONE — `fork([ChildSettings(...)])` spawns children that inherit parent context. Named agent registry with lineage tracking. Inter-agent messaging via `message_agent(name, content)`. Explicit `done()` to exit. `ChildAgentCompleted` work item with `child_name`, `result_memory`, clear finish reason.
 
 - ~~**Child process support**~~: DONE — Children now have full `shell_exec` via the unified `AgentLoop` in `agent_loop.rs`, with their own ProcessSupervisor + event loop. `child_depth_remaining: u32` controls recursion depth.
 
