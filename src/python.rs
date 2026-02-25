@@ -46,7 +46,7 @@ pub struct SideEffectCollector {
     pub history_removes: Vec<String>,
     pub history_replaces: Vec<(String, String)>,
     pub history_adds: Vec<String>,
-    pub show_in_context: Vec<String>,
+    pub show_in_context: Vec<Attachment>,
     pub fork_requests: Vec<ForkRequest>,
     pub agent_messages: Vec<AgentMessageRequest>,
     pub compaction_script_appends: Vec<String>,
@@ -63,6 +63,9 @@ pub struct ForkChildSettings {
     pub model: Option<String>,  // None = inherit parent's model
     pub max_turns: u32,
     pub can_compact: bool,
+    /// File paths to show in the child's first-turn context.
+    /// Same semantics as show_in_context() — ephemeral, one turn only.
+    pub attachments: Vec<Attachment>,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +181,7 @@ impl PyWorkItem {
                 "error" => self.error.as_deref(),
                 "output_preview" => self.output_preview.as_deref(),
                 "child_id" => self.child_id.as_deref(),
+                "child_name" => self.child_id.as_deref(),  // alias for ChildAgentCompleted
                 "summary" => self.summary.as_deref(),
                 "source" => self.source.as_deref(),
                 "event_type" => self.event_type.as_deref(),
@@ -769,8 +773,14 @@ impl PyHarness {
         self.process_info.clone()
     }
 
-    fn show_in_context(&self, data: String) -> PyResult<()> {
-        self.collector.lock().unwrap().show_in_context.push(data);
+    fn show_in_context(&self, path: String) -> PyResult<()> {
+        let pb = std::path::PathBuf::from(&path);
+        if !pb.is_file() {
+            return Err(pyo3::exceptions::PyFileNotFoundError::new_err(
+                format!("show_in_context: file not found or not a regular file: {}", path)
+            ));
+        }
+        self.collector.lock().unwrap().show_in_context.push(Attachment::new(pb));
         Ok(())
     }
 
@@ -818,6 +828,18 @@ impl PyHarness {
             let max_turns: u32 = item.getattr("max_turns")?.extract::<u32>()?.min(50);
             let can_compact: bool = item.getattr("can_compact")?.extract()?;
 
+            // Extract show_in_context attachment paths (None → empty).
+            // File existence is NOT checked here — the parent may be queuing a
+            // shell_exec that writes the file before the child's turn 1 runs.
+            // Resolution/error handling happens at API-call time.
+            let sic_obj = item.getattr("show_in_context")?;
+            let attachments: Vec<Attachment> = if sic_obj.is_none() {
+                Vec::new()
+            } else {
+                let paths: Vec<String> = sic_obj.extract()?;
+                paths.into_iter().map(Attachment::new).collect()
+            };
+
             names.push(name.clone());
             child_settings.push(ForkChildSettings {
                 name,
@@ -825,6 +847,7 @@ impl PyHarness {
                 model,
                 max_turns,
                 can_compact,
+                attachments,
             });
         }
 
@@ -929,6 +952,7 @@ class ChildSettings:
     model: str | None = None
     max_turns: int = 20
     can_compact: bool = True
+    show_in_context: list[str] | None = None
 
 send_message = _harness.send_message
 shell_exec = _harness.shell_exec
@@ -1580,6 +1604,88 @@ print("forked")
         assert_eq!(req.children[1].model, None);
         assert_eq!(req.children[1].max_turns, 20); // default
         assert!(req.children[1].can_compact); // default is true
+        assert!(req.children[0].attachments.is_empty()); // default: no attachments
+    }
+
+    #[test]
+    fn test_show_in_context() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+
+        // Create a temp file so the existence check passes
+        let tmp = std::env::temp_dir().join("claude-server-test-attachment.txt");
+        std::fs::write(&tmp, "test content").unwrap();
+
+        let code = format!(
+            r#"
+show_in_context({path:?})
+print("ok")
+"#,
+            path = tmp.to_str().unwrap()
+        );
+        let result = execute(&state, &code, false, &HashMap::new());
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert_eq!(result.stdout.trim(), "ok");
+        assert_eq!(result.side_effects.show_in_context.len(), 1);
+        assert_eq!(result.side_effects.show_in_context[0].path, tmp);
+
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_show_in_context_file_not_found() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        let result = execute(
+            &state,
+            r#"show_in_context("/nonexistent/path/xyz.jpg")"#,
+            false,
+            &HashMap::new(),
+        );
+        assert!(result.is_error, "Should fail on nonexistent file");
+        assert!(
+            result.error_text.contains("FileNotFoundError")
+                || result.error_text.contains("file not found"),
+            "Error: {}",
+            result.error_text
+        );
+    }
+
+    #[test]
+    fn test_fork_with_show_in_context() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        let result = execute_with_timeout(
+            &state,
+            r#"
+fork([
+    ChildSettings(
+        name="investigator",
+        task="Look at this image",
+        show_in_context=["/tmp/snapshot.jpg", "/tmp/metadata.json"],
+    ),
+])
+"#,
+            false,
+            &HashMap::new(),
+            0,
+            1,
+            "root",
+            "root",
+            &HashMap::new(),
+        );
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        let req = &result.side_effects.fork_requests[0];
+        assert_eq!(req.children.len(), 1);
+        assert_eq!(req.children[0].attachments.len(), 2);
+        assert_eq!(
+            req.children[0].attachments[0].path.to_str().unwrap(),
+            "/tmp/snapshot.jpg"
+        );
+        assert_eq!(
+            req.children[0].attachments[1].path.to_str().unwrap(),
+            "/tmp/metadata.json"
+        );
     }
 
     #[test]

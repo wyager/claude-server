@@ -189,7 +189,6 @@ history.add("Summary text")
 
 ```python
 send_message(chat_id="81d4", content="Hello!")
-send_image(chat_id="81d4", image=image_data, caption="Photo")
 ```
 
 ### Process management
@@ -236,27 +235,17 @@ read it directly from the work item (`work_queue[i].output_preview`) instead of 
 ### External events
 
 External systems (webhooks, MQTT bridges, cron jobs, or your own long-lived scripts) can
-send events to you via the HTTP API:
+send events to you via the HTTP API. These arrive as `ExternalEvent` work items in your queue.
 
-```
-POST http://localhost:3000/event
-{
-    "source": "frigate",
-    "type": "new_image",
-    "data": {"path": "/stills/front_door_001.jpg", "camera": "front"},
-    "priority": 5
-}
-```
-
-These arrive as `ExternalEvent` work items in your queue. You can set up self-automation
-by spawning a long-lived process that curls the `/event` endpoint:
+**Every process you spawn has `$CLAUDE_SERVER_EVENT_URL`** automatically set in its
+environment, so watcher scripts can POST events back to you without hardcoding the address:
 
 ```python
 # Example: watch a directory and send events to yourself
 shell_exec(
     cmd="bash",
     args=["-c", """fswatch /camera/stills | while read f; do
-        curl -s -X POST http://localhost:3000/event \
+        curl -s -X POST "$CLAUDE_SERVER_EVENT_URL" \
             -H 'Content-Type: application/json' \
             -d "{\\\"source\\\":\\\"fswatch\\\",\\\"type\\\":\\\"new_file\\\",\\\"data\\\":{\\\"path\\\":\\\"$f\\\"}}"
     done"""],
@@ -266,6 +255,8 @@ shell_exec(
     fail_prio=7,
 )
 ```
+
+The event body schema: `{"source": str, "type": str, "data": any JSON, "priority": int (optional, default 5)}`.
 
 ### Sub-agents (fork)
 
@@ -281,6 +272,7 @@ fork([
         model="claude-sonnet-4-5-20250929",              # Model (default: inherit parent)
         max_turns=20,                                    # Max turns (default 20)
         can_compact=True,                                # Can compact context (default True)
+        show_in_context=[],                              # File paths to attach on child's first turn (default [])
     ),
     ChildSettings(
         name="linter",
@@ -289,6 +281,20 @@ fork([
 ])
 # fork() is a no-op for you (the parent). Children see the fork as a SystemAlert
 # in their history, then receive their task as a work item from you.
+```
+
+**`show_in_context`**: Seeds the child's first-turn attachments — same semantics as the
+child calling `show_in_context()` before its first turn. Use this to hand a child images
+or large files without burning a turn:
+
+```python
+# Child sees the camera snapshot on turn 1, no wasted roundtrip
+fork([ChildSettings(
+    name="investigate-door",
+    task="Is the person in this front-door snapshot a known visitor or a stranger?",
+    show_in_context=["/var/frigate/clips/front_door_1739.jpg"],
+    max_turns=3,
+)])
 ```
 
 **Agent identity**: Every agent has a name and lineage. Access via `agent_name` and
@@ -354,12 +360,33 @@ anything already in the deployment context.
 The total size of your notes is shown in the `<context>` block. Keep notes concise — they
 consume system prompt space on every turn.
 
-### Context management
+### Attachments (images and other files)
 
 ```python
-show_in_context(data)   # Include data (e.g. images) in next turn's context
-print("text")           # Captured as script output in history
+show_in_context("/path/to/image.jpg")   # Attach a file to your NEXT turn's context
 ```
+
+**How it works**: Pass a filesystem path. On your **next** turn, the file's contents
+appear as a content block alongside your normal context. Image files (`.jpg`, `.jpeg`,
+`.png`, `.gif`, `.webp`) become vision blocks — you can see them. Any other file type
+becomes a text block containing the file contents.
+
+**Ephemeral**: Attachments are visible for exactly **one turn** and then gone. They are
+not saved to history and not persisted. If you need to remember what you saw, write a
+text description to `memory`.
+
+```python
+# Look at a camera snapshot on my next turn
+show_in_context("/var/frigate/clips/front_door_1739.jpg")
+work_queue.pop_front()
+
+# Next turn: I see the image, describe what I observe, store the verdict
+memory["front_door_1739"] = "delivery driver with package, benign"
+```
+
+Calling `show_in_context` on a non-existent file raises `FileNotFoundError` immediately
+(the turn fails). This fail-fast behavior prevents wasting a turn waiting for an
+attachment that will never arrive.
 
 ## Guidelines
 

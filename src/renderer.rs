@@ -14,7 +14,9 @@ pub struct CompactionState {
 pub struct RenderedContext {
     /// The main text content (the user message).
     pub text: String,
-    // Future: images from show_in_context
+    /// File-path attachments to include as additional content blocks.
+    /// Resolved to image/text blocks at API-call time.
+    pub attachments: Vec<Attachment>,
 }
 
 /// Agent identity info for rendering into context.
@@ -37,6 +39,7 @@ pub fn render_context(
     compact_at: u64,
     agent: Option<&AgentIdentity>,
     notes_summary: NotesSummary,
+    attachments: Vec<Attachment>,
 ) -> RenderedContext {
     let mut out = String::with_capacity(8192);
 
@@ -50,13 +53,13 @@ pub fn render_context(
     render_agent_state(&mut out, state, config);
 
     // Context metadata
-    render_context_metadata(&mut out, state, compaction, compact_at, agent, notes_summary);
+    render_context_metadata(&mut out, state, compaction, compact_at, agent, notes_summary, attachments.len());
 
     // Work queue (last — changes every turn, so placing it at the end
     // maximizes KV cache reuse for the stable prefix above)
     render_work_queue(&mut out, &state.work_queue, config);
 
-    RenderedContext { text: out }
+    RenderedContext { text: out, attachments }
 }
 
 fn render_deployment_context(out: &mut String, deployment_context: &str) {
@@ -438,6 +441,7 @@ fn render_context_metadata(
     compact_at: u64,
     agent: Option<&AgentIdentity>,
     notes_summary: NotesSummary,
+    attachment_count: usize,
 ) {
     out.push_str("<context>\n");
 
@@ -468,6 +472,14 @@ fn render_context_metadata(
     ));
 
     out.push_str(&format!("Compaction threshold: {} tokens\n", compact_at));
+
+    // Attachments for this turn (ephemeral, visible as content blocks below)
+    if attachment_count > 0 {
+        out.push_str(&format!(
+            "Attachments this turn: {} (ephemeral — visible once, not saved to history)\n",
+            attachment_count
+        ));
+    }
 
     // Agent notes summary
     if let Some((count, chars)) = notes_summary {
@@ -606,7 +618,7 @@ mod tests {
     fn test_render_produces_expected_structure() {
         let state = make_test_state();
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "Test deployment.", None, &config, 150_000, None, None);
+        let rendered = render_context(&state, "Test deployment.", None, &config, 150_000, None, None, Vec::new());
 
         assert!(rendered.text.contains("<deployment_context>"));
         assert!(rendered.text.contains("Test deployment."));
@@ -641,7 +653,7 @@ mod tests {
     fn test_render_empty_state() {
         let state = HarnessState::new(200_000, 16384);
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000, None, None);
+        let rendered = render_context(&state, "", None, &config, 150_000, None, None, Vec::new());
 
         assert!(rendered.text.contains("<deployment_context>\n</deployment_context>"));
         assert!(rendered.text.contains("<event_history>\n</event_history>"));
@@ -658,7 +670,7 @@ mod tests {
             compaction_script: String::new(),
             estimated_post_compaction: 142000,
         };
-        let rendered = render_context(&state, "", Some(&compaction), &config, 150_000, None, None);
+        let rendered = render_context(&state, "", Some(&compaction), &config, 150_000, None, None, Vec::new());
 
         assert!(rendered.text.contains("COMPACTION MODE:"));
         assert!(rendered.text.contains("Current usage: 142000 tokens"));
@@ -700,7 +712,7 @@ mod tests {
         });
 
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000, None, None);
+        let rendered = render_context(&state, "", None, &config, 150_000, None, None, Vec::new());
 
         // Agent state should appear
         assert!(rendered.text.contains("<agent_state>"), "Missing agent_state block");
@@ -723,10 +735,34 @@ mod tests {
     fn test_render_no_agent_state_when_empty() {
         let state = HarnessState::new(200_000, 16384);
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000, None, None);
+        let rendered = render_context(&state, "", None, &config, 150_000, None, None, Vec::new());
 
         // No agent_state block when nothing to show
         assert!(!rendered.text.contains("<agent_state>"));
+    }
+
+    #[test]
+    fn test_render_with_attachments() {
+        let state = HarnessState::new(200_000, 16384);
+        let config = RenderConfig::default();
+        let attachments = vec![
+            Attachment::new("/tmp/camera.jpg"),
+            Attachment::new("/tmp/meta.json"),
+        ];
+        let rendered = render_context(&state, "", None, &config, 150_000, None, None, attachments);
+
+        assert_eq!(rendered.attachments.len(), 2);
+        assert!(rendered.text.contains("Attachments this turn: 2"));
+        assert!(rendered.text.contains("ephemeral"));
+    }
+
+    #[test]
+    fn test_render_no_attachment_line_when_empty() {
+        let state = HarnessState::new(200_000, 16384);
+        let config = RenderConfig::default();
+        let rendered = render_context(&state, "", None, &config, 150_000, None, None, Vec::new());
+
+        assert!(!rendered.text.contains("Attachments this turn"));
     }
 
     #[test]
@@ -739,7 +775,7 @@ mod tests {
             turn_counter: 3,
             max_turns: Some(10),
         };
-        let rendered = render_context(&state, "", None, &config, 150_000, Some(&agent), None);
+        let rendered = render_context(&state, "", None, &config, 150_000, Some(&agent), None, Vec::new());
 
         assert!(rendered.text.contains("Agent: api-checker"));
         assert!(rendered.text.contains("Lineage: api-checker, child of plan-builder, child of root"));
@@ -756,7 +792,7 @@ mod tests {
             turn_counter: 5,
             max_turns: None,
         };
-        let rendered = render_context(&state, "", None, &config, 150_000, Some(&agent), None);
+        let rendered = render_context(&state, "", None, &config, 150_000, Some(&agent), None, Vec::new());
 
         assert!(rendered.text.contains("Agent: root"));
         assert!(rendered.text.contains("Turns: 5 (no limit)"));

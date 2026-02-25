@@ -585,6 +585,23 @@ impl HarnessState {
     }
 }
 
+// ---- Attachments ----
+
+/// A file to include as a content block in the next turn's API request.
+/// Ephemeral: not persisted, not in history. Consumed once and dropped.
+/// Media type is resolved at API-call time by extension sniffing:
+/// image/* → vision block, everything else → text block.
+#[derive(Debug, Clone)]
+pub struct Attachment {
+    pub path: std::path::PathBuf,
+}
+
+impl Attachment {
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
 // ---- Context Rendering ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

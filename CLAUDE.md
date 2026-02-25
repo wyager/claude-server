@@ -115,13 +115,29 @@ globally unique name and lineage (e.g., `"api-checker, child of plan-builder,
 child of root"`). The root agent is always named `"root"`. Names are registered
 atomically via `AgentRegistry` — if any name collides, the entire fork fails.
 `ChildSettings` fields: `name`, `task`, `model` (Optional, inherits parent),
-`max_turns` (default 20), `can_compact` (default True). Children can compact
-their own context. `message_agent(name, content, priority=6)` enables inter-agent
-messaging (parent↔child, sibling↔sibling). If any message targets a nonexistent
-agent, the entire turn's side effects roll back. Children return a
-`ChildAgentCompleted` work item with `child_name`, `result_memory`, `turns_used`,
-`success`, and `summary`. Max 3 concurrent children. `child_depth_remaining: u32`
-controls recursion depth.
+`max_turns` (default 20), `can_compact` (default True), `show_in_context` (list
+of file paths to attach on the child's first turn — see Attachments below).
+Children can compact their own context. `message_agent(name, content, priority=6)`
+enables inter-agent messaging (parent↔child, sibling↔sibling). If any message
+targets a nonexistent agent, the entire turn's side effects roll back. Children
+return a `ChildAgentCompleted` work item with `child_name`, `result_memory`,
+`turns_used`, `success`, and `summary`. Max 3 concurrent children.
+`child_depth_remaining: u32` controls recursion depth.
+
+**Attachments (vision + large-file injection)**: `show_in_context(path)` queues a
+file to appear as a content block on the agent's *next* turn. Images (`.jpg`,
+`.jpeg`, `.png`, `.gif`, `.webp`) become vision blocks the model can see; any
+other file becomes a text block. Attachments are ephemeral: visible exactly once,
+not in `HarnessState`, not persisted, not in history. Storage lives in
+`AgentLoop.pending_attachments` which is `std::mem::take`'d into each turn's
+render. File paths (not bytes) are stored in `SideEffectCollector` — encoding
+is deferred to `api_client::resolve_attachment()`. `ChildSettings.show_in_context`
+seeds a child's first-turn attachments via the same mechanism.
+
+**Auto-injected process env**: Every process spawned via `shell_exec()` gets
+`CLAUDE_SERVER_EVENT_URL` in its environment (computed from `Config.listen_addr`).
+Watcher scripts can `curl -X POST "$CLAUDE_SERVER_EVENT_URL" ...` to send events
+back to the agent without hardcoding the listen address.
 
 **Agent notes (self-improving system prompt)**: `notes.set(section, content)` writes
 persistent notes stored in SQLite (`agent_notes` table). Notes are injected into the

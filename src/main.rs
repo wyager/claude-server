@@ -117,7 +117,8 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>) -> Result<()> {
     println!("  API client ready");
 
     // Create process supervisor
-    let process_supervisor = process::ProcessSupervisor::new(process_event_tx, database.clone());
+    let event_url = format!("http://{}/event", config.listen_addr);
+    let process_supervisor = process::ProcessSupervisor::new(process_event_tx, database.clone(), event_url);
 
     // Create token accumulator
     let token_accumulator = Arc::new(Mutex::new(TokenAccumulator::default()));

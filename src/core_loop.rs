@@ -117,6 +117,7 @@ pub fn write_turn_dump(
     agent_name: &str,
     turn_number: u32,
     context: &str,
+    attachments: &[crate::types::Attachment],
     thinking: Option<&str>,
     code: &str,
     output: &str,
@@ -138,6 +139,23 @@ pub fn write_turn_dump(
     dump.push_str(&format!("{}\n\n", sep));
     dump.push_str(context);
     dump.push_str(&format!("\n{}\n", dash));
+
+    if !attachments.is_empty() {
+        dump.push_str(&format!("\n{}\n", sep));
+        dump.push_str(&format!(
+            "[{}] Turn {} — ATTACHMENTS ({} file{})\n",
+            agent_name,
+            turn_number,
+            attachments.len(),
+            if attachments.len() == 1 { "" } else { "s" }
+        ));
+        dump.push_str(&format!("{}\n\n", sep));
+        for att in attachments {
+            let size = std::fs::metadata(&att.path).map(|m| m.len()).unwrap_or(0);
+            dump.push_str(&format!("  {} ({} bytes)\n", att.path.display(), size));
+        }
+        dump.push_str(&format!("{}\n", dash));
+    }
 
     if let Some(thinking) = thinking {
         dump.push_str(&format!("\n{}\n", sep));

@@ -22,14 +22,23 @@ pub struct ProcessSupervisor {
     event_tx: mpsc::UnboundedSender<ProcessEvent>,
     db: Arc<Database>,
     running: Arc<Mutex<HashMap<String, u32>>>, // agent_id -> os_pid
+    /// URL of the /event endpoint. Injected as CLAUDE_SERVER_EVENT_URL into
+    /// every spawned process's environment so watcher scripts can POST events
+    /// back to the agent without hardcoding the listen address.
+    event_url: String,
 }
 
 impl ProcessSupervisor {
-    pub fn new(event_tx: mpsc::UnboundedSender<ProcessEvent>, db: Arc<Database>) -> Self {
+    pub fn new(
+        event_tx: mpsc::UnboundedSender<ProcessEvent>,
+        db: Arc<Database>,
+        event_url: String,
+    ) -> Self {
         Self {
             event_tx,
             db,
             running: Arc::new(Mutex::new(HashMap::new())),
+            event_url,
         }
     }
 
@@ -41,11 +50,16 @@ impl ProcessSupervisor {
     ) -> Result<Option<oneshot::Receiver<()>>> {
         let mut cmd = Command::new(&request.cmd);
         cmd.args(&request.args);
+        // Auto-inject event URL first so agent-supplied env can override it.
+        cmd.env("CLAUDE_SERVER_EVENT_URL", &self.event_url);
         for (k, v) in &request.env {
             cmd.env(k, v);
         }
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        // Kill the child if the daemon exits. Long-running watchers would
+        // otherwise orphan and keep POSTing to a dead endpoint.
+        cmd.kill_on_drop(true);
 
         let mut child = cmd.spawn()?;
         let os_pid = child.id().unwrap_or(0);

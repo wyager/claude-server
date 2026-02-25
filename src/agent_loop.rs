@@ -72,6 +72,9 @@ pub struct AgentLoop {
     local_cache_read_tokens: u64,
     /// Shared agent registry for naming and inter-agent messaging.
     registry: Arc<AgentRegistry>,
+    /// Attachments queued for the next turn's API request. Consumed once, then cleared.
+    /// Populated by show_in_context() or by ChildSettings.show_in_context on fork.
+    pending_attachments: Vec<Attachment>,
 }
 
 impl AgentLoop {
@@ -120,7 +123,13 @@ impl AgentLoop {
             local_cache_creation_tokens: 0,
             local_cache_read_tokens: 0,
             registry,
+            pending_attachments: Vec::new(),
         }
+    }
+
+    /// Seed attachments for the first turn (used by fork to give children initial content).
+    pub fn set_initial_attachments(&mut self, attachments: Vec<Attachment>) {
+        self.pending_attachments = attachments;
     }
 
     fn broadcast(&self, msg: BroadcastMsg) {
@@ -273,6 +282,9 @@ impl AgentLoop {
             turn_counter: self.turn_counter,
             max_turns: self.permissions.max_turns,
         };
+        // Consume pending attachments — they're visible for exactly this one turn
+        let attachments = std::mem::take(&mut self.pending_attachments);
+
         let rendered = renderer::render_context(
             &self.state,
             &self.deployment_context,
@@ -281,13 +293,15 @@ impl AgentLoop {
             self.config.compact_at,
             Some(&agent_identity),
             notes_summary,
+            attachments,
         );
 
         println!(
-            "[{}] Rendered context: {} chars, queue: {} items",
+            "[{}] Rendered context: {} chars, queue: {} items, attachments: {}",
             self.name,
             rendered.text.len(),
-            self.state.work_queue.len()
+            self.state.work_queue.len(),
+            rendered.attachments.len()
         );
 
         // Broadcast thinking status
@@ -402,6 +416,7 @@ impl AgentLoop {
                 &self.name,
                 self.turn_counter,
                 &rendered.text,
+                &rendered.attachments,
                 api_result.thinking.as_deref(),
                 &api_result.code,
                 &output,
@@ -783,6 +798,9 @@ impl AgentLoop {
         // Process kills
         deferred.process_kills = effects.process_kills;
 
+        // Attachments for next turn's context (ephemeral)
+        self.pending_attachments.extend(effects.show_in_context);
+
         // Fork requests (child agent spawns)
         for req in effects.fork_requests {
             // Build channels and registration entries for atomic registration
@@ -870,8 +888,11 @@ impl AgentLoop {
                 // Create child's own process event channel and supervisor
                 let (child_process_event_tx, mut child_process_event_rx) =
                     mpsc::unbounded_channel::<ProcessEvent>();
-                let child_process_supervisor =
-                    ProcessSupervisor::new(child_process_event_tx, self.db.clone());
+                let child_process_supervisor = ProcessSupervisor::new(
+                    child_process_event_tx,
+                    self.db.clone(),
+                    format!("http://{}/event", self.config.listen_addr),
+                );
 
                 // Forward process events to child's main event channel
                 let child_event_tx_for_process = child_event_tx.clone();
@@ -983,6 +1004,7 @@ impl AgentLoop {
                     7, // default priority for ChildAgentCompleted
                     parent_tx,
                     registry,
+                    child_settings.attachments,
                 ));
             }
         }
@@ -1151,6 +1173,7 @@ async fn run_child_agent_loop(
     priority: u8,
     parent_tx: mpsc::UnboundedSender<HarnessEvent>,
     registry: Arc<AgentRegistry>,
+    initial_attachments: Vec<Attachment>,
 ) {
     let mut child_loop = AgentLoop::new(
         child_name.clone(),
@@ -1169,6 +1192,7 @@ async fn run_child_agent_loop(
         None,  // children track tokens locally
         registry.clone(),
     );
+    child_loop.set_initial_attachments(initial_attachments);
 
     let reason = child_loop.run().await;
     let turns_used = child_loop.turn_counter;

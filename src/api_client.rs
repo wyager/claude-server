@@ -1,10 +1,71 @@
 use anyhow::{bail, Context, Result};
+use base64::Engine;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::Config;
 use crate::renderer::RenderedContext;
 use crate::types::*;
+
+/// Maximum size for a text attachment before we truncate.
+/// Keeps the agent from accidentally nuking its context window
+/// by attaching a 100MB log file.
+const MAX_TEXT_ATTACHMENT_BYTES: usize = 64 * 1024;
+
+/// Sniff media type from extension. Returns Some("image/...") for supported
+/// image formats, None for everything else (which we treat as text).
+fn sniff_image_media_type(path: &Path) -> Option<&'static str> {
+    match path.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+        Some("png") => Some("image/png"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Resolve an attachment file path into a ContentBlock.
+/// Images → base64-encoded image block. Everything else → text block.
+/// File-not-found or read errors → text block with an error message
+/// (don't fail the turn — the agent gets feedback and moves on).
+fn resolve_attachment(att: &Attachment) -> ContentBlock {
+    let path = &att.path;
+    let display = path.display();
+
+    match sniff_image_media_type(path) {
+        Some(media_type) => match std::fs::read(path) {
+            Ok(bytes) => ContentBlock::Image {
+                source: ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: media_type.to_string(),
+                    data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                },
+            },
+            Err(e) => ContentBlock::Text {
+                text: format!("[attachment read error: {} — {}]", display, e),
+            },
+        },
+        None => match std::fs::read_to_string(path) {
+            Ok(mut text) => {
+                if text.len() > MAX_TEXT_ATTACHMENT_BYTES {
+                    let orig_len = text.len();
+                    text.truncate(MAX_TEXT_ATTACHMENT_BYTES);
+                    text.push_str(&format!(
+                        "\n[... truncated, {} bytes total]",
+                        orig_len
+                    ));
+                }
+                ContentBlock::Text {
+                    text: format!("<attachment path=\"{}\">\n{}\n</attachment>", display, text),
+                }
+            }
+            Err(e) => ContentBlock::Text {
+                text: format!("[attachment read error: {} — {}]", display, e),
+            },
+        },
+    }
+}
 
 pub struct ApiClient {
     client: reqwest::Client,
@@ -138,9 +199,25 @@ impl ApiClient {
             }),
         }];
 
+        // Build message content. If there are attachments, use block form with
+        // the rendered text first (preserves KV cache prefix) then attachments.
+        // Otherwise, plain text — byte-identical to before, no cache churn.
+        let content = if rendered.attachments.is_empty() {
+            MessageContent::Text(rendered.text.clone())
+        } else {
+            let mut blocks: Vec<ContentBlock> = Vec::with_capacity(rendered.attachments.len() + 1);
+            blocks.push(ContentBlock::Text {
+                text: rendered.text.clone(),
+            });
+            for att in &rendered.attachments {
+                blocks.push(resolve_attachment(att));
+            }
+            MessageContent::Blocks(blocks)
+        };
+
         let messages = vec![Message {
             role: "user".to_string(),
-            content: MessageContent::Text(rendered.text.clone()),
+            content,
         }];
 
         ApiRequest {
@@ -217,5 +294,81 @@ impl ApiClient {
                 text
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sniff_image_media_type() {
+        assert_eq!(sniff_image_media_type(Path::new("foo.jpg")), Some("image/jpeg"));
+        assert_eq!(sniff_image_media_type(Path::new("foo.JPEG")), Some("image/jpeg"));
+        assert_eq!(sniff_image_media_type(Path::new("foo.png")), Some("image/png"));
+        assert_eq!(sniff_image_media_type(Path::new("foo.gif")), Some("image/gif"));
+        assert_eq!(sniff_image_media_type(Path::new("foo.webp")), Some("image/webp"));
+        assert_eq!(sniff_image_media_type(Path::new("foo.txt")), None);
+        assert_eq!(sniff_image_media_type(Path::new("foo.json")), None);
+        assert_eq!(sniff_image_media_type(Path::new("foo")), None);
+    }
+
+    #[test]
+    fn test_resolve_attachment_text() {
+        let tmp = std::env::temp_dir().join("claude-server-test-text.json");
+        std::fs::write(&tmp, r#"{"camera": "front", "confidence": 0.92}"#).unwrap();
+
+        let block = resolve_attachment(&Attachment::new(&tmp));
+        match block {
+            ContentBlock::Text { text } => {
+                assert!(text.contains("<attachment path="));
+                assert!(text.contains(r#"{"camera": "front", "confidence": 0.92}"#));
+            }
+            _ => panic!("Expected Text block, got {:?}", block),
+        }
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_resolve_attachment_image() {
+        // Minimal valid PNG (1x1 transparent pixel, 67 bytes)
+        let png_bytes: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // signature
+            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+            0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+            0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, // IDAT chunk
+            0x54, 0x78, 0x9C, 0x62, 0x00, 0x01, 0x00, 0x00,
+            0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, // IEND chunk
+            0x42, 0x60, 0x82,
+        ];
+        let tmp = std::env::temp_dir().join("claude-server-test-img.png");
+        std::fs::write(&tmp, png_bytes).unwrap();
+
+        let block = resolve_attachment(&Attachment::new(&tmp));
+        match block {
+            ContentBlock::Image { source } => {
+                assert_eq!(source.source_type, "base64");
+                assert_eq!(source.media_type, "image/png");
+                // Decode and verify it's the same bytes
+                let decoded = base64::engine::general_purpose::STANDARD.decode(&source.data).unwrap();
+                assert_eq!(decoded, png_bytes);
+            }
+            _ => panic!("Expected Image block, got {:?}", block),
+        }
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_resolve_attachment_not_found() {
+        let block = resolve_attachment(&Attachment::new("/nonexistent/xyz.jpg"));
+        match block {
+            ContentBlock::Text { text } => {
+                assert!(text.contains("[attachment read error"));
+                assert!(text.contains("/nonexistent/xyz.jpg"));
+            }
+            _ => panic!("Expected Text error block, got {:?}", block),
+        }
     }
 }
