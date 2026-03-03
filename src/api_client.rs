@@ -113,9 +113,9 @@ impl ApiClient {
     pub async fn call(
         &self,
         rendered: &RenderedContext,
-        notes: &[(String, String)],
+        pinned_memory: &[(String, String)],
     ) -> Result<ApiTurnResult> {
-        let request = self.build_request(rendered, notes);
+        let request = self.build_request(rendered, pinned_memory);
         let mut retries = 0;
         let max_retries = 3;
 
@@ -159,23 +159,23 @@ impl ApiClient {
         }
     }
 
-    fn build_system_prompt(&self, notes: &[(String, String)]) -> String {
-        if notes.is_empty() {
+    fn build_system_prompt(&self, pinned_memory: &[(String, String)]) -> String {
+        if pinned_memory.is_empty() {
             return self.base_system_prompt.clone();
         }
         let mut prompt = self.base_system_prompt.clone();
-        prompt.push_str("\n\n<agent_notes>\n");
-        for (section, content) in notes {
-            prompt.push_str(&format!("## {}\n{}\n\n", section, content));
+        prompt.push_str("\n\n<pinned_memory>\n");
+        for (key, content) in pinned_memory {
+            prompt.push_str(&format!("## {}\n{}\n\n", key, content));
         }
-        prompt.push_str("</agent_notes>\n");
+        prompt.push_str("</pinned_memory>\n");
         prompt
     }
 
-    fn build_request(&self, rendered: &RenderedContext, notes: &[(String, String)]) -> ApiRequest {
+    fn build_request(&self, rendered: &RenderedContext, pinned_memory: &[(String, String)]) -> ApiRequest {
         let system = vec![SystemBlock {
             block_type: "text".to_string(),
-            text: self.build_system_prompt(notes),
+            text: self.build_system_prompt(pinned_memory),
             cache_control: Some(CacheControl {
                 control_type: "ephemeral".to_string(),
             }),

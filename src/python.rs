@@ -46,14 +46,15 @@ pub struct SideEffectCollector {
     pub history_removes: Vec<String>,
     pub history_replaces: Vec<(String, String)>,
     pub history_adds: Vec<String>,
-    pub show_in_context: Vec<Attachment>,
+    pub attachments: Vec<Attachment>,
     pub fork_requests: Vec<ForkRequest>,
     pub agent_messages: Vec<AgentMessageRequest>,
     pub compaction_script_appends: Vec<String>,
     pub compact_called: bool,
     pub done_called: bool,
-    pub note_sets: Vec<(String, String)>,    // (section, content)
-    pub note_deletes: Vec<String>,           // section names
+    pub done_result: HashMap<String, serde_json::Value>,
+    pub memory_pins: Vec<(String, String)>,    // (key, content) — written to agent_notes table, cached in system prompt
+    pub memory_unpins: Vec<String>,            // keys to remove from pinned storage
 }
 
 #[derive(Debug, Clone)]
@@ -63,8 +64,8 @@ pub struct ForkChildSettings {
     pub model: Option<String>,  // None = inherit parent's model
     pub max_turns: u32,
     pub can_compact: bool,
-    /// File paths to show in the child's first-turn context.
-    /// Same semantics as show_in_context() — ephemeral, one turn only.
+    /// File paths to attach on the child's first turn.
+    /// Same semantics as attach() — ephemeral, one turn only.
     pub attachments: Vec<Attachment>,
 }
 
@@ -129,24 +130,9 @@ struct PyWorkItem {
     priority: u8,
     time: String,
     item_type: String,
-    chat_id: Option<String>,
-    user: Option<String>,
-    content: Option<String>,
-    timer_id: Option<String>,
-    every: Option<String>,
-    description: Option<String>,
-    pid: Option<String>,
-    exit_code: Option<i32>,
-    error: Option<String>,
-    output_preview: Option<String>,
-    child_id: Option<String>,
-    result_memory: Option<HashMap<String, serde_json::Value>>,
-    turns_used: Option<u32>,
-    success: Option<bool>,
-    summary: Option<String>,
-    source: Option<String>,
-    event_type: Option<String>,
-    event_data: Option<serde_json::Value>,
+    /// Variant-specific fields, keyed by exact Rust field names.
+    /// Exposed via __getattr__: `item.chat_id`, `item.result`, etc.
+    fields: serde_json::Map<String, serde_json::Value>,
 }
 
 #[pymethods]
@@ -163,78 +149,19 @@ impl PyWorkItem {
     fn time(&self) -> &str {
         &self.time
     }
+
     fn __getattr__(&self, name: &str) -> PyResult<PyObject> {
         Python::with_gil(|py| {
-            // Handle "type" specially since it's a Python keyword
             if name == "type" {
                 return Ok(self.item_type.as_str().into_pyobject(py)?.into_any().unbind());
             }
-            let val = match name {
-                "chat_id" => self.chat_id.as_deref(),
-                "user" => self.user.as_deref(),
-                "from_agent" => self.user.as_deref(),  // alias for AgentMessage
-                "content" => self.content.as_deref(),
-                "timer_id" => self.timer_id.as_deref(),
-                "every" => self.every.as_deref(),
-                "description" => self.description.as_deref(),
-                "pid" => self.pid.as_deref(),
-                "error" => self.error.as_deref(),
-                "output_preview" => self.output_preview.as_deref(),
-                "child_id" => self.child_id.as_deref(),
-                "child_name" => self.child_id.as_deref(),  // alias for ChildAgentCompleted
-                "summary" => self.summary.as_deref(),
-                "source" => self.source.as_deref(),
-                "event_type" => self.event_type.as_deref(),
-                _ => None,
-            };
-            if let Some(s) = val {
-                return Ok(s.into_pyobject(py)?.into_any().unbind());
-            }
-            // Non-string fields
-            match name {
-                "exit_code" => match self.exit_code {
-                    Some(c) => Ok(c.into_pyobject(py)?.into_any().unbind()),
-                    None => Err(PyAttributeError::new_err(format!(
-                        "This {} item has no '{}' field", self.item_type, name
-                    ))),
-                },
-                "turns_used" => match self.turns_used {
-                    Some(t) => Ok(t.into_pyobject(py)?.into_any().unbind()),
-                    None => Err(PyAttributeError::new_err(format!(
-                        "This {} item has no '{}' field", self.item_type, name
-                    ))),
-                },
-                "success" => match self.success {
-                    Some(s) => {
-                        let py_bool = pyo3::types::PyBool::new(py, s);
-                        Ok(py_bool.to_owned().into_any().unbind())
-                    }
-                    None => Err(PyAttributeError::new_err(format!(
-                        "This {} item has no '{}' field", self.item_type, name
-                    ))),
-                },
-                "result_memory" => match &self.result_memory {
-                    Some(mem) => {
-                        let json_str = serde_json::to_string(mem).unwrap_or_default();
-                        let json_mod = py.import("json")?;
-                        Ok(json_mod.call_method1("loads", (json_str,))?.unbind())
-                    }
-                    None => Err(PyAttributeError::new_err(format!(
-                        "This {} item has no '{}' field", self.item_type, name
-                    ))),
-                },
-                "data" => match &self.event_data {
-                    Some(data) => {
-                        let json_str = serde_json::to_string(data).unwrap_or_default();
-                        let json_mod = py.import("json")?;
-                        Ok(json_mod.call_method1("loads", (json_str,))?.unbind())
-                    }
-                    None => Err(PyAttributeError::new_err(format!(
-                        "This {} item has no '{}' field", self.item_type, name
-                    ))),
-                },
-                _ => Err(PyAttributeError::new_err(format!(
-                    "'WorkItem' has no attribute '{}'", name
+            match self.fields.get(name) {
+                Some(val) => json_to_py(py, val),
+                None => Err(PyAttributeError::new_err(format!(
+                    "{} work item has no field '{}'. Available fields: {}",
+                    self.item_type,
+                    name,
+                    self.fields.keys().cloned().collect::<Vec<_>>().join(", ")
                 ))),
             }
         })
@@ -248,149 +175,84 @@ impl PyWorkItem {
     }
 }
 
+/// Convert a serde_json::Value to a Python object via json.loads.
+/// Used for work item field access and memory retrieval.
+fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
+    let json_str = serde_json::to_string(value).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("json serialize error: {}", e))
+    })?;
+    let json_mod = py.import("json")?;
+    Ok(json_mod.call_method1("loads", (json_str,))?.unbind())
+}
+
+/// Serialize each WorkItemType variant into a field map with keys matching
+/// the exact Rust field names. This is the single source of truth for what
+/// fields are available on each work item type in Python.
 fn work_item_to_py(item: &WorkItem) -> PyWorkItem {
     let time_str = item.time.format("%Y-%m-%d %H:%M:%S UTC").to_string();
-    let (item_type, chat_id, user, content, timer_id, every, description, pid, exit_code, error) =
-        match &item.item_type {
-            WorkItemType::UserMessage {
-                chat_id,
-                user,
-                content,
-            } => (
-                "UserMessage",
-                Some(chat_id.clone()),
-                Some(user.clone()),
-                Some(content.clone()),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
-            WorkItemType::TimerFired {
-                timer_id,
-                every,
-                description,
-            } => (
-                "TimerFired",
-                None,
-                None,
-                None,
-                Some(timer_id.0.clone()),
-                every.map(|d| format!("{}s", d.as_secs())),
-                Some(description.clone()),
-                None,
-                None,
-                None,
-            ),
-            WorkItemType::ProcessCompleted {
-                pid,
-                exit_code,
-                output_preview,
-            } => (
-                "ProcessCompleted",
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(pid.0.clone()),
-                Some(*exit_code),
-                None,
-            ),
-            WorkItemType::ProcessFailed {
-                pid,
-                error,
-                output_preview,
-            } => (
-                "ProcessFailed",
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(pid.0.clone()),
-                None,
-                Some(error.clone()),
-            ),
-            WorkItemType::ProcessTimeout { pid } => (
-                "ProcessTimeout",
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(pid.0.clone()),
-                None,
-                None,
-            ),
-            WorkItemType::ChildAgentCompleted { .. } => (
-                "ChildAgentCompleted",
-                None, None, None, None, None, None, None, None, None,
-            ),
-            WorkItemType::AgentMessage { ref from, ref content } => (
-                "AgentMessage",
-                None, Some(from.clone()), Some(content.clone()), None, None, None, None, None, None,
-            ),
-            WorkItemType::ExternalEvent { .. } => (
-                "ExternalEvent",
-                None, None, None, None, None, None, None, None, None,
-            ),
-            WorkItemType::Compaction => (
-                "Compaction",
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("You must compact your context.".to_string()),
-                None,
-                None,
-                None,
-            ),
-        };
+    let mut fields = serde_json::Map::new();
 
-    // Extract output_preview from ProcessCompleted/ProcessFailed
-    let output_preview = match &item.item_type {
-        WorkItemType::ProcessCompleted { output_preview, .. } => output_preview.clone(),
-        WorkItemType::ProcessFailed { output_preview, .. } => output_preview.clone(),
-        _ => None,
-    };
-
-    // Extract child agent fields
-    let (child_id, result_memory, turns_used, success, summary) = match &item.item_type {
-        WorkItemType::ChildAgentCompleted {
-            child_name,
-            result_memory,
-            turns_used,
-            success,
-            summary,
-        } => (
-            Some(child_name.clone()),
-            Some(result_memory.clone()),
-            Some(*turns_used),
-            Some(*success),
-            Some(summary.clone()),
-        ),
-        _ => (None, None, None, None, None),
-    };
-
-    // Extract external event fields
-    let (source, event_type, event_data) = match &item.item_type {
-        WorkItemType::ExternalEvent {
-            source,
-            event_type,
-            data,
-        } => (
-            Some(source.clone()),
-            Some(event_type.clone()),
-            Some(data.clone()),
-        ),
-        _ => (None, None, None),
+    let item_type = match &item.item_type {
+        WorkItemType::UserMessage { chat_id, user, content } => {
+            fields.insert("chat_id".into(), chat_id.clone().into());
+            fields.insert("user".into(), user.clone().into());
+            fields.insert("content".into(), content.clone().into());
+            "UserMessage"
+        }
+        WorkItemType::TimerFired { timer_id, every, description } => {
+            fields.insert("timer_id".into(), timer_id.0.clone().into());
+            fields.insert("every".into(), match every {
+                Some(d) => serde_json::Value::from(d.as_secs()),
+                None => serde_json::Value::Null,
+            });
+            fields.insert("description".into(), description.clone().into());
+            "TimerFired"
+        }
+        WorkItemType::ProcessCompleted { pid, exit_code, output_preview } => {
+            fields.insert("pid".into(), pid.0.clone().into());
+            fields.insert("exit_code".into(), (*exit_code).into());
+            fields.insert("output_preview".into(), match output_preview {
+                Some(s) => s.clone().into(),
+                None => serde_json::Value::Null,
+            });
+            "ProcessCompleted"
+        }
+        WorkItemType::ProcessFailed { pid, error, output_preview } => {
+            fields.insert("pid".into(), pid.0.clone().into());
+            fields.insert("error".into(), error.clone().into());
+            fields.insert("output_preview".into(), match output_preview {
+                Some(s) => s.clone().into(),
+                None => serde_json::Value::Null,
+            });
+            "ProcessFailed"
+        }
+        WorkItemType::ProcessTimeout { pid } => {
+            fields.insert("pid".into(), pid.0.clone().into());
+            "ProcessTimeout"
+        }
+        WorkItemType::ChildAgentCompleted { child_name, result, turns_used, success, summary } => {
+            fields.insert("child_name".into(), child_name.clone().into());
+            fields.insert("result".into(), serde_json::to_value(result).unwrap_or_default());
+            fields.insert("turns_used".into(), (*turns_used).into());
+            fields.insert("success".into(), (*success).into());
+            fields.insert("summary".into(), summary.clone().into());
+            "ChildAgentCompleted"
+        }
+        WorkItemType::AgentMessage { from, content } => {
+            fields.insert("from_agent".into(), from.clone().into());
+            fields.insert("content".into(), content.clone().into());
+            "AgentMessage"
+        }
+        WorkItemType::ExternalEvent { source, event_type, data } => {
+            fields.insert("source".into(), source.clone().into());
+            fields.insert("event_type".into(), event_type.clone().into());
+            fields.insert("data".into(), data.clone());
+            "ExternalEvent"
+        }
+        WorkItemType::Compaction => {
+            fields.insert("description".into(), "You must compact your context.".into());
+            "Compaction"
+        }
     };
 
     PyWorkItem {
@@ -398,24 +260,7 @@ fn work_item_to_py(item: &WorkItem) -> PyWorkItem {
         priority: item.priority,
         time: time_str,
         item_type: item_type.to_string(),
-        chat_id,
-        user,
-        content,
-        timer_id,
-        every,
-        description,
-        pid,
-        exit_code,
-        error,
-        output_preview,
-        child_id,
-        result_memory,
-        turns_used,
-        success,
-        summary,
-        source,
-        event_type,
-        event_data,
+        fields,
     }
 }
 
@@ -476,6 +321,10 @@ impl PyWorkQueue {
 struct PyMemory {
     data: HashMap<String, serde_json::Value>,
     priorities: HashMap<String, u8>,
+    /// Pinned entries: shared across all agents, injected into the cached
+    /// system prompt. Stored separately in SQLite (agent_notes table).
+    /// Read-through: get() checks local `data` first, then falls back here.
+    pinned: HashMap<String, String>,
     collector: Collector,
 }
 
@@ -524,15 +373,18 @@ impl PyMemory {
     }
 
     fn __contains__(&self, key: &str) -> bool {
-        self.data.contains_key(key)
+        self.data.contains_key(key) || self.pinned.contains_key(key)
     }
 
     #[pyo3(signature = (key, default=None))]
     fn get<'py>(&self, py: Python<'py>, key: &str, default: Option<PyObject>) -> PyResult<PyObject> {
-        match self.data.get(key) {
-            Some(value) => Self::value_to_py(py, value),
-            None => Ok(default.unwrap_or_else(|| py.None().into())),
+        if let Some(value) = self.data.get(key) {
+            return Self::value_to_py(py, value);
         }
+        if let Some(s) = self.pinned.get(key) {
+            return Ok(s.as_str().into_pyobject(py)?.into_any().unbind());
+        }
+        Ok(default.unwrap_or_else(|| py.None().into()))
     }
 
     #[pyo3(signature = (key, value, priority=5))]
@@ -556,8 +408,33 @@ impl PyMemory {
         self.priorities.get(key).copied().unwrap_or(5)
     }
 
+    /// Pin a key–value pair into the shared, cached tier. Pinned entries:
+    /// - are injected into the system prompt (prompt-cached, cheap to keep)
+    /// - are shared across all agents (parent, children, future sessions)
+    /// - must be strings (they render as markdown in the system prompt)
+    /// Use for stable facts: API endpoints, learned recipes, user prefs.
+    fn pin(&mut self, key: String, value: String) -> PyResult<()> {
+        self.pinned.insert(key.clone(), value.clone());
+        self.collector.lock().unwrap().memory_pins.push((key, value));
+        Ok(())
+    }
+
+    /// Remove a key from the pinned tier.
+    fn unpin(&mut self, key: String) -> PyResult<()> {
+        self.pinned.remove(&key);
+        self.collector.lock().unwrap().memory_unpins.push(key);
+        Ok(())
+    }
+
+    /// List pinned keys.
+    fn list_pinned(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.pinned.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
     fn __repr__(&self) -> String {
-        format!("Memory({} keys)", self.data.len())
+        format!("Memory({} keys, {} pinned)", self.data.len(), self.pinned.len())
     }
 }
 
@@ -697,7 +574,6 @@ struct PyHarness {
     child_depth_remaining: u32,
     agent_name: String,
     agent_lineage: String,
-    notes_snapshot: HashMap<String, String>,
 }
 
 #[pymethods]
@@ -773,14 +649,14 @@ impl PyHarness {
         self.process_info.clone()
     }
 
-    fn show_in_context(&self, path: String) -> PyResult<()> {
+    fn attach(&self, path: String) -> PyResult<()> {
         let pb = std::path::PathBuf::from(&path);
         if !pb.is_file() {
             return Err(pyo3::exceptions::PyFileNotFoundError::new_err(
-                format!("show_in_context: file not found or not a regular file: {}", path)
+                format!("attach: file not found or not a regular file: {}", path)
             ));
         }
-        self.collector.lock().unwrap().show_in_context.push(Attachment::new(pb));
+        self.collector.lock().unwrap().attachments.push(Attachment::new(pb));
         Ok(())
     }
 
@@ -828,15 +704,15 @@ impl PyHarness {
             let max_turns: u32 = item.getattr("max_turns")?.extract::<u32>()?.min(50);
             let can_compact: bool = item.getattr("can_compact")?.extract()?;
 
-            // Extract show_in_context attachment paths (None → empty).
+            // Extract attach paths (None → empty).
             // File existence is NOT checked here — the parent may be queuing a
             // shell_exec that writes the file before the child's turn 1 runs.
             // Resolution/error handling happens at API-call time.
-            let sic_obj = item.getattr("show_in_context")?;
-            let attachments: Vec<Attachment> = if sic_obj.is_none() {
+            let attach_obj = item.getattr("attach")?;
+            let attachments: Vec<Attachment> = if attach_obj.is_none() {
                 Vec::new()
             } else {
-                let paths: Vec<String> = sic_obj.extract()?;
+                let paths: Vec<String> = attach_obj.extract()?;
                 paths.into_iter().map(Attachment::new).collect()
             };
 
@@ -868,8 +744,22 @@ impl PyHarness {
         Ok(())
     }
 
-    fn done(&self) -> PyResult<()> {
-        self.collector.lock().unwrap().done_called = true;
+    #[pyo3(signature = (**result))]
+    fn done<'py>(&self, py: Python<'py>, result: Option<&Bound<'py, PyDict>>) -> PyResult<()> {
+        let mut col = self.collector.lock().unwrap();
+        col.done_called = true;
+        if let Some(dict) = result {
+            for (key, val) in dict.iter() {
+                let key_str: String = key.extract()?;
+                let json_mod = py.import("json")?;
+                let json_str: String = json_mod.call_method1("dumps", (val,))?.extract()?;
+                let serde_val: serde_json::Value = serde_json::from_str(&json_str)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(
+                        format!("done() kwargs must be JSON-serializable: {}", e)
+                    ))?;
+                col.done_result.insert(key_str, serde_val);
+            }
+        }
         Ok(())
     }
 
@@ -881,44 +771,6 @@ impl PyHarness {
     #[getter]
     fn agent_lineage(&self) -> &str {
         &self.agent_lineage
-    }
-
-    #[getter]
-    fn notes(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let notes_obj = PyNotes {
-            collector: self.collector.clone(),
-            snapshot: self.notes_snapshot.clone(),
-        };
-        Ok(Py::new(py, notes_obj)?.into_any().into())
-    }
-}
-
-#[pyclass]
-struct PyNotes {
-    collector: Collector,
-    snapshot: HashMap<String, String>,
-}
-
-#[pymethods]
-impl PyNotes {
-    fn set(&self, section: String, content: String) -> PyResult<()> {
-        self.collector.lock().unwrap().note_sets.push((section, content));
-        Ok(())
-    }
-
-    fn delete(&self, section: String) -> PyResult<()> {
-        self.collector.lock().unwrap().note_deletes.push(section);
-        Ok(())
-    }
-
-    fn list(&self) -> Vec<String> {
-        let mut sections: Vec<String> = self.snapshot.keys().cloned().collect();
-        sections.sort();
-        sections
-    }
-
-    fn get(&self, section: &str) -> Option<String> {
-        self.snapshot.get(section).cloned()
     }
 }
 
@@ -952,7 +804,7 @@ class ChildSettings:
     model: str | None = None
     max_turns: int = 20
     can_compact: bool = True
-    show_in_context: list[str] | None = None
+    attach: list[str] | None = None
 
 send_message = _harness.send_message
 shell_exec = _harness.shell_exec
@@ -961,13 +813,12 @@ shell_output = _harness.shell_output
 shell_kill = _harness.shell_kill
 processes_list = _harness.processes_list
 acknowledge_timer = _harness.acknowledge_timer
-show_in_context = _harness.show_in_context
+attach = _harness.attach
 fork = _harness.fork
 message_agent = _harness.message_agent
 done = _harness.done
 agent_name = _harness.agent_name
 agent_lineage = _harness.agent_lineage
-notes = _harness.notes
 "#;
 
 const COMPACTION_PREAMBLE: &str = r#"
@@ -1000,7 +851,7 @@ pub fn execute_with_timeout(
     child_depth_remaining: u32,
     agent_name: &str,
     agent_lineage: &str,
-    notes_snapshot: &HashMap<String, String>,
+    pinned_memory: &HashMap<String, String>,
 ) -> ExecutionResult {
     // Clone everything the thread needs (state is already Clone)
     let state = state.clone();
@@ -1008,12 +859,12 @@ pub fn execute_with_timeout(
     let process_outputs = process_outputs.clone();
     let agent_name = agent_name.to_string();
     let agent_lineage = agent_lineage.to_string();
-    let notes_snapshot = notes_snapshot.clone();
+    let pinned_memory = pinned_memory.clone();
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<ExecutionResult>(1);
 
     std::thread::spawn(move || {
-        let result = execute_inner(&state, &code, is_compaction, &process_outputs, child_depth_remaining, &agent_name, &agent_lineage, &notes_snapshot);
+        let result = execute_inner(&state, &code, is_compaction, &process_outputs, child_depth_remaining, &agent_name, &agent_lineage, &pinned_memory);
         let _ = tx.send(result);
     });
 
@@ -1077,7 +928,7 @@ fn execute_inner(
     child_depth_remaining: u32,
     agent_name: &str,
     agent_lineage: &str,
-    notes_snapshot: &HashMap<String, String>,
+    pinned_memory: &HashMap<String, String>,
 ) -> ExecutionResult {
     let collector = Arc::new(Mutex::new(SideEffectCollector {
         id_gen: state.id_generator.clone(),
@@ -1123,6 +974,7 @@ fn execute_inner(
             PyMemory {
                 data: state.memory.clone(),
                 priorities: state.memory_priorities.clone(),
+                pinned: pinned_memory.clone(),
                 collector: collector.clone(),
             },
         )?;
@@ -1229,7 +1081,6 @@ fn execute_inner(
                 child_depth_remaining,
                 agent_name: agent_name.to_string(),
                 agent_lineage: agent_lineage.to_string(),
-                notes_snapshot: notes_snapshot.clone(),
             },
         )?;
         locals.set_item("_harness", harness)?;
@@ -1608,7 +1459,7 @@ print("forked")
     }
 
     #[test]
-    fn test_show_in_context() {
+    fn test_attach() {
         init();
         let state = HarnessState::new(200_000, 16384);
 
@@ -1618,7 +1469,7 @@ print("forked")
 
         let code = format!(
             r#"
-show_in_context({path:?})
+attach({path:?})
 print("ok")
 "#,
             path = tmp.to_str().unwrap()
@@ -1626,19 +1477,19 @@ print("ok")
         let result = execute(&state, &code, false, &HashMap::new());
         assert!(!result.is_error, "Error: {}", result.error_text);
         assert_eq!(result.stdout.trim(), "ok");
-        assert_eq!(result.side_effects.show_in_context.len(), 1);
-        assert_eq!(result.side_effects.show_in_context[0].path, tmp);
+        assert_eq!(result.side_effects.attachments.len(), 1);
+        assert_eq!(result.side_effects.attachments[0].path, tmp);
 
         std::fs::remove_file(&tmp).ok();
     }
 
     #[test]
-    fn test_show_in_context_file_not_found() {
+    fn test_attach_file_not_found() {
         init();
         let state = HarnessState::new(200_000, 16384);
         let result = execute(
             &state,
-            r#"show_in_context("/nonexistent/path/xyz.jpg")"#,
+            r#"attach("/nonexistent/path/xyz.jpg")"#,
             false,
             &HashMap::new(),
         );
@@ -1652,7 +1503,7 @@ print("ok")
     }
 
     #[test]
-    fn test_fork_with_show_in_context() {
+    fn test_fork_with_attach() {
         init();
         let state = HarnessState::new(200_000, 16384);
         let result = execute_with_timeout(
@@ -1662,7 +1513,7 @@ fork([
     ChildSettings(
         name="investigator",
         task="Look at this image",
-        show_in_context=["/tmp/snapshot.jpg", "/tmp/metadata.json"],
+        attach=["/tmp/snapshot.jpg", "/tmp/metadata.json"],
     ),
 ])
 "#,
@@ -1769,28 +1620,26 @@ print(agent_lineage)
     }
 
     #[test]
-    fn test_notes_api() {
+    fn test_memory_pin() {
         init();
         let state = HarnessState::new(200_000, 16384);
-        let mut snapshot = HashMap::new();
-        snapshot.insert("existing".to_string(), "old value".to_string());
+        let mut pinned = HashMap::new();
+        pinned.insert("existing".to_string(), "old value".to_string());
         let result = execute_with_timeout(
             &state,
             r#"
-# Read existing notes
-sections = notes.list()
-print(f"sections: {sections}")
-existing = notes.get("existing")
-print(f"existing: {existing}")
-missing = notes.get("missing")
-print(f"missing: {missing}")
+# Pinned entries are readable via memory.get() (local-first fallback)
+print(f"pinned: {memory.list_pinned()}")
+print(f"existing: {memory.get('existing')}")
+print(f"missing: {memory.get('missing')}")
+print(f"contains: {'existing' in memory}")
 
-# Write new notes
-notes.set("api_info", "HA API at :8123")
-notes.set("user_prefs", "Prefers SMS alerts")
+# Pin new entries
+memory.pin("api_info", "HA API at :8123")
+memory.pin("user_prefs", "Prefers SMS alerts")
 
-# Delete a note
-notes.delete("existing")
+# Unpin
+memory.unpin("existing")
 "#,
             false,
             &HashMap::new(),
@@ -1798,17 +1647,108 @@ notes.delete("existing")
             1,
             "root",
             "root",
-            &snapshot,
+            &pinned,
         );
         assert!(!result.is_error, "Error: {}", result.error_text);
-        assert!(result.stdout.contains("sections: ['existing']"));
+        assert!(result.stdout.contains("pinned: ['existing']"));
         assert!(result.stdout.contains("existing: old value"));
         assert!(result.stdout.contains("missing: None"));
-        assert_eq!(result.side_effects.note_sets.len(), 2);
-        assert_eq!(result.side_effects.note_sets[0].0, "api_info");
-        assert_eq!(result.side_effects.note_sets[0].1, "HA API at :8123");
-        assert_eq!(result.side_effects.note_sets[1].0, "user_prefs");
-        assert_eq!(result.side_effects.note_deletes.len(), 1);
-        assert_eq!(result.side_effects.note_deletes[0], "existing");
+        assert!(result.stdout.contains("contains: True"));
+        assert_eq!(result.side_effects.memory_pins.len(), 2);
+        assert_eq!(result.side_effects.memory_pins[0].0, "api_info");
+        assert_eq!(result.side_effects.memory_pins[0].1, "HA API at :8123");
+        assert_eq!(result.side_effects.memory_pins[1].0, "user_prefs");
+        assert_eq!(result.side_effects.memory_unpins.len(), 1);
+        assert_eq!(result.side_effects.memory_unpins[0], "existing");
+    }
+
+    #[test]
+    fn test_done_with_result() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        let result = execute(
+            &state,
+            r#"
+done(verdict="all clear", confidence=0.95, details={"camera": "front", "count": 5})
+"#,
+            false,
+            &HashMap::new(),
+        );
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert!(result.side_effects.done_called);
+        assert_eq!(result.side_effects.done_result.len(), 3);
+        assert_eq!(
+            result.side_effects.done_result["verdict"],
+            serde_json::json!("all clear")
+        );
+        assert_eq!(
+            result.side_effects.done_result["confidence"],
+            serde_json::json!(0.95)
+        );
+        assert_eq!(
+            result.side_effects.done_result["details"],
+            serde_json::json!({"camera": "front", "count": 5})
+        );
+    }
+
+    #[test]
+    fn test_done_no_args() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        let result = execute(&state, "done()", false, &HashMap::new());
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert!(result.side_effects.done_called);
+        assert!(result.side_effects.done_result.is_empty());
+    }
+
+    #[test]
+    fn test_work_item_field_access() {
+        init();
+        let mut state = HarnessState::new(200_000, 16384);
+        let mut id_gen = IdGenerator::new();
+
+        // Push a ChildAgentCompleted to test the new principled field mapping
+        let mut result_map = HashMap::new();
+        result_map.insert("verdict".to_string(), serde_json::json!("safe"));
+        state.work_queue.push(WorkItem {
+            id: id_gen.next(),
+            priority: 7,
+            time: chrono::Utc::now(),
+            item_type: WorkItemType::ChildAgentCompleted {
+                child_name: "investigator".to_string(),
+                result: result_map,
+                turns_used: 2,
+                success: true,
+                summary: "done".to_string(),
+            },
+        });
+
+        let result = execute(
+            &state,
+            r#"
+item = work_queue[0]
+print(item.type)
+print(item.child_name)
+print(item.turns_used)
+print(item.success)
+print(item.result["verdict"])
+# Accessing a field that doesn't exist on this variant should raise with available fields listed
+try:
+    _ = item.chat_id
+    print("FAIL: should have raised")
+except AttributeError as e:
+    print(f"attr error: {e}")
+"#,
+            false,
+            &HashMap::new(),
+        );
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert!(result.stdout.contains("ChildAgentCompleted"));
+        assert!(result.stdout.contains("investigator"));
+        assert!(result.stdout.contains("2"));
+        assert!(result.stdout.contains("True"));
+        assert!(result.stdout.contains("safe"));
+        assert!(result.stdout.contains("has no field 'chat_id'"));
+        assert!(result.stdout.contains("Available fields"));
     }
 }

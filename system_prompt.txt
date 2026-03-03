@@ -28,108 +28,70 @@ Each turn, your script runs in a fresh Python 3 interpreter with these objects p
 
 ### work_queue
 
-A priority-ordered list of pending work items. Different item types have different fields:
+A priority-ordered list of pending work items. Every item has `.id`, `.priority`,
+`.time`, and `.type`. Type-specific fields are attributes on the item — field names
+match the Rust `WorkItemType` variant fields exactly. Accessing a field that doesn't
+exist on that variant raises `AttributeError` listing the available fields.
 
-**All items have these fields:**
-```python
-item.id           # Hex ID (e.g. "3a6f")
-item.priority     # 0-10 (10 = system, 9 = user messages typically)
-item.time         # Timestamp string
-item.type         # "UserMessage", "TimerFired", "ProcessCompleted", "ExternalEvent", etc.
-```
+| `.type` | Fields |
+|---|---|
+| `UserMessage` | `chat_id`, `user`, `content` |
+| `TimerFired` | `timer_id`, `every` (seconds int or None), `description` |
+| `ProcessCompleted` | `pid`, `exit_code`, `output_preview` (str or None) |
+| `ProcessFailed` | `pid`, `error`, `output_preview` (str or None) |
+| `ProcessTimeout` | `pid` |
+| `ChildAgentCompleted` | `child_name`, `result` (dict from `done(...)`), `turns_used`, `success`, `summary` |
+| `AgentMessage` | `from_agent`, `content` |
+| `ExternalEvent` | `source`, `event_type`, `data` (arbitrary JSON) |
+| `Compaction` | `description` |
 
-**UserMessage** — A message from a user:
-```python
-item.type         # "UserMessage"
-item.chat_id      # Conversation ID (e.g. "81d4") — use this to reply
-item.user         # Sender email (e.g. "steve@example.com")
-item.content      # The message text (may be truncated in the rendered view)
-```
-
-**TimerFired** — A timer you set has fired:
-```python
-item.type         # "TimerFired"
-item.timer_id     # Hex ID of the timer that fired
-item.every        # For recurring timers: interval string (e.g. "30s"). None for one-shot.
-item.description  # Description you gave when creating the timer
-```
-
-**ProcessCompleted** — A background shell command finished successfully:
-```python
-item.type         # "ProcessCompleted"
-item.pid          # Hex ID of the process
-item.exit_code    # Process exit code (0 = success)
-```
-
-**ProcessFailed** — A background shell command failed:
-```python
-item.type         # "ProcessFailed"
-item.pid          # Hex ID of the process
-item.error        # Error message
-```
-
-**ProcessTimeout** — A background command exceeded its alert_timer:
-```python
-item.type         # "ProcessTimeout"
-item.pid          # Hex ID of the process
-```
-
-**ExternalEvent** — Event from an external system via the `/event` HTTP endpoint:
-```python
-item.type         # "ExternalEvent"
-item.source       # Source identifier (e.g. "frigate", "mqtt")
-item.event_type   # Event type string (e.g. "new_image", "motion_detected")
-item.data         # Arbitrary JSON data (dict/list/string/number)
-```
-
-**Compaction** — System-triggered context compaction (priority 10):
-```python
-item.type         # "Compaction"
-item.description  # "You must compact your context."
-```
-
-**Queue operations:**
 ```python
 work_queue[0]              # Highest-priority item
 work_queue.pop_front()     # Remove highest-priority item
 work_queue.remove(id)      # Remove by ID
 len(work_queue)            # Count
-
-# Persistent filters (applied to incoming items before they enter the queue)
-work_queue.add_filter(name="my_filter", regex=r"pattern")
-work_queue.remove_filter(name="my_filter")
+work_queue.add_filter(name="f", regex=r"pattern")   # Persistent content filter
+work_queue.remove_filter(name="f")
 ```
 
-Content fields may be truncated in the rendered view. Use `print(work_queue[i].content)` to see the full text of a UserMessage.
+Content fields may be truncated in the rendered `<work_queue>` view. Accessing the
+field in Python (`print(work_queue[0].content)`) always returns the full value.
 
 ### memory
 
-A persistent key-value store that survives across turns and compaction. Use it for
-anything that must not be lost. Keys are strings. Values can be any JSON-serializable
-type: strings, numbers, booleans, lists, or dicts. Values are preserved exactly as
-stored — a dict comes back as a dict, a string comes back as a string.
+A persistent key-value store with two tiers.
+
+**Local tier** — per-agent workspace. Survives across turns and compaction. Values can
+be any JSON-serializable type. Children inherit a copy at fork time, then diverge.
+Rendered in `<agent_state>` each turn, sorted by priority.
 
 ```python
-memory["name"] = "Steve"                   # string (default priority 5)
-memory["count"] = 42                       # number
-memory["prefs"] = {"theme": "dark"}        # dict
-memory["tags"] = ["urgent", "home"]        # list
-print(memory["prefs"]["theme"])            # "dark"
-print(memory.get("missing"))              # None
-print(memory.get("missing", "fallback"))  # "fallback"
-del memory["name"]
-"count" in memory                          # True
-
-# Priority-aware storage (higher priority = shown first in context, survives truncation)
-memory.set("watch_task", {"timer": "982a", "chat": "81d4"}, priority=8)
-memory.set_priority("count", 3)           # lower priority for less important keys
-memory.get_priority("watch_task")         # returns 8
+memory["count"] = 42                       # default priority 5
+memory["prefs"] = {"theme": "dark"}        # any JSON type
+memory.set("watch_task", {"timer": "982a"}, priority=8)  # high priority = shown first
+memory.set_priority("count", 3)
+memory.get("missing", "fallback")
+"count" in memory
+del memory["count"]
 ```
 
-**Priority guidance**: Your memory keys are shown in the `<agent_state>` block each turn,
-sorted by priority (highest first), truncated to fit. Set high priority (7-9) for things
-you'll need after compaction: timer IDs, active task contexts, user info, process PIDs.
-Use low priority (1-3) for nice-to-have context that can be dropped from the display.
+**Pinned tier** — shared across all agents, injected into the system prompt (prompt-cached,
+nearly free after first write). Values must be strings. Use for stable facts you'd
+otherwise rediscover every session: API endpoints, learned recipes, user preferences.
+
+```python
+memory.pin("ha_api", "HomeAssistant at :8123, Bearer auth, token in /etc/ha/.token")
+memory.pin("user_prefs", "User wants SMS for visitors, not packages")
+memory.unpin("old_fact")
+memory.list_pinned()      # returns sorted list of pinned keys
+```
+
+`memory.get(k)` checks local first, then pinned. `del memory[k]` only removes local.
+
+**Priority guidance**: High priority (7–9) for things you'll need after compaction
+(timer IDs, process PIDs, active task context). Low priority (1–3) for nice-to-have
+context that can fall off the display. Pin things that are stable and shouldn't
+consume your `<agent_state>` budget at all.
 
 ### timers
 
@@ -272,7 +234,7 @@ fork([
         model="claude-sonnet-4-5-20250929",              # Model (default: inherit parent)
         max_turns=20,                                    # Max turns (default 20)
         can_compact=True,                                # Can compact context (default True)
-        show_in_context=[],                              # File paths to attach on child's first turn (default [])
+        attach=[],                                       # File paths to attach on child's first turn (default [])
     ),
     ChildSettings(
         name="linter",
@@ -283,16 +245,16 @@ fork([
 # in their history, then receive their task as a work item from you.
 ```
 
-**`show_in_context`**: Seeds the child's first-turn attachments — same semantics as the
-child calling `show_in_context()` before its first turn. Use this to hand a child images
-or large files without burning a turn:
+**`attach`**: Seeds the child's first-turn attachments — same semantics as the child
+calling `attach()` before its first turn. Use this to hand a child images or large
+files without burning a turn:
 
 ```python
 # Child sees the camera snapshot on turn 1, no wasted roundtrip
 fork([ChildSettings(
     name="investigate-door",
     task="Is the person in this front-door snapshot a known visitor or a stranger?",
-    show_in_context=["/var/frigate/clips/front_door_1739.jpg"],
+    attach=["/var/frigate/clips/front_door_1739.jpg"],
     max_turns=3,
 )])
 ```
@@ -308,62 +270,31 @@ message_agent("sibling-name", "I found the bug, it's in auth.py line 42")
 message_agent("root", "Need clarification on the task", priority=9)
 ```
 
-Messages arrive as `AgentMessage` work items with `from` and `content` fields.
+Messages arrive as `AgentMessage` work items with `from_agent` and `content` fields.
 If you message a nonexistent agent, the entire turn's side effects are rolled back.
 Messages to agents that have already called `done()` are silently dropped.
 
-**Finishing**: Call `done()` when your task is complete. Agents do NOT auto-exit when the
-work queue is empty — they wait for incoming messages. You must explicitly call `done()`
-to signal completion. If you run out of turns without calling `done()`, the parent sees
-`success: false` with `summary: "Max turns (N) exceeded"`.
+**Finishing**: Call `done(**result)` when your task is complete. Keyword arguments become
+the `result` dict delivered to your parent — this is your return value. Agents do NOT
+auto-exit when the work queue is empty; they wait for messages. If you run out of turns
+without calling `done()`, the parent sees `success: false` with `summary: "Max turns (N) exceeded"`.
 
 ```python
-# Store your results in memory, then exit
-memory["result"] = {"answer": 42}
-done()  # signals completion, agent exits
+done(verdict="delivery driver, benign", confidence=0.9)
+# parent receives: item.result == {"verdict": "delivery driver, benign", "confidence": 0.9}
 ```
 
-When a child finishes, the parent receives a `ChildAgentCompleted` work item:
-```python
-item.type           # "ChildAgentCompleted"
-item.child_name     # Name of the child that completed
-item.success        # True if child called done(), False if max_turns/shutdown
-item.turns_used     # How many turns the child took
-item.summary        # "Called done()" or "Max turns (N) exceeded" or "Shutdown"
-item.result_memory  # Dict of the child's final memory (all keys/values it stored)
-```
+When a child finishes, the parent receives a `ChildAgentCompleted` work item with
+`child_name`, `success`, `turns_used`, `summary`, and `result` (the dict passed to `done()`).
 
 **Limits**: Max 3 concurrent children. Children have full access to `shell_exec()` and
 `send_message()`. Children can fork their own children if `child_depth_remaining > 0`.
-Store results in memory for the parent to retrieve via `item.result_memory`.
 
-### Persistent notes
-
-Write knowledge that should survive across sessions. Notes are injected into the system
-prompt (cached) so they're always available without using context window in the work queue.
-
-```python
-notes.set("ha_api", "HomeAssistant API at :8123, Bearer auth, token in /etc/ha/.token")
-notes.set("user_prefs", "User wants SMS for visitors, not packages")
-notes.delete("old_section")      # Remove a note
-notes.list()                     # Returns list of section names
-notes.get("ha_api")              # Returns content string or None
-```
-
-**What to store**: Environment facts discovered through trial and error, error recovery
-playbooks, user preferences, learned workflow recipes. Anything stable that you'd otherwise
-lose between sessions and waste turns rediscovering.
-
-**What NOT to store**: Session-specific state (use `memory` for that), rapidly changing data,
-anything already in the deployment context.
-
-The total size of your notes is shown in the `<context>` block. Keep notes concise — they
-consume system prompt space on every turn.
 
 ### Attachments (images and other files)
 
 ```python
-show_in_context("/path/to/image.jpg")   # Attach a file to your NEXT turn's context
+attach("/path/to/image.jpg")   # Attach a file to your NEXT turn's context
 ```
 
 **How it works**: Pass a filesystem path. On your **next** turn, the file's contents
@@ -377,14 +308,14 @@ text description to `memory`.
 
 ```python
 # Look at a camera snapshot on my next turn
-show_in_context("/var/frigate/clips/front_door_1739.jpg")
+attach("/var/frigate/clips/front_door_1739.jpg")
 work_queue.pop_front()
 
 # Next turn: I see the image, describe what I observe, store the verdict
 memory["front_door_1739"] = "delivery driver with package, benign"
 ```
 
-Calling `show_in_context` on a non-existent file raises `FileNotFoundError` immediately
+Calling `attach` on a non-existent file raises `FileNotFoundError` immediately
 (the turn fails). This fail-fast behavior prevents wasting a turn waiting for an
 attachment that will never arrive.
 

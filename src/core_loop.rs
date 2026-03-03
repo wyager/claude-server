@@ -24,7 +24,7 @@ pub enum HarnessEvent {
     Process(ProcessEvent),
     ChildCompleted {
         child_name: String,
-        result_memory: HashMap<String, serde_json::Value>,
+        result: HashMap<String, serde_json::Value>,
         turns_used: u32,
         success: bool,
         summary: String,

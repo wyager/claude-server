@@ -27,9 +27,9 @@ pub struct AgentIdentity<'a> {
     pub max_turns: Option<u32>,
 }
 
-/// Summary of agent notes for rendering in context metadata.
-/// (section_count, total_chars)
-pub type NotesSummary = Option<(usize, usize)>;
+/// Summary of pinned memory for rendering in context metadata.
+/// (key_count, total_chars)
+pub type PinnedSummary = Option<(usize, usize)>;
 
 pub fn render_context(
     state: &HarnessState,
@@ -38,7 +38,7 @@ pub fn render_context(
     config: &RenderConfig,
     compact_at: u64,
     agent: Option<&AgentIdentity>,
-    notes_summary: NotesSummary,
+    pinned_summary: PinnedSummary,
     attachments: Vec<Attachment>,
 ) -> RenderedContext {
     let mut out = String::with_capacity(8192);
@@ -53,7 +53,7 @@ pub fn render_context(
     render_agent_state(&mut out, state, config);
 
     // Context metadata
-    render_context_metadata(&mut out, state, compaction, compact_at, agent, notes_summary, attachments.len());
+    render_context_metadata(&mut out, state, compaction, compact_at, agent, pinned_summary, attachments.len());
 
     // Work queue (last — changes every turn, so placing it at the end
     // maximizes KV cache reuse for the stable prefix above)
@@ -215,28 +215,27 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
             turns_used,
             success,
             summary,
-            result_memory,
+            result,
         } => {
             out.push_str("type: ChildAgentCompleted\n");
             out.push_str(&format!("child_name: {}\n", child_name));
             out.push_str(&format!("success: {}\n", success));
             out.push_str(&format!("turns_used: {}\n", turns_used));
 
-            // Show result_memory preview
-            if result_memory.is_empty() {
-                out.push_str("result_memory: (empty)\n");
+            if result.is_empty() {
+                out.push_str("result: (empty)\n");
             } else {
-                let total = result_memory.len();
+                let total = result.len();
                 let display_count = total.min(5);
                 out.push_str(&format!(
-                    "result_memory ({} {}):\n",
+                    "result ({} {}):\n",
                     total,
                     if total == 1 { "key" } else { "keys" }
                 ));
-                let mut keys: Vec<&String> = result_memory.keys().collect();
+                let mut keys: Vec<&String> = result.keys().collect();
                 keys.sort();
                 for key in keys.iter().take(display_count) {
-                    let val_str = serde_json::to_string(&result_memory[*key])
+                    let val_str = serde_json::to_string(&result[*key])
                         .unwrap_or_else(|_| "?".to_string());
                     let truncated = if val_str.len() > 80 {
                         format!("{}...", &val_str[..80])
@@ -440,7 +439,7 @@ fn render_context_metadata(
     compaction: Option<&CompactionState>,
     compact_at: u64,
     agent: Option<&AgentIdentity>,
-    notes_summary: NotesSummary,
+    pinned_summary: PinnedSummary,
     attachment_count: usize,
 ) {
     out.push_str("<context>\n");
@@ -481,11 +480,11 @@ fn render_context_metadata(
         ));
     }
 
-    // Agent notes summary
-    if let Some((count, chars)) = notes_summary {
-        out.push_str(&format!("Agent notes: {} {}, {} chars\n",
+    // Pinned memory summary
+    if let Some((count, chars)) = pinned_summary {
+        out.push_str(&format!("Pinned memory: {} {}, {} chars\n",
             count,
-            if count == 1 { "section" } else { "sections" },
+            if count == 1 { "key" } else { "keys" },
             chars,
         ));
     }

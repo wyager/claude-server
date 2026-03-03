@@ -73,8 +73,11 @@ pub struct AgentLoop {
     /// Shared agent registry for naming and inter-agent messaging.
     registry: Arc<AgentRegistry>,
     /// Attachments queued for the next turn's API request. Consumed once, then cleared.
-    /// Populated by show_in_context() or by ChildSettings.show_in_context on fork.
+    /// Populated by attach() or by ChildSettings.attach on fork.
     pending_attachments: Vec<Attachment>,
+    /// Explicit return values from done(**kwargs). Populated on the turn that
+    /// calls done(); read by run_child_agent_loop after run() returns.
+    done_result: HashMap<String, serde_json::Value>,
 }
 
 impl AgentLoop {
@@ -124,6 +127,7 @@ impl AgentLoop {
             local_cache_read_tokens: 0,
             registry,
             pending_attachments: Vec::new(),
+            done_result: HashMap::new(),
         }
     }
 
@@ -266,14 +270,14 @@ impl AgentLoop {
 
         // Render context
         let lineage_str = format_lineage(&self.permissions.lineage);
-        // Load agent notes from DB (needed for both rendering and API call)
-        let notes = self.db.load_notes().unwrap_or_default();
-        let notes_snapshot: HashMap<String, String> = notes.iter().cloned().collect();
-        let notes_summary = if notes.is_empty() {
+        // Load pinned memory from DB (shared across agents, injected into system prompt)
+        let pinned = self.db.load_notes().unwrap_or_default();
+        let pinned_snapshot: HashMap<String, String> = pinned.iter().cloned().collect();
+        let pinned_summary = if pinned.is_empty() {
             None
         } else {
-            let total_chars: usize = notes.iter().map(|(s, c)| s.len() + c.len()).sum();
-            Some((notes.len(), total_chars))
+            let total_chars: usize = pinned.iter().map(|(s, c)| s.len() + c.len()).sum();
+            Some((pinned.len(), total_chars))
         };
 
         let agent_identity = renderer::AgentIdentity {
@@ -292,7 +296,7 @@ impl AgentLoop {
             &self.config.render_config,
             self.config.compact_at,
             Some(&agent_identity),
-            notes_summary,
+            pinned_summary,
             attachments,
         );
 
@@ -310,7 +314,7 @@ impl AgentLoop {
         });
 
         // Call Claude API
-        let api_result = self.api_client.call(&rendered, &notes).await?;
+        let api_result = self.api_client.call(&rendered, &pinned).await?;
 
         println!(
             "[{}] API response: {} input tokens, {} output tokens (cache: {} created, {} read)",
@@ -360,7 +364,7 @@ impl AgentLoop {
             self.permissions.child_depth_remaining,
             &self.permissions.agent_name,
             &lineage_str,
-            &notes_snapshot,
+            &pinned_snapshot,
         );
 
         let mut is_error = exec_result.is_error;
@@ -382,6 +386,9 @@ impl AgentLoop {
         let mut done_called = false;
         if !is_error {
             done_called = exec_result.side_effects.done_called;
+            if done_called {
+                self.done_result = exec_result.side_effects.done_result.clone();
+            }
             match self.apply_side_effects(exec_result.side_effects) {
                 Ok(deferred) => {
                     self.perform_deferred_ops(deferred).await;
@@ -540,7 +547,7 @@ impl AgentLoop {
             },
             HarnessEvent::ChildCompleted {
                 child_name,
-                result_memory,
+                result,
                 turns_used,
                 success,
                 summary,
@@ -572,7 +579,7 @@ impl AgentLoop {
                     time: Utc::now(),
                     item_type: WorkItemType::ChildAgentCompleted {
                         child_name,
-                        result_memory,
+                        result,
                         turns_used,
                         success,
                         summary,
@@ -799,7 +806,7 @@ impl AgentLoop {
         deferred.process_kills = effects.process_kills;
 
         // Attachments for next turn's context (ephemeral)
-        self.pending_attachments.extend(effects.show_in_context);
+        self.pending_attachments.extend(effects.attachments);
 
         // Fork requests (child agent spawns)
         for req in effects.fork_requests {
@@ -827,7 +834,7 @@ impl AgentLoop {
                     time: Utc::now(),
                     item_type: WorkItemType::ChildAgentCompleted {
                         child_name: format!("fork-failed"),
-                        result_memory: HashMap::new(),
+                        result: HashMap::new(),
                         turns_used: 0,
                         success: false,
                         summary: format!("Fork failed: {}", e),
@@ -860,7 +867,7 @@ impl AgentLoop {
                         time: Utc::now(),
                         item_type: WorkItemType::ChildAgentCompleted {
                             child_name: child_settings.name,
-                            result_memory: HashMap::new(),
+                            result: HashMap::new(),
                             turns_used: 0,
                             success: false,
                             summary: format!(
@@ -966,7 +973,7 @@ impl AgentLoop {
                                 time: Utc::now(),
                                 item_type: WorkItemType::ChildAgentCompleted {
                                     child_name: child_name_str,
-                                    result_memory: HashMap::new(),
+                                    result: HashMap::new(),
                                     turns_used: 0,
                                     success: false,
                                     summary: format!("Failed to create API client: {}", e),
@@ -1047,15 +1054,15 @@ impl AgentLoop {
             }
         }
 
-        // Agent notes
-        for (section, content) in effects.note_sets {
-            if let Err(e) = self.db.save_note(&section, &content) {
-                eprintln!("[{}] Failed to save note '{}': {}", self.name, section, e);
+        // Pinned memory (shared, cached in system prompt)
+        for (key, content) in effects.memory_pins {
+            if let Err(e) = self.db.save_note(&key, &content) {
+                eprintln!("[{}] Failed to pin '{}': {}", self.name, key, e);
             }
         }
-        for section in effects.note_deletes {
-            if let Err(e) = self.db.delete_note(&section) {
-                eprintln!("[{}] Failed to delete note '{}': {}", self.name, section, e);
+        for key in effects.memory_unpins {
+            if let Err(e) = self.db.delete_note(&key) {
+                eprintln!("[{}] Failed to unpin '{}': {}", self.name, key, e);
             }
         }
 
@@ -1074,7 +1081,7 @@ impl AgentLoop {
                 0, // compaction doesn't need to spawn children
                 &self.permissions.agent_name,
                 &format_lineage(&self.permissions.lineage),
-                &HashMap::new(), // compaction doesn't need notes
+                &HashMap::new(), // compaction doesn't need pinned memory
             );
 
             if compact_result.is_error {
@@ -1214,7 +1221,7 @@ async fn run_child_agent_loop(
 
     let _ = parent_tx.send(HarnessEvent::ChildCompleted {
         child_name,
-        result_memory: child_loop.state.memory,
+        result: child_loop.done_result,
         turns_used,
         success: final_success,
         summary: final_summary,
