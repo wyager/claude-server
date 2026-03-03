@@ -1,5 +1,33 @@
 # Changelog
 
+## 2026-02-27
+
+### Attachments (Vision + Large-File Injection)
+- `attach(path)` queues a file to appear as a content block on the agent's next turn
+- Media-type sniffed by extension: images → vision blocks, anything else → text block
+- Ephemeral: visible exactly once, not in `HarnessState`, not persisted, not in history
+- Stored as file paths (not bytes) in `SideEffectCollector`; encoding deferred to API call time
+- `ChildSettings.attach=[paths]` seeds a child's first-turn attachments (no wasted roundtrip)
+- `CLAUDE_SERVER_EVENT_URL` auto-injected into every spawned process's env
+- `kill_on_drop(true)` on spawned processes so watchers clean up on daemon shutdown
+
+### API Unification (net -123 lines)
+- `done(**kwargs)` takes explicit return values. Parent receives only what child passed,
+  not the entire inherited memory. `ChildAgentCompleted.result_memory` → `ChildAgentCompleted.result`
+- `PyWorkItem` collapsed from 20-field sparse struct to `{id, priority, time, type, fields: Map}`.
+  Field names match Rust `WorkItemType` variant field names exactly. Single `__getattr__`
+  with helpful errors listing available fields. No more `child_id` vs `child_name` aliases.
+- `notes.*` folded into `memory.pin(k, v)` / `memory.unpin(k)` / `memory.list_pinned()`.
+  One namespace, two storage tiers: local per-agent (any JSON) + pinned shared (strings,
+  system-prompt cached). `memory.get()` reads through both. `PyNotes` class deleted.
+  SQLite table renamed `agent_notes` → `pinned_memory`, column `section` → `key`
+  (no production DBs existed at time of rename). DB methods renamed:
+  `load_notes`/`save_note`/`delete_note` → `load_pinned`/`save_pin`/`delete_pin`.
+- `show_in_context` → `attach` rename; `ChildSettings.show_in_context` → `ChildSettings.attach`
+- System prompt `<agent_notes>` block → `<pinned_memory>`
+- Work-queue docs in system prompt collapsed from ~60 lines per-type listings to 12-line table
+- 3 new tests: `test_done_with_result`, `test_done_no_args`, `test_work_item_field_access`
+
 ## 2026-01-27 (cont.)
 
 ### Unified Agent Loop

@@ -53,7 +53,7 @@ pub struct SideEffectCollector {
     pub compact_called: bool,
     pub done_called: bool,
     pub done_result: HashMap<String, serde_json::Value>,
-    pub memory_pins: Vec<(String, String)>,    // (key, content) — written to agent_notes table, cached in system prompt
+    pub memory_pins: Vec<(String, String)>,    // (key, content) — written to pinned_memory table, cached in system prompt
     pub memory_unpins: Vec<String>,            // keys to remove from pinned storage
 }
 
@@ -322,7 +322,7 @@ struct PyMemory {
     data: HashMap<String, serde_json::Value>,
     priorities: HashMap<String, u8>,
     /// Pinned entries: shared across all agents, injected into the cached
-    /// system prompt. Stored separately in SQLite (agent_notes table).
+    /// system prompt. Stored separately in SQLite (pinned_memory table).
     /// Read-through: get() checks local `data` first, then falls back here.
     pinned: HashMap<String, String>,
     collector: Collector,

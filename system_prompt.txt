@@ -192,7 +192,6 @@ If it doesn't finish in time, it arrives later as normal.
 includes an `output_preview` field with the last ~500 characters of output. You can
 read it directly from the work item (`work_queue[i].output_preview`) instead of calling
 `shell_output()`. Only use `shell_output()` if you need the full output and it was truncated.
-```
 
 ### External events
 

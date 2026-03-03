@@ -56,8 +56,8 @@ impl Database {
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
-            CREATE TABLE IF NOT EXISTS agent_notes (
-                section TEXT PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS pinned_memory (
+                key TEXT PRIMARY KEY,
                 content TEXT NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
@@ -173,36 +173,36 @@ impl Database {
         Ok(())
     }
 
-    // ---- Agent Notes ----
+    // ---- Pinned Memory ----
 
-    /// Load all agent notes, sorted by section name.
-    pub fn load_notes(&self) -> Result<Vec<(String, String)>> {
+    /// Load all pinned memory entries, sorted by key.
+    pub fn load_pinned(&self) -> Result<Vec<(String, String)>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT section, content FROM agent_notes ORDER BY section")?;
-        let mut notes = Vec::new();
+        let mut stmt = conn.prepare("SELECT key, content FROM pinned_memory ORDER BY key")?;
+        let mut entries = Vec::new();
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
-            notes.push((row.get(0)?, row.get(1)?));
+            entries.push((row.get(0)?, row.get(1)?));
         }
-        Ok(notes)
+        Ok(entries)
     }
 
-    /// Save or update a note section.
-    pub fn save_note(&self, section: &str, content: &str) -> Result<()> {
+    /// Pin a key, overwriting any existing value.
+    pub fn save_pin(&self, key: &str, content: &str) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO agent_notes (section, content, updated_at)
+            "INSERT INTO pinned_memory (key, content, updated_at)
              VALUES (?1, ?2, datetime('now'))
-             ON CONFLICT(section) DO UPDATE SET content = ?2, updated_at = datetime('now')",
-            rusqlite::params![section, content],
+             ON CONFLICT(key) DO UPDATE SET content = ?2, updated_at = datetime('now')",
+            rusqlite::params![key, content],
         )?;
         Ok(())
     }
 
-    /// Delete a note section.
-    pub fn delete_note(&self, section: &str) -> Result<()> {
+    /// Unpin a key.
+    pub fn delete_pin(&self, key: &str) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "DELETE FROM agent_notes WHERE section = ?1",
-            [section],
+            "DELETE FROM pinned_memory WHERE key = ?1",
+            [key],
         )?;
         Ok(())
     }

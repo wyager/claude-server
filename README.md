@@ -286,7 +286,9 @@ Work item types (each has different fields):
 | `ProcessCompleted` | `pid`, `exit_code`, `output_preview` | 7 (default) |
 | `ProcessFailed` | `pid`, `error`, `output_preview` | 8 (default) |
 | `ProcessTimeout` | `pid` | 8 (default) |
-| `ChildAgentCompleted` | `child_id`, `result_memory`, `turns_used`, `success`, `summary` | Set by caller |
+| `ChildAgentCompleted` | `child_name`, `result`, `turns_used`, `success`, `summary` | 7 (default) |
+| `AgentMessage` | `from_agent`, `content` | Set by sender |
+| `ExternalEvent` | `source`, `event_type`, `data` | Set by caller |
 | `Compaction` | `description` | 10 |
 
 The work queue display is truncated to fit in context:
@@ -457,9 +459,6 @@ history.add("Summary text to insert as a new history entry")
 ```python
 # Send a text message to a user
 send_message(chat_id="81d4", content="I see a white van in the driveway!")
-
-# Send an image to a user
-send_image(chat_id="81d4", image=frame_data, caption="Driveway camera")
 ```
 
 #### Process Management
@@ -495,27 +494,36 @@ processes_list()         # Returns [(pid, cmd, description, status), ...]
 #### Sub-agents
 
 ```python
-# Spawn a child agent to handle a task in parallel
-spawn_agent(
-    task="Summarize the API documentation at /tmp/api-docs.md",
-    model="claude-sonnet-4-5-20250929",   # Optional, defaults to parent's model
-    memory={"file_path": "/tmp/api-docs.md"},  # Seed memory for the child
-    max_turns=20,                          # Max turns before forced stop (max 50)
-    priority=6                             # Priority of the ChildAgentCompleted work item
-)
+# Spawn child agents to handle tasks in parallel
+fork([
+    ChildSettings(
+        name="summarizer",                        # Globally unique name
+        task="Summarize /tmp/api-docs.md",
+        model="claude-sonnet-4-5-20250929",       # Optional, inherits parent's model
+        max_turns=20,
+        attach=["/tmp/api-docs.md"],              # Files attached on child's first turn
+    ),
+])
 ```
 
-Children have full `shell_exec` support (own ProcessSupervisor + event loop).
+Children inherit the parent's full context (event history + memory) for KV cache reuse.
+They have full `shell_exec` support (own ProcessSupervisor + event loop) and can
+`message_agent(name, content)` to communicate with the parent or siblings.
 Recursion depth is controlled by `child_depth_remaining: u32` in `AgentPermissions`.
 Max 3 concurrent children (`CLAUDE_SERVER_MAX_CHILDREN`).
-When a child finishes, a `ChildAgentCompleted` work item arrives with `result_memory`,
-`turns_used`, `success`, and `summary`.
 
-#### Context Management
+Children call `done(**result)` to exit. The parent receives a `ChildAgentCompleted`
+work item with `child_name`, `result` (the kwargs dict passed to `done()`), `turns_used`,
+`success`, and `summary`.
+
+#### Attachments (images and large files)
 
 ```python
-# Add data to be shown in the next turn's context (e.g. images)
-show_in_context(data)
+# Queue a file to appear in NEXT turn's context
+attach("/var/frigate/clips/front_door.jpg")
+# Image files (.jpg/.jpeg/.png/.gif/.webp) → vision blocks the model can see
+# Any other file → text block with file contents
+# Ephemeral: visible for exactly one turn, not saved to history
 
 # Standard output is captured and shown in history
 print("This appears in the history output")
@@ -893,14 +901,14 @@ Claude checks the camera:
   "id": "toolu_01E",
   "name": "execute",
   "input": {
-    "code": "frames = camera_tool.get_interesting_frames(\n    camera=\"driveway\",\n    max_frames=5,\n    from_time=\"2026-02-01 08:35:41\",\n    to_time=\"2026-02-01 08:36:11\")\nshow_in_context(frames)\nwork_queue.pop_front()"
+    "code": "path = camera_tool.get_interesting_frame(\n    camera=\"driveway\",\n    from_time=\"2026-02-01 08:35:41\",\n    to_time=\"2026-02-01 08:36:11\")\nattach(path)\nwork_queue.pop_front()"
   }
 }
 ```
 
-This is executed. `camera_tool.get_interesting_frames()` runs synchronously and returns
-frame data. `show_in_context(frames)` tells the harness to include the frames in the
-next turn's context (as image content blocks in the API call).
+This is executed. The deployment-specific `camera_tool.get_interesting_frame()` runs
+synchronously and returns a file path to the saved frame. `attach(path)` queues that
+image to appear as a vision content block on the **next** turn's API call.
 Recorded as history entry `d7ea`.
 
 
@@ -957,16 +965,14 @@ output:
 <entry id="d7ea">
 time: 2026-02-01 08:36:13 PST
 code:
-  frames = camera_tool.get_interesting_frames(
+  path = camera_tool.get_interesting_frame(
       camera="driveway",
-      max_frames=5,
       from_time="2026-02-01 08:35:41",
       to_time="2026-02-01 08:36:11")
-  show_in_context(frames)
+  attach(path)
   work_queue.pop_front()
 output:
-  1 frame:
-  {embedded image}
+  Saved frame to /tmp/driveway-083542.jpg
 </entry>
 </event_history>
 <work_queue>
@@ -1367,10 +1373,11 @@ How should Claude be able to customize its interpreter environment?
 Options: pip install support, pre-loaded deployment-specific packages,
 or a fixed set of standard library only.
 
-### Image handling
-How are images (e.g. camera frames from `show_in_context()`) embedded in the
-API call? They would be `image` content blocks in the user message, which
-costs tokens. Need to decide on resolution limits, max images per turn, etc.
+### ~~Image handling~~
+**RESOLVED**: `attach(path)` queues a file for the next turn. Extension sniffing
+decides: image → base64 vision content block, anything else → text block. Text
+attachments are capped at 64KB. The rendered text context goes first, attachments
+second, to preserve KV cache prefix. No per-turn count limit.
 
 
 ## Implementation

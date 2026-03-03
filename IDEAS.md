@@ -18,9 +18,9 @@ with `block_for` instead.
 
 ## Agent Capabilities
 
-- ~~**Self-improvement**~~: DONE (partial) — `notes.set(section, content)` lets the agent write persistent notes stored in SQLite. Notes are injected into the system prompt (cached). Agent accumulates environment facts, error recovery playbooks, user preferences, workflow recipes across sessions. Custom Python functions not implemented (kept runtime stable).
+- ~~**Self-improvement**~~: DONE (partial) — `memory.pin(key, content)` writes persistent string entries to SQLite and injects them into the system prompt (cached). Agent accumulates environment facts, error recovery playbooks, user preferences, workflow recipes across sessions. `memory.get()` reads through both local and pinned tiers. Custom Python functions not implemented (kept runtime stable).
 
-- ~~**Sub-agents**~~: DONE — `fork([ChildSettings(...)])` spawns children that inherit parent context. Named agent registry with lineage tracking. Inter-agent messaging via `message_agent(name, content)`. Explicit `done()` to exit. `ChildAgentCompleted` work item with `child_name`, `result_memory`, clear finish reason.
+- ~~**Sub-agents**~~: DONE — `fork([ChildSettings(...)])` spawns children that inherit parent context. Named agent registry with lineage tracking. Inter-agent messaging via `message_agent(name, content)`. `done(**result)` exits and passes the kwargs dict to the parent. `ChildAgentCompleted` work item with `child_name`, `result`, clear finish reason.
 
 - ~~**Child process support**~~: DONE — Children now have full `shell_exec` via the unified `AgentLoop` in `agent_loop.rs`, with their own ProcessSupervisor + event loop. `child_depth_remaining: u32` controls recursion depth.
 

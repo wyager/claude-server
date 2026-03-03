@@ -271,7 +271,7 @@ impl AgentLoop {
         // Render context
         let lineage_str = format_lineage(&self.permissions.lineage);
         // Load pinned memory from DB (shared across agents, injected into system prompt)
-        let pinned = self.db.load_notes().unwrap_or_default();
+        let pinned = self.db.load_pinned().unwrap_or_default();
         let pinned_snapshot: HashMap<String, String> = pinned.iter().cloned().collect();
         let pinned_summary = if pinned.is_empty() {
             None
@@ -1056,12 +1056,12 @@ impl AgentLoop {
 
         // Pinned memory (shared, cached in system prompt)
         for (key, content) in effects.memory_pins {
-            if let Err(e) = self.db.save_note(&key, &content) {
+            if let Err(e) = self.db.save_pin(&key, &content) {
                 eprintln!("[{}] Failed to pin '{}': {}", self.name, key, e);
             }
         }
         for key in effects.memory_unpins {
-            if let Err(e) = self.db.delete_note(&key) {
+            if let Err(e) = self.db.delete_pin(&key) {
                 eprintln!("[{}] Failed to unpin '{}': {}", self.name, key, e);
             }
         }

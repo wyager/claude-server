@@ -141,7 +141,7 @@ Watcher scripts can `curl -X POST "$CLAUDE_SERVER_EVENT_URL" ...` to send events
 back to the agent without hardcoding the listen address.
 
 **Pinned memory (self-improving system prompt)**: `memory.pin(key, content)` writes
-to a shared SQLite tier (`agent_notes` table) and injects into the system prompt
+to a shared SQLite tier (`pinned_memory` table) and injects into the system prompt
 (cached via `cache_control: ephemeral`). Shared across all agents and sessions.
 `memory.get(k)` checks local first, then pinned. `memory.unpin(k)`, `memory.list_pinned()`.
 Pinned entries are strings (render as markdown in the system prompt). Pinned size is

@@ -48,7 +48,7 @@ The agent's Python code sees these objects:
 | Object | Type | Source |
 |--------|------|--------|
 | `work_queue` | `PyWorkQueue` | Snapshot of `state.work_queue` |
-| `memory` | `PyMemory` | Clone of `state.memory` (dict-like, supports priorities) |
+| `memory` | `PyMemory` | Clone of `state.memory` + pinned snapshot (two-tier store) |
 | `timers` | `PyTimerManager` | Timer metadata from `state.timer_manager` |
 | `history` | `PyHistoryManager` | History entries from `state.event_history` |
 | `send_message(chat_id, content)` | function | From `_harness.send_message` |
@@ -56,23 +56,42 @@ The agent's Python code sees these objects:
 | `shell_status(pid)` | function | From `_harness.shell_status` |
 | `shell_output(pid)` | function | From `_harness.shell_output` |
 | `shell_kill(pid)` | function | From `_harness.shell_kill` |
-| `show_in_context(data)` | function | From `_harness.show_in_context` |
+| `attach(path)` | function | Queue a file for next turn's context (image → vision) |
+| `fork([ChildSettings(...)])` | function | Spawn child agents |
+| `message_agent(name, content)` | function | Inter-agent messaging |
+| `done(**result)` | function | Exit, passing `result` dict to parent |
+| `agent_name`, `agent_lineage` | str | Identity strings |
+| `ChildSettings` | dataclass | `name`, `task`, `model`, `max_turns`, `can_compact`, `attach` |
 | `timedelta`, `datetime` | classes | From Python's `datetime` module |
 
 In compaction mode, `compact()` and `compaction_script` are also available.
 
-### Memory Priorities
+### Memory: two tiers
 
-`PyMemory` supports priority-based ordering via three additional methods:
+**Local tier** — per-agent, in `state.memory` + `state.memory_priorities`:
 
-- `memory.set(key, value, priority=N)` — set a key with an explicit priority (0-10)
-- `memory.set_priority(key, N)` — change the priority of an existing key
-- `memory.get_priority(key)` — read the current priority of a key
+- `memory[k] = v` / `memory.set(k, v, priority=N)` — any JSON type
+- `memory.set_priority(k, N)`, `memory.get_priority(k)`
+- Higher priority → rendered first in `<agent_state>`, survives truncation
 
-Priorities are stored in `state.memory_priorities` (a separate `HashMap<String, u8>`)
-and are backwards compatible — keys without an explicit priority default to 5.
-Higher-priority keys are rendered first in the `<agent_state>` context block and
-are less likely to be truncated when the render limit is hit.
+**Pinned tier** — shared across all agents, stored in SQLite (`pinned_memory` table),
+injected into the system prompt (cached via `cache_control: ephemeral`):
+
+- `memory.pin(k, v)` — `v` must be a string
+- `memory.unpin(k)`, `memory.list_pinned()`
+- `memory.get(k)` checks local first, then falls back to pinned
+- `k in memory` is true if in either tier
+
+Pins/unpins flow through `SideEffectCollector.memory_pins`/`memory_unpins` and
+`agent_loop.rs` writes them to SQLite via `db.save_pin()`/`db.delete_pin()`.
+
+### WorkItem field access
+
+`PyWorkItem` has fixed fields `id`, `priority`, `time`, `type`, plus a
+`fields: serde_json::Map` populated from the `WorkItemType` variant. `__getattr__`
+looks up in `fields` — field names match the Rust struct field names exactly.
+Wrong-field access raises `AttributeError` listing available fields. See
+`work_item_to_py()` in `python.rs` for the single source of truth.
 
 The convenience functions (`send_message`, `shell_exec`, etc.) are created
 by the preamble, which assigns `_harness.method_name` to top-level names.
