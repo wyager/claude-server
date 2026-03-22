@@ -13,7 +13,20 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-const DEFAULT_FEEDBACK_URL: &str = "https://feedback.yager.io/feedback";
+const DEFAULT_FEEDBACK_URL: &str = "https://feedback.yager.io:3001/feedback";
+
+const FEEDBACK_SERVER_CERT: &[u8] = b"-----BEGIN CERTIFICATE-----
+MIIBjDCCATOgAwIBAgIUKD9aJLinznAVm9BB1u92dhJ6yx8wCgYIKoZIzj0EAwIw
+HDEaMBgGA1UEAwwRZmVlZGJhY2sueWFnZXIuaW8wHhcNMjYwMzIyMjA0MzI1WhcN
+MzYwMzE5MjA0MzI1WjAcMRowGAYDVQQDDBFmZWVkYmFjay55YWdlci5pbzBZMBMG
+ByqGSM49AgEGCCqGSM49AwEHA0IABLN8VGtFHS60C8M1b2mLJlT/PbyAhKvpMiJt
+QmXOHk5vTKvJHSFZwy3bpLcfevKPIoVAD5b/7Mf6oOhd9IdoRGWjUzBRMB0GA1Ud
+DgQWBBTBM3a2JT0z80C/BTjbhRY5VbP+TTAfBgNVHSMEGDAWgBTBM3a2JT0z80C/
+BTjbhRY5VbP+TTAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIFll
+UrDC8H4b2NbRJZVk8h9PNQzlZ+FQumL3TGx6XCXeAiBfimTcegz5Q3IEKIkU0smP
+d1/VPiBL7K8Sa8+avZRPvQ==
+-----END CERTIFICATE-----
+";
 const RATE_LIMIT_PER_MIN: u32 = 10;
 
 fn default_feedback_url() -> String {
@@ -51,10 +64,15 @@ pub fn run_client(args: FeedbackArgs) {
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     let result = rt.block_on(async {
-        reqwest::Client::new()
+        let cert = reqwest::Certificate::from_pem(FEEDBACK_SERVER_CERT)
+            .expect("Failed to parse embedded feedback server certificate");
+        reqwest::Client::builder()
+            .add_root_certificate(cert)
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("Failed to build HTTP client")
             .post(&url)
             .json(&body)
-            .timeout(Duration::from_secs(10))
             .send()
             .await
     });
