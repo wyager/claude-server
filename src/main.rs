@@ -13,7 +13,6 @@ mod renderer;
 mod source_dump;
 mod types;
 
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use std::path::PathBuf;
@@ -48,7 +47,7 @@ fn main() {
             println!();
             println!("Environment variables:");
             println!("  ANTHROPIC_API_KEY             API key (required for daemon)");
-            println!("  CLAUDE_SERVER_MODEL            Model name (default: claude-opus-4-5-20251101)");
+            println!("  CLAUDE_SERVER_MODEL            Model name (default: claude-opus-4-6)");
             println!("  CLAUDE_SERVER_LISTEN           API listen address (default: 127.0.0.1:3000)");
             println!("  CLAUDE_SERVER_DB               SQLite path (default: claude-server.db)");
             println!("  CLAUDE_SERVER_SYSTEM_PROMPT     System prompt file (default: system_prompt.txt)");
@@ -228,32 +227,18 @@ fn spawn_local_chat(
     event_tx: mpsc::UnboundedSender<core_loop::HarnessEvent>,
     mut broadcast_rx: broadcast::Receiver<BroadcastMsg>,
 ) {
-    // Outbound: agent → stdout
+    // Outbound: agent → stdout. Prompt is printed on the `idle` status broadcast
+    // so it always lands after the agent loop's own "Idle, waiting..." log line.
     tokio::spawn(async move {
-        let mut stdout = std::io::stdout();
-        let mut showing_status = false;
         loop {
             match broadcast_rx.recv().await {
                 Ok(BroadcastMsg::Message { chat_id, content, .. }) if chat_id == LOCAL_CHAT_ID => {
-                    if showing_status {
-                        write!(stdout, "\r\x1b[K").ok();
-                        showing_status = false;
-                    }
-                    println!("\n{}\n", content);
-                    prompt();
+                    println!("\n\x1b[1;36m── claude ──────────────────────\x1b[0m");
+                    println!("{}", content);
+                    println!("\x1b[1;36m────────────────────────────────\x1b[0m");
                 }
-                Ok(BroadcastMsg::Status { status }) => {
-                    if status == "idle" {
-                        if showing_status {
-                            write!(stdout, "\r\x1b[K").ok();
-                            stdout.flush().ok();
-                            showing_status = false;
-                        }
-                    } else {
-                        write!(stdout, "\r\x1b[K[{}...]", status).ok();
-                        stdout.flush().ok();
-                        showing_status = true;
-                    }
+                Ok(BroadcastMsg::Status { status }) if status == "idle" => {
+                    prompt();
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -264,7 +249,6 @@ fn spawn_local_chat(
 
     // Inbound: stdin → agent
     tokio::spawn(async move {
-        prompt();
         let stdin = BufReader::new(tokio::io::stdin());
         let mut lines = stdin.lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -290,6 +274,7 @@ fn spawn_local_chat(
 }
 
 fn prompt() {
-    print!("> ");
+    use std::io::Write;
+    print!("\x1b[1;32m> \x1b[0m");
     std::io::stdout().flush().ok();
 }

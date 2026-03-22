@@ -5,8 +5,15 @@
 ### Built-in Local Chat
 - Default launch now includes a stdin/stdout chat interface (chat_id `"local"`).
   Wired directly to the in-process `event_tx`/`broadcast_tx` channels — no HTTP hop.
-  Shows `[thinking...]`/`[executing...]` status inline. Pass `--daemon` to suppress.
-  Stdin EOF triggers graceful shutdown.
+  Agent replies rendered in a cyan-bordered box; prompt is green `> `. Pass `--daemon`
+  to suppress. Stdin EOF triggers graceful shutdown.
+- All agent-loop log lines now render in dim gray (`dimlog!` macro, agent_loop.rs)
+  so they're visually distinct from chat output. `[message] -> chat:...` log now
+  truncates content to first line / 60 chars instead of duplicating full reply.
+- Default model bumped to `claude-opus-4-6`.
+- Default `CLAUDE_SERVER_CONTEXT_WINDOW` bumped 200k → 1M. Compaction thresholds
+  (`compact_at` = 80%, `compact_target` = 50%) derive proportionally so they scale
+  automatically.
 
 ### Bundled Subcommands + Source Self-Dump
 - `claude-server source [--extract DIR]` dumps an embedded tarball of the harness

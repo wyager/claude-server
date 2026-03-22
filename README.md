@@ -143,7 +143,7 @@ Each turn is a single API call. The harness constructs the request as follows:
 
 ```json
 {
-  "model": "claude-opus-4-5-20251101",
+  "model": "claude-opus-4-6",
   "max_tokens": 16384,
   "system": [
     {
@@ -177,7 +177,7 @@ Each turn is a single API call. The harness constructs the request as follows:
 }
 ```
 
-The model is configurable (default: `claude-opus-4-5-20251101`).
+The model is configurable (default: `claude-opus-4-6`).
 
 ### Why tool_use Instead of Raw Text
 
@@ -1465,12 +1465,12 @@ All endpoints have CORS enabled (permissive).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ANTHROPIC_API_KEY` | (required) | Anthropic API key |
-| `CLAUDE_SERVER_MODEL` | `claude-opus-4-5-20251101` | Model to use |
+| `CLAUDE_SERVER_MODEL` | `claude-opus-4-6` | Model to use |
 | `CLAUDE_SERVER_LISTEN` | `127.0.0.1:3000` | API listen address |
 | `CLAUDE_SERVER_DB` | `claude-server.db` | SQLite database path |
 | `CLAUDE_SERVER_SYSTEM_PROMPT` | `system_prompt.txt` | System prompt file |
 | `CLAUDE_SERVER_DEPLOYMENT_CONTEXT` | (none) | Deployment context file |
-| `CLAUDE_SERVER_CONTEXT_WINDOW` | `200000` | Model context window size |
+| `CLAUDE_SERVER_CONTEXT_WINDOW` | `1000000` | Model context window size |
 | `CLAUDE_SERVER_MAX_TOKENS` | `16384` | Max output tokens per turn |
 | `CLAUDE_SERVER_PYTHON_TIMEOUT` | `5` | Python script execution timeout (seconds) |
 | `CLAUDE_SERVER_MAX_CHILDREN` | `3` | Max concurrent sub-agent children |

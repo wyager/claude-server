@@ -18,6 +18,23 @@ use crate::python;
 use crate::renderer;
 use crate::types::*;
 
+/// Dim-gray log line, visually distinct from chat output.
+macro_rules! dimlog {
+    ($($arg:tt)*) => {
+        ::std::println!("\x1b[2m{}\x1b[0m", format_args!($($arg)*))
+    };
+}
+
+fn truncate_for_log(s: &str, max: usize) -> String {
+    let first = s.lines().next().unwrap_or("");
+    let truncated: String = first.chars().take(max).collect();
+    if truncated.len() < first.len() || s.contains('\n') {
+        format!("{}…", truncated)
+    } else {
+        truncated
+    }
+}
+
 /// Why an agent's run loop ended.
 pub enum FinishReason {
     /// Agent called done() explicitly.
@@ -143,7 +160,7 @@ impl AgentLoop {
     }
 
     pub async fn run(&mut self) -> FinishReason {
-        println!("[{}] Agent loop started", self.name);
+        dimlog!("[{}] Agent loop started", self.name);
         let mut idle = false;
         let mut finish_reason = FinishReason::Shutdown; // default
 
@@ -159,8 +176,8 @@ impl AgentLoop {
                 && !self.compaction.active
                 && CompactionManager::should_trigger(&self.state, self.config.compact_at)
             {
-                println!(
-                    "[{}] Triggering compaction (input_tokens {} > threshold {})",
+                dimlog!(
+                   "[{}] Triggering compaction (input_tokens {} > threshold {})",
                     self.name, self.state.last_input_tokens, self.config.compact_at
                 );
                 self.compaction
@@ -171,7 +188,7 @@ impl AgentLoop {
             // completions, timer fires). Agents exit explicitly via done().
             if self.state.work_queue.is_empty() {
                 if !idle {
-                    println!("[{}] Idle, waiting for events...", self.name);
+                    dimlog!("[{}] Idle, waiting for events...", self.name);
                     idle = true;
                     self.broadcast(BroadcastMsg::Status {
                         status: "idle".to_string(),
@@ -192,13 +209,13 @@ impl AgentLoop {
                     event = self.event_rx.recv() => {
                         match event {
                             Some(HarnessEvent::Shutdown) => {
-                                println!("[{}] Shutdown requested", self.name);
+                                dimlog!("[{}] Shutdown requested", self.name);
                                 finish_reason = FinishReason::Shutdown;
                                 break;
                             }
                             Some(event) => self.apply_event(event),
                             None => {
-                                println!("[{}] Event channel closed, shutting down", self.name);
+                                dimlog!("[{}] Event channel closed, shutting down", self.name);
                                 finish_reason = FinishReason::ChannelClosed;
                                 break;
                             }
@@ -216,8 +233,8 @@ impl AgentLoop {
             // Check max_turns limit
             if let Some(max) = self.permissions.max_turns {
                 if self.turn_counter >= max {
-                    println!(
-                        "[{}] Max turns ({}) reached, exiting",
+                    dimlog!(
+                       "[{}] Max turns ({}) reached, exiting",
                         self.name, max
                     );
                     finish_reason = FinishReason::MaxTurns(max);
@@ -228,7 +245,7 @@ impl AgentLoop {
             // Run a turn
             match self.run_turn().await {
                 Ok(true) => {
-                    println!("[{}] done() called, exiting", self.name);
+                    dimlog!("[{}] done() called, exiting", self.name);
                     finish_reason = FinishReason::Done;
                     break;
                 }
@@ -300,8 +317,8 @@ impl AgentLoop {
             attachments,
         );
 
-        println!(
-            "[{}] Rendered context: {} chars, queue: {} items, attachments: {}",
+        dimlog!(
+           "[{}] Rendered context: {} chars, queue: {} items, attachments: {}",
             self.name,
             rendered.text.len(),
             self.state.work_queue.len(),
@@ -316,8 +333,8 @@ impl AgentLoop {
         // Call Claude API
         let api_result = self.api_client.call(&rendered, &pinned).await?;
 
-        println!(
-            "[{}] API response: {} input tokens, {} output tokens (cache: {} created, {} read)",
+        dimlog!(
+           "[{}] API response: {} input tokens, {} output tokens (cache: {} created, {} read)",
             self.name,
             api_result.input_tokens,
             api_result.output_tokens,
@@ -371,15 +388,15 @@ impl AgentLoop {
         let stdout = exec_result.stdout.clone();
         let mut error_text = exec_result.error_text.clone();
 
-        println!(
-            "[{}] Executed (error={}): {}",
+        dimlog!(
+           "[{}] Executed (error={}): {}",
             self.name,
             is_error,
             &api_result.code.lines().next().unwrap_or("(empty)")
         );
 
         if !stdout.is_empty() {
-            print!("[stdout] {}", stdout);
+            print!("\x1b[2m[stdout] {}\x1b[0m", stdout);
         }
 
         // Apply side effects (only if no error)
@@ -449,7 +466,7 @@ impl AgentLoop {
             .timer_manager
             .check_and_fire(now, &mut self.state.id_generator);
         for item in fired {
-            println!("[{}] Timer fired: {}", self.name, item.id);
+            dimlog!("[{}] Timer fired: {}", self.name, item.id);
             self.state.work_queue.push(item);
         }
     }
@@ -462,8 +479,8 @@ impl AgentLoop {
                 content,
             } => {
                 let id = self.state.id_generator.next();
-                println!(
-                    "[{}] User message from {}: {} (id={})",
+                dimlog!(
+                   "[{}] User message from {}: {} (id={})",
                     self.name,
                     user,
                     &content[..content.len().min(50)],
@@ -559,8 +576,8 @@ impl AgentLoop {
             } => {
                 self.active_children = self.active_children.saturating_sub(1);
                 let id = self.state.id_generator.next();
-                println!(
-                    "[{}] Child agent {} completed (success={}, turns={})",
+                dimlog!(
+                   "[{}] Child agent {} completed (success={}, turns={})",
                     self.name, child_name, success, turns_used
                 );
 
@@ -592,8 +609,8 @@ impl AgentLoop {
                 priority,
             } => {
                 let id = self.state.id_generator.next();
-                println!(
-                    "[{}] Agent message from {}: {}",
+                dimlog!(
+                   "[{}] Agent message from {}: {}",
                     self.name,
                     from,
                     &content[..content.len().min(50)]
@@ -612,8 +629,8 @@ impl AgentLoop {
                 priority,
             } => {
                 let id = self.state.id_generator.next();
-                println!(
-                    "[{}] External event from {}: {} (id={})",
+                dimlog!(
+                   "[{}] External event from {}: {} (id={})",
                     self.name, source, event_type, id
                 );
                 self.state.work_queue.push(WorkItem {
@@ -887,8 +904,8 @@ impl AgentLoop {
                 let child_depth = self.permissions.child_depth_remaining.saturating_sub(1);
                 let model = child_settings.model.unwrap_or_else(|| self.config.model.clone());
 
-                println!(
-                    "[{}] Forking child '{}' (model={}, max_turns={}, depth_remaining={})",
+                dimlog!(
+                   "[{}] Forking child '{}' (model={}, max_turns={}, depth_remaining={})",
                     self.name, child_name_str, model, max_turns, child_depth
                 );
 
@@ -1028,8 +1045,8 @@ impl AgentLoop {
             ) {
                 Ok(true) => {} // delivered
                 Ok(false) => {
-                    println!(
-                        "[{}] Message to '{}' dropped (agent completed)",
+                    dimlog!(
+                       "[{}] Message to '{}' dropped (agent completed)",
                         self.name, msg.recipient
                     );
                 }
@@ -1041,7 +1058,11 @@ impl AgentLoop {
 
         // Outbound messages
         for msg in effects.messages {
-            println!("[message] -> chat:{} | {}", msg.chat_id, msg.content);
+            dimlog!(
+                "[message] -> chat:{} | {}",
+                msg.chat_id,
+                truncate_for_log(&msg.content, 60)
+            );
             if let Ok(id) = self.db.save_outbound_message(&msg.chat_id, &msg.content) {
                 self.broadcast(BroadcastMsg::Message {
                     chat_id: msg.chat_id,
@@ -1071,7 +1092,7 @@ impl AgentLoop {
             self.compaction.script.push_str(&append);
         }
         if effects.compact_called && self.compaction.active {
-            println!("[{}] Compaction executed", self.name);
+            dimlog!("[{}] Compaction executed", self.name);
             let compact_result = python::execute_with_timeout(
                 &self.state,
                 &self.compaction.script,
@@ -1129,7 +1150,7 @@ impl AgentLoop {
                 }
 
                 self.compaction.complete();
-                println!("[{}] Compaction complete", self.name);
+                dimlog!("[{}] Compaction complete", self.name);
             }
         }
 
@@ -1211,8 +1232,8 @@ async fn run_child_agent_loop(
         FinishReason::ChannelClosed => (false, "Parent disconnected".to_string()),
     };
 
-    println!(
-        "[{}] Finished (success={}, turns={}, reason={})",
+    dimlog!(
+       "[{}] Finished (success={}, turns={}, reason={})",
         child_name, final_success, turns_used, final_summary
     );
 

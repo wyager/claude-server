@@ -132,7 +132,7 @@ where
 
 /// Parse `--api-url` from args, consuming it. Returns (api_url, remaining_args).
 pub fn parse_api_url(args: &[String]) -> (String, Vec<String>) {
-    let mut api_url = std::env::var("CLAUDE_SERVER_API_URL")
+    let mut api_url = std::env::var("CLAUDE_SERVER_BRIDGE_API")
         .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
     let mut rest = Vec::new();
     let mut i = 0;
