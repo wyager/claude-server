@@ -23,7 +23,7 @@ pub fn run(args: &[String]) {
             println!("Each bridge owns one conversation (chat_id = \"<type>:<peer>\").");
             println!();
             println!("Bridge types:");
-            println!("  stdio     Read stdin, print agent replies to stdout (scaffold example)");
+            println!("  stdio     CLI chat over HTTP (connect to a headless daemon)");
             println!("  signal    Relay via signal-cli (requires signal-cli installed + linked)");
             println!("  telegram  Relay via Telegram Bot API (long-polling, no webhook)");
             println!("  slack     Relay via Slack Socket Mode (no public callback URL)");

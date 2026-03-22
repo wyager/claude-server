@@ -51,6 +51,7 @@ pub struct SideEffectCollector {
     pub agent_messages: Vec<AgentMessageRequest>,
     pub compaction_script_appends: Vec<String>,
     pub compact_called: bool,
+    pub compaction_requested: bool,
     pub done_called: bool,
     pub done_result: HashMap<String, serde_json::Value>,
     pub memory_pins: Vec<(String, String)>,    // (key, content) — written to pinned_memory table, cached in system prompt
@@ -671,6 +672,11 @@ impl PyHarness {
         Ok(())
     }
 
+    fn request_compaction(&self) -> PyResult<()> {
+        self.collector.lock().unwrap().compaction_requested = true;
+        Ok(())
+    }
+
     /// Fork child agents. Takes a list of ChildSettings objects.
     fn fork<'py>(
         &self,
@@ -819,6 +825,7 @@ shell_output = _harness.shell_output
 shell_kill = _harness.shell_kill
 processes_list = _harness.processes_list
 acknowledge_timer = _harness.acknowledge_timer
+request_compaction = _harness.request_compaction
 attach = _harness.attach
 fork = _harness.fork
 message_agent = _harness.message_agent
@@ -1644,6 +1651,15 @@ assert isinstance(harness_bin, str) and len(harness_bin) > 0
         );
         assert!(!result.is_error, "Error: {}", result.error_text);
         assert!(!result.stdout.trim().is_empty());
+    }
+
+    #[test]
+    fn test_request_compaction() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        let result = execute(&state, "request_compaction()", false, &HashMap::new());
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert!(result.side_effects.compaction_requested);
     }
 
     #[test]

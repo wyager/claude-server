@@ -201,18 +201,13 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
 
     if let Some(rx) = local_chat_rx {
         println!("Invoke with `--daemon` to run headless without this chat interface.");
+        println!("Attach another CLI chat: claude-server bridge stdio --api-url http://{}", config.listen_addr);
         println!("HTTP API also available at http://{}", config.listen_addr);
         println!();
         spawn_local_chat(event_tx.clone(), rx);
     } else {
-        println!("Send messages with:");
-        println!(
-            "  curl -X POST http://{}/message -H 'Content-Type: application/json' \\",
-            config.listen_addr
-        );
-        println!("    -d '{{\"user\":\"you@example.com\",\"content\":\"Hello Claude!\"}}'");
-        println!();
-        println!("Or start the chat UI with: claude-server chat");
+        println!("CLI chat:  claude-server bridge stdio --api-url http://{}", config.listen_addr);
+        println!("Web UI:    claude-server chat --api-url http://{}", config.listen_addr);
         println!();
     }
 

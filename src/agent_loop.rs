@@ -1088,6 +1088,16 @@ impl AgentLoop {
             }
         }
 
+        // Agent-requested compaction (e.g. scheduled via timer)
+        if effects.compaction_requested
+            && self.permissions.can_compact
+            && !self.compaction.active
+        {
+            dimlog!("[{}] Compaction requested by agent", self.name);
+            self.compaction
+                .trigger(&mut self.state, self.config.compact_target);
+        }
+
         // Compaction script
         for append in effects.compaction_script_appends {
             self.compaction.script.push_str(&append);

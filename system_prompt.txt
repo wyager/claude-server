@@ -406,6 +406,10 @@ Store important long-term information in `memory` rather than relying on history
 
 ### Compaction
 
+You can trigger compaction on demand with `request_compaction()`. Useful for
+scheduled housekeeping — e.g. a daily timer that calls `request_compaction()` at
+a quiet hour. The harness also triggers it automatically when context nears the limit.
+
 When you see a Compaction work item (priority 10), you must compact your context:
 
 1. Build up the `compaction_script` variable by appending Python code to it

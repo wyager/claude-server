@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-03-22
+
+### CLI chat over HTTP + `request_compaction()`
+- `bridge stdio` is now a proper CLI chat client: same cyan-box rendering and
+  idle-status prompt timing as the built-in chat, but connects over HTTP/SSE.
+  Use it to attach to a headless daemon (e.g. systemd service). Uses
+  `chat_id="local"` so it's the same conversation as the built-in chat.
+- Headless daemon startup banner now points at `claude-server bridge stdio`
+  and `claude-server chat` instead of the raw curl example.
+- `request_compaction()` Python function lets the agent trigger compaction on
+  demand (e.g. from a scheduled timer). Previously compaction was threshold-only.
+
 ## 2026-03-21 (later)
 
 ### New Bridges: Telegram, Slack, Discord
