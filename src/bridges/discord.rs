@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use clap::Args;
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -7,63 +8,24 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const INTENTS: u32 = (1 << 9) | (1 << 15); // GUILD_MESSAGES | MESSAGE_CONTENT
 
-pub fn run(args: &[String]) {
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        print_help();
-        return;
-    }
+#[derive(Args)]
+pub struct DiscordArgs {
+    /// Bot token (enable MESSAGE CONTENT intent in the developer portal)
+    #[arg(long)]
+    pub token: String,
+    /// Channel ID (enable Developer Mode, right-click channel)
+    #[arg(long)]
+    pub channel: String,
+    #[command(flatten)]
+    pub api: super::ApiUrl,
+}
 
-    let (api_url, rest) = super::parse_api_url(args);
-    let mut token = None;
-    let mut channel = None;
-    let mut i = 0;
-    while i < rest.len() {
-        match rest[i].as_str() {
-            "--token" => {
-                token = rest.get(i + 1).cloned();
-                i += 2;
-            }
-            "--channel" => {
-                channel = rest.get(i + 1).cloned();
-                i += 2;
-            }
-            other => {
-                eprintln!("Unknown argument: {}", other);
-                print_help();
-                std::process::exit(1);
-            }
-        }
-    }
-
-    let token = token.unwrap_or_else(|| {
-        eprintln!("--token is required");
-        std::process::exit(1);
-    });
-    let channel = channel.unwrap_or_else(|| {
-        eprintln!("--channel is required");
-        std::process::exit(1);
-    });
-
+pub fn run(args: DiscordArgs) {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-    if let Err(e) = rt.block_on(run_async(api_url, token, channel)) {
+    if let Err(e) = rt.block_on(run_async(args.api.api_url, args.token, args.channel)) {
         eprintln!("[discord bridge] error: {:#}", e);
         std::process::exit(1);
     }
-}
-
-fn print_help() {
-    println!("Usage: claude-server bridge discord --token TOKEN --channel ID [OPTIONS]");
-    println!();
-    println!("Relay Discord messages via the Gateway websocket.");
-    println!("Create a bot at https://discord.com/developers/applications, enable the");
-    println!("MESSAGE CONTENT intent, and invite it to your server.");
-    println!();
-    println!("Options:");
-    println!("  --token TOKEN      Bot token");
-    println!("  --channel ID       Channel ID (enable Developer Mode, right-click channel)");
-    println!("  --api-url URL      Claude Server API URL (default: http://127.0.0.1:3000)");
-    println!();
-    println!("chat_id will be \"discord:<channel>\".");
 }
 
 async fn run_async(api_url: String, token: String, channel: String) -> Result<()> {

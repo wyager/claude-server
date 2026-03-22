@@ -5,22 +5,13 @@ use futures::StreamExt;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+use super::ApiUrl;
+
 const CHAT_ID: &str = "local";
 
-pub fn run(args: &[String]) {
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Usage: claude-server bridge stdio [--api-url URL]");
-        println!();
-        println!("CLI chat: reads lines from stdin, prints agent replies to stdout.");
-        println!("Connects to a running daemon over HTTP (chat_id = \"local\", same");
-        println!("conversation as the daemon's built-in chat).");
-        return;
-    }
-
-    let (api_url, _) = super::parse_api_url(args);
-
+pub fn run(args: ApiUrl) {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-    if let Err(e) = rt.block_on(run_async(api_url)) {
+    if let Err(e) = rt.block_on(run_async(args.api_url)) {
         eprintln!("[stdio bridge] error: {:#}", e);
         std::process::exit(1);
     }

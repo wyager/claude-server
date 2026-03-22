@@ -2,11 +2,11 @@ mod agent_loop;
 mod api_client;
 mod bridges;
 mod chat;
-mod feedback;
 mod compaction;
 mod config;
 mod core_loop;
 mod db;
+mod feedback;
 mod http_server;
 mod process;
 mod python;
@@ -14,59 +14,80 @@ mod renderer;
 mod source_dump;
 mod types;
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use std::path::PathBuf;
-
 use anyhow::Result;
+use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{broadcast, mpsc};
 
 use http_server::BroadcastMsg;
 use types::TokenAccumulator;
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
+const ENV_HELP: &str = "\
+Environment variables:
+  ANTHROPIC_API_KEY                 API key (required for daemon)
+  CLAUDE_SERVER_MODEL               Model name (default: claude-opus-4-6)
+  CLAUDE_SERVER_LISTEN              API listen address (default: 127.0.0.1:3000)
+  CLAUDE_SERVER_DB                  SQLite path (default: claude-server.db)
+  CLAUDE_SERVER_SYSTEM_PROMPT       System prompt file (default: system_prompt.txt)
+  CLAUDE_SERVER_DEPLOYMENT_CONTEXT  Deployment context file
+  CLAUDE_SERVER_FEEDBACK_URL        Feedback server URL (default: https://feedback.yager.io/feedback)";
 
-    match args.get(1).map(|s| s.as_str()) {
-        Some("chat") => chat::run_chat_server(&args[2..]),
-        Some("source") => source_dump::run(&args[2..]),
-        Some("bridge") => bridges::run(&args[2..]),
-        Some("feedback") => feedback::run_client(&args[2..]),
-        Some("feedback-server") => feedback::run_server(&args[2..]),
-        Some("--help") | Some("-h") => {
-            println!("Usage: claude-server [OPTIONS] [COMMAND]");
-            println!();
-            println!("Commands:");
-            println!("  (default)   Start the agent daemon with a stdin/stdout chat");
-            println!("  chat        Start the chat web UI");
-            println!("  source      Dump embedded harness source tarball (--extract DIR)");
-            println!("  bridge      Start a messaging bridge (stdio, signal, telegram, slack, discord)");
-            println!("  feedback    Send a harness bug report to the feedback server");
-            println!("  feedback-server  Run the feedback collection server");
-            println!();
-            println!("Options (daemon mode):");
-            println!("  --daemon              Run headless (no stdin/stdout chat)");
-            println!("  --dump-turns          Print the full context and agent response each turn");
-            println!("  --dump-dir <path>     Write turn dumps to files in <path> (parent + children)");
-            println!();
-            println!("Environment variables:");
-            println!("  ANTHROPIC_API_KEY             API key (required for daemon)");
-            println!("  CLAUDE_SERVER_MODEL            Model name (default: claude-opus-4-6)");
-            println!("  CLAUDE_SERVER_LISTEN           API listen address (default: 127.0.0.1:3000)");
-            println!("  CLAUDE_SERVER_DB               SQLite path (default: claude-server.db)");
-            println!("  CLAUDE_SERVER_SYSTEM_PROMPT     System prompt file (default: system_prompt.txt)");
-            println!("  CLAUDE_SERVER_DEPLOYMENT_CONTEXT Deployment context file");
-        }
-        _ => {
-            let dump_turns = args.iter().any(|a| a == "--dump-turns");
-            let daemon = args.iter().any(|a| a == "--daemon");
-            let dump_dir = args
-                .windows(2)
-                .find(|w| w[0] == "--dump-dir")
-                .map(|w| PathBuf::from(&w[1]));
+#[derive(Parser)]
+#[command(
+    name = "claude-server",
+    about = "Long-running persistent Claude agent harness",
+    after_help = ENV_HELP,
+    args_conflicts_with_subcommands = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Run headless (no stdin/stdout chat)
+    #[arg(long)]
+    daemon: bool,
+
+    /// Print the full context and agent response each turn
+    #[arg(long)]
+    dump_turns: bool,
+
+    /// Write turn dumps to files in <path> (parent + children)
+    #[arg(long, value_name = "PATH")]
+    dump_dir: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Start the chat web UI
+    Chat(chat::ChatArgs),
+    /// Dump embedded harness source tarball
+    Source(source_dump::SourceArgs),
+    /// Start a messaging bridge
+    Bridge {
+        #[command(subcommand)]
+        bridge: bridges::BridgeCmd,
+    },
+    /// Send a harness bug report to the feedback server
+    Feedback(feedback::FeedbackArgs),
+    /// Run the feedback collection server
+    FeedbackServer(feedback::ServerArgs),
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Command::Chat(a)) => chat::run_chat_server(a),
+        Some(Command::Source(a)) => source_dump::run(a),
+        Some(Command::Bridge { bridge }) => bridges::run(bridge),
+        Some(Command::Feedback(a)) => feedback::run_client(a),
+        Some(Command::FeedbackServer(a)) => feedback::run_server(a),
+        None => {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-            if let Err(e) = rt.block_on(run_daemon(dump_turns, dump_dir, !daemon)) {
+            if let Err(e) = rt.block_on(run_daemon(cli.dump_turns, cli.dump_dir, !cli.daemon)) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }

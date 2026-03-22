@@ -70,7 +70,7 @@ impl CoreLoop {
     ) -> Self {
         // Register root agent in the registry
         registry
-            .register("root".to_string(), vec!["root".to_string()], event_tx.clone())
+            .register("root".to_string(), event_tx.clone())
             .expect("Failed to register root agent");
 
         let permissions = AgentPermissions {

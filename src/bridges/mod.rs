@@ -5,37 +5,44 @@ mod stdio;
 mod telegram;
 
 use anyhow::{Context, Result};
+use clap::{Args, Subcommand};
 use futures::StreamExt;
 use serde_json::json;
 use tokio::sync::mpsc;
 
-pub fn run(args: &[String]) {
-    match args.first().map(String::as_str) {
-        Some("stdio") => stdio::run(&args[1..]),
-        Some("signal") => signal::run(&args[1..]),
-        Some("telegram") => telegram::run(&args[1..]),
-        Some("slack") => slack::run(&args[1..]),
-        Some("discord") => discord::run(&args[1..]),
-        Some("--help") | Some("-h") | None => {
-            println!("Usage: claude-server bridge <TYPE> [OPTIONS]");
-            println!();
-            println!("Relay messages between an external service and the claude-server HTTP API.");
-            println!("Each bridge owns one conversation (chat_id = \"<type>:<peer>\").");
-            println!();
-            println!("Bridge types:");
-            println!("  stdio     CLI chat over HTTP (connect to a headless daemon)");
-            println!("  signal    Relay via signal-cli (requires signal-cli installed + linked)");
-            println!("  telegram  Relay via Telegram Bot API (long-polling, no webhook)");
-            println!("  slack     Relay via Slack Socket Mode (no public callback URL)");
-            println!("  discord   Relay via Discord Gateway websocket");
-            println!();
-            println!("Run 'claude-server bridge <TYPE> --help' for type-specific options.");
-        }
-        Some(other) => {
-            eprintln!("Unknown bridge type: {}", other);
-            eprintln!("Run 'claude-server bridge --help' for the list.");
-            std::process::exit(1);
-        }
+fn default_api_url() -> String {
+    std::env::var("CLAUDE_SERVER_BRIDGE_API")
+        .unwrap_or_else(|_| "http://127.0.0.1:3000".into())
+}
+
+#[derive(Args)]
+pub struct ApiUrl {
+    /// Claude Server API URL (env: CLAUDE_SERVER_BRIDGE_API)
+    #[arg(long, default_value_t = default_api_url())]
+    pub api_url: String,
+}
+
+#[derive(Subcommand)]
+pub enum BridgeCmd {
+    /// CLI chat over HTTP (connect to a headless daemon)
+    Stdio(ApiUrl),
+    /// Relay via signal-cli (requires signal-cli installed + linked)
+    Signal(signal::SignalArgs),
+    /// Relay via Telegram Bot API (long-polling, no webhook)
+    Telegram(telegram::TelegramArgs),
+    /// Relay via Slack Socket Mode (no public callback URL)
+    Slack(slack::SlackArgs),
+    /// Relay via Discord Gateway websocket
+    Discord(discord::DiscordArgs),
+}
+
+pub fn run(cmd: BridgeCmd) {
+    match cmd {
+        BridgeCmd::Stdio(a) => stdio::run(a),
+        BridgeCmd::Signal(a) => signal::run(a),
+        BridgeCmd::Telegram(a) => telegram::run(a),
+        BridgeCmd::Slack(a) => slack::run(a),
+        BridgeCmd::Discord(a) => discord::run(a),
     }
 }
 
@@ -139,22 +146,3 @@ where
     }
 }
 
-/// Parse `--api-url` from args, consuming it. Returns (api_url, remaining_args).
-pub fn parse_api_url(args: &[String]) -> (String, Vec<String>) {
-    let mut api_url = std::env::var("CLAUDE_SERVER_BRIDGE_API")
-        .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
-    let mut rest = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--api-url" {
-            if let Some(v) = args.get(i + 1) {
-                api_url = v.clone();
-                i += 2;
-                continue;
-            }
-        }
-        rest.push(args[i].clone());
-        i += 1;
-    }
-    (api_url, rest)
-}

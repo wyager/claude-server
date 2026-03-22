@@ -1,76 +1,31 @@
 use anyhow::{Context, Result};
+use clap::Args;
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-pub fn run(args: &[String]) {
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        print_help();
-        return;
-    }
+#[derive(Args)]
+pub struct SlackArgs {
+    /// App-level token (xapp-..., needs connections:write scope)
+    #[arg(long)]
+    pub app_token: String,
+    /// Bot user token (xoxb-..., needs chat:write + channels:history)
+    #[arg(long)]
+    pub bot_token: String,
+    /// Channel ID (e.g. C0123456789)
+    #[arg(long)]
+    pub channel: String,
+    #[command(flatten)]
+    pub api: super::ApiUrl,
+}
 
-    let (api_url, rest) = super::parse_api_url(args);
-    let mut app_token = None;
-    let mut bot_token = None;
-    let mut channel = None;
-    let mut i = 0;
-    while i < rest.len() {
-        match rest[i].as_str() {
-            "--app-token" => {
-                app_token = rest.get(i + 1).cloned();
-                i += 2;
-            }
-            "--bot-token" => {
-                bot_token = rest.get(i + 1).cloned();
-                i += 2;
-            }
-            "--channel" => {
-                channel = rest.get(i + 1).cloned();
-                i += 2;
-            }
-            other => {
-                eprintln!("Unknown argument: {}", other);
-                print_help();
-                std::process::exit(1);
-            }
-        }
-    }
-
-    let app_token = app_token.unwrap_or_else(|| {
-        eprintln!("--app-token is required (xapp-...)");
-        std::process::exit(1);
-    });
-    let bot_token = bot_token.unwrap_or_else(|| {
-        eprintln!("--bot-token is required (xoxb-...)");
-        std::process::exit(1);
-    });
-    let channel = channel.unwrap_or_else(|| {
-        eprintln!("--channel is required (channel ID like C0123...)");
-        std::process::exit(1);
-    });
-
+pub fn run(args: SlackArgs) {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-    if let Err(e) = rt.block_on(run_async(api_url, app_token, bot_token, channel)) {
+    if let Err(e) = rt.block_on(run_async(args.api.api_url, args.app_token, args.bot_token, args.channel)) {
         eprintln!("[slack bridge] error: {:#}", e);
         std::process::exit(1);
     }
-}
-
-fn print_help() {
-    println!("Usage: claude-server bridge slack --app-token TOKEN --bot-token TOKEN --channel ID [OPTIONS]");
-    println!();
-    println!("Relay Slack messages via Socket Mode (no public callback URL needed).");
-    println!("Create a Slack app with Socket Mode enabled, subscribe to message.channels events,");
-    println!("and add the bot to your channel.");
-    println!();
-    println!("Options:");
-    println!("  --app-token TOKEN  App-level token (xapp-..., needs connections:write scope)");
-    println!("  --bot-token TOKEN  Bot user token (xoxb-..., needs chat:write + channels:history)");
-    println!("  --channel ID       Channel ID (e.g. C0123456789)");
-    println!("  --api-url URL      Claude Server API URL (default: http://127.0.0.1:3000)");
-    println!();
-    println!("chat_id will be \"slack:<channel>\".");
 }
 
 async fn run_async(api_url: String, app_token: String, bot_token: String, channel: String) -> Result<()> {

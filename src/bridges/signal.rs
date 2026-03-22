@@ -1,81 +1,30 @@
 use anyhow::{Context, Result};
+use clap::Args;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-pub fn run(args: &[String]) {
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        print_help();
-        return;
-    }
+#[derive(Args)]
+pub struct SignalArgs {
+    /// Your linked Signal account (E.164, e.g. +15551234567)
+    #[arg(long)]
+    pub account: String,
+    /// The peer to relay with (E.164)
+    #[arg(long)]
+    pub peer: String,
+    /// Path to signal-cli binary
+    #[arg(long, default_value = "signal-cli")]
+    pub signal_cli: String,
+    #[command(flatten)]
+    pub api: super::ApiUrl,
+}
 
-    let (api_url, rest) = super::parse_api_url(args);
-
-    let mut account = None;
-    let mut peer = None;
-    let mut signal_cli = "signal-cli".to_string();
-    let mut i = 0;
-    while i < rest.len() {
-        match rest[i].as_str() {
-            "--account" => {
-                account = rest.get(i + 1).cloned();
-                i += 2;
-            }
-            "--peer" => {
-                peer = rest.get(i + 1).cloned();
-                i += 2;
-            }
-            "--signal-cli" => {
-                if let Some(v) = rest.get(i + 1) {
-                    signal_cli = v.clone();
-                }
-                i += 2;
-            }
-            other => {
-                eprintln!("Unknown argument: {}", other);
-                print_help();
-                std::process::exit(1);
-            }
-        }
-    }
-
-    let account = match account {
-        Some(a) => a,
-        None => {
-            eprintln!("--account is required");
-            print_help();
-            std::process::exit(1);
-        }
-    };
-    let peer = match peer {
-        Some(p) => p,
-        None => {
-            eprintln!("--peer is required");
-            print_help();
-            std::process::exit(1);
-        }
-    };
-
+pub fn run(args: SignalArgs) {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-    if let Err(e) = rt.block_on(run_async(api_url, account, peer, signal_cli)) {
+    if let Err(e) = rt.block_on(run_async(args.api.api_url, args.account, args.peer, args.signal_cli)) {
         eprintln!("[signal bridge] error: {:#}", e);
         std::process::exit(1);
     }
-}
-
-fn print_help() {
-    println!("Usage: claude-server bridge signal --account PHONE --peer PHONE [OPTIONS]");
-    println!();
-    println!("Relay Signal messages via signal-cli. Requires signal-cli installed and");
-    println!("linked to an account (run `signal-cli link` first).");
-    println!();
-    println!("Options:");
-    println!("  --account PHONE    Your linked Signal account (E.164, e.g. +15551234567)");
-    println!("  --peer PHONE       The peer to relay with (E.164)");
-    println!("  --api-url URL      Claude Server API URL (default: http://127.0.0.1:3000)");
-    println!("  --signal-cli PATH  Path to signal-cli binary (default: signal-cli)");
-    println!();
-    println!("chat_id will be \"signal:<peer>\".");
 }
 
 async fn run_async(

@@ -458,8 +458,6 @@ pub struct ManagedProcess {
     pub env: HashMap<String, String>,
     pub description: String,
     pub status: ProcessStatus,
-    #[serde(with = "duration_secs")]
-    pub alert_timer: Duration,
     pub success_prio: u8,
     pub fail_prio: u8,
     pub started_at: DateTime<Utc>,
@@ -488,35 +486,6 @@ impl ProcessManager {
 
     pub fn get_mut(&mut self, id: &AgentId) -> Option<&mut ManagedProcess> {
         self.processes.iter_mut().find(|p| &p.id == id)
-    }
-
-    #[allow(dead_code)] // TODO: alert_timer feature — never wired into the loop
-    pub fn check_timeouts(
-        &self,
-        now: DateTime<Utc>,
-        id_gen: &mut IdGenerator,
-    ) -> Vec<WorkItem> {
-        let mut alerts = Vec::new();
-
-        for process in &self.processes {
-            if matches!(process.status, ProcessStatus::Running) {
-                let elapsed = now - process.started_at;
-                let alert_dur = chrono::Duration::from_std(process.alert_timer)
-                    .unwrap_or(chrono::Duration::MAX);
-                if elapsed >= alert_dur {
-                    alerts.push(WorkItem {
-                        id: id_gen.next(),
-                        priority: process.fail_prio,
-                        time: now,
-                        item_type: WorkItemType::ProcessTimeout {
-                            pid: process.id.clone(),
-                        },
-                    });
-                }
-            }
-        }
-
-        alerts
     }
 
     pub fn processes(&self) -> &[ManagedProcess] {
@@ -649,8 +618,6 @@ pub struct AgentRegistry {
 }
 
 struct AgentEntry {
-    #[allow(dead_code)]
-    pub lineage: Vec<String>,
     pub event_tx: mpsc::UnboundedSender<crate::core_loop::HarnessEvent>,
     /// True if the agent has completed and deregistered. The name stays in the
     /// registry so siblings can still message it (messages are silently dropped)
@@ -669,7 +636,6 @@ impl AgentRegistry {
     pub fn register(
         &self,
         name: String,
-        lineage: Vec<String>,
         event_tx: mpsc::UnboundedSender<crate::core_loop::HarnessEvent>,
     ) -> Result<(), String> {
         let mut agents = self.agents.lock().unwrap();
@@ -679,7 +645,7 @@ impl AgentRegistry {
             }
             // Completed agents can be replaced (name reuse)
         }
-        agents.insert(name, AgentEntry { lineage, event_tx, completed: false });
+        agents.insert(name, AgentEntry { event_tx, completed: false });
         Ok(())
     }
 
@@ -687,13 +653,13 @@ impl AgentRegistry {
     /// *running* agent, none are registered. Completed agent names can be reused.
     pub fn register_batch(
         &self,
-        entries: Vec<(String, Vec<String>, mpsc::UnboundedSender<crate::core_loop::HarnessEvent>)>,
+        entries: Vec<(String, mpsc::UnboundedSender<crate::core_loop::HarnessEvent>)>,
     ) -> Result<(), String> {
         let mut agents = self.agents.lock().unwrap();
 
         // Check for collisions with running agents
         let mut collisions = Vec::new();
-        for (name, _, _) in &entries {
+        for (name, _) in &entries {
             if let Some(existing) = agents.get(name) {
                 if !existing.completed {
                     collisions.push(name.clone());
@@ -703,7 +669,7 @@ impl AgentRegistry {
 
         // Check for collisions within the batch itself
         let mut seen = std::collections::HashSet::new();
-        for (name, _, _) in &entries {
+        for (name, _) in &entries {
             if !seen.insert(name.clone()) {
                 collisions.push(format!("{} (duplicate in batch)", name));
             }
@@ -717,8 +683,8 @@ impl AgentRegistry {
         }
 
         // All clear — register all
-        for (name, lineage, event_tx) in entries {
-            agents.insert(name, AgentEntry { lineage, event_tx, completed: false });
+        for (name, event_tx) in entries {
+            agents.insert(name, AgentEntry { event_tx, completed: false });
         }
         Ok(())
     }

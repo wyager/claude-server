@@ -7,6 +7,7 @@ use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
+use clap::Args;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -14,60 +15,35 @@ use serde_json::json;
 const DEFAULT_FEEDBACK_URL: &str = "https://feedback.yager.io/feedback";
 const RATE_LIMIT_PER_MIN: u32 = 10;
 
+fn default_feedback_url() -> String {
+    std::env::var("CLAUDE_SERVER_FEEDBACK_URL")
+        .unwrap_or_else(|_| DEFAULT_FEEDBACK_URL.into())
+}
+
 // ---- Client ----
 
-pub fn run_client(args: &[String]) {
-    let mut summary = None;
-    let mut details = None;
-    let mut repro = None;
-    let mut url = std::env::var("CLAUDE_SERVER_FEEDBACK_URL")
-        .unwrap_or_else(|_| DEFAULT_FEEDBACK_URL.to_string());
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--summary" => {
-                summary = args.get(i + 1).cloned();
-                i += 2;
-            }
-            "--details" => {
-                details = args.get(i + 1).cloned();
-                i += 2;
-            }
-            "--repro" => {
-                repro = args.get(i + 1).cloned();
-                i += 2;
-            }
-            "--url" => {
-                if let Some(u) = args.get(i + 1) {
-                    url = u.clone();
-                }
-                i += 2;
-            }
-            "--help" | "-h" => {
-                println!("Usage: claude-server feedback --summary TEXT [--details TEXT] [--repro TEXT] [--url URL]");
-                println!();
-                println!("Send a harness bug report or suggestion to the feedback server.");
-                println!("Default URL: {} (override with CLAUDE_SERVER_FEEDBACK_URL)", DEFAULT_FEEDBACK_URL);
-                println!();
-                println!("DO NOT include private user data — only harness behavior, errors, repro steps.");
-                return;
-            }
-            other => {
-                eprintln!("Unknown argument: {}", other);
-                std::process::exit(1);
-            }
-        }
-    }
+#[derive(Args)]
+pub struct FeedbackArgs {
+    /// Brief summary of the issue
+    #[arg(long)]
+    pub summary: String,
+    /// Longer description
+    #[arg(long)]
+    pub details: Option<String>,
+    /// Reproduction steps
+    #[arg(long)]
+    pub repro: Option<String>,
+    /// Feedback server URL (env: CLAUDE_SERVER_FEEDBACK_URL)
+    #[arg(long, default_value_t = default_feedback_url())]
+    pub url: String,
+}
 
-    let summary = summary.unwrap_or_else(|| {
-        eprintln!("--summary is required");
-        std::process::exit(1);
-    });
-
+pub fn run_client(args: FeedbackArgs) {
+    let url = args.url;
     let body = json!({
-        "summary": summary,
-        "details": details,
-        "repro": repro,
+        "summary": args.summary,
+        "details": args.details,
+        "repro": args.repro,
         "harness_version": env!("CARGO_PKG_VERSION"),
         "agent_name": std::env::var("CLAUDE_SERVER_AGENT_NAME").ok(),
     });
@@ -133,48 +109,23 @@ struct ListQuery {
     since: Option<i64>,
 }
 
-pub fn run_server(args: &[String]) {
-    let mut listen = "0.0.0.0:3001".to_string();
-    let mut db_path = "feedback.db".to_string();
-    let mut admin_token = std::env::var("CLAUDE_SERVER_FEEDBACK_ADMIN_TOKEN").ok();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--listen" => {
-                if let Some(v) = args.get(i + 1) {
-                    listen = v.clone();
-                }
-                i += 2;
-            }
-            "--db" => {
-                if let Some(v) = args.get(i + 1) {
-                    db_path = v.clone();
-                }
-                i += 2;
-            }
-            "--admin-token" => {
-                admin_token = args.get(i + 1).cloned();
-                i += 2;
-            }
-            "--help" | "-h" => {
-                println!("Usage: claude-server feedback-server [--listen ADDR] [--db PATH] [--admin-token TOKEN]");
-                println!();
-                println!("Run the harness feedback collection server.");
-                println!("  POST /feedback         — public, rate-limited (10/min/IP)");
-                println!("  GET  /feedback         — admin-only, requires Bearer token");
-                println!();
-                println!("Defaults: listen 0.0.0.0:3001, db feedback.db");
-                println!("Admin token also read from CLAUDE_SERVER_FEEDBACK_ADMIN_TOKEN.");
-                return;
-            }
-            other => {
-                eprintln!("Unknown argument: {}", other);
-                std::process::exit(1);
-            }
-        }
-    }
+#[derive(Args)]
+pub struct ServerArgs {
+    /// Listen address
+    #[arg(long, default_value = "0.0.0.0:3001")]
+    pub listen: String,
+    /// SQLite database path
+    #[arg(long, default_value = "feedback.db")]
+    pub db: String,
+    /// Admin Bearer token for GET /feedback (env: CLAUDE_SERVER_FEEDBACK_ADMIN_TOKEN)
+    #[arg(long, env = "CLAUDE_SERVER_FEEDBACK_ADMIN_TOKEN")]
+    pub admin_token: Option<String>,
+}
 
-    let conn = Connection::open(&db_path).expect("Failed to open feedback database");
+pub fn run_server(args: ServerArgs) {
+    let listen = args.listen;
+    let admin_token = args.admin_token;
+    let conn = Connection::open(&args.db).expect("Failed to open feedback database");
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS feedback (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

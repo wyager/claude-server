@@ -1,57 +1,25 @@
 use axum::response::Html;
 use axum::routing::get;
 use axum::Router;
+use clap::Args;
 
 static CHAT_HTML: &str = include_str!("chat.html");
 
-pub fn run_chat_server(args: &[String]) {
-    let mut port: u16 = 8080;
-    let mut api_url = "http://127.0.0.1:3000".to_string();
+#[derive(Args)]
+pub struct ChatArgs {
+    /// Port for the chat UI
+    #[arg(short, long, default_value_t = 8080)]
+    pub port: u16,
 
-    // Parse --port and --api-url flags
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--port" | "-p" => {
-                if let Some(val) = args.get(i + 1) {
-                    port = val.parse().unwrap_or_else(|_| {
-                        eprintln!("Invalid port: {}", val);
-                        std::process::exit(1);
-                    });
-                    i += 2;
-                } else {
-                    eprintln!("--port requires a value");
-                    std::process::exit(1);
-                }
-            }
-            "--api-url" | "-a" => {
-                if let Some(val) = args.get(i + 1) {
-                    api_url = val.clone();
-                    i += 2;
-                } else {
-                    eprintln!("--api-url requires a value");
-                    std::process::exit(1);
-                }
-            }
-            "--help" | "-h" => {
-                println!("Usage: claude-server chat [OPTIONS]");
-                println!();
-                println!("Options:");
-                println!("  --port, -p PORT       Port for the chat UI (default: 8080)");
-                println!("  --api-url, -a URL     Claude Server API URL (default: http://127.0.0.1:3000)");
-                println!("  --help, -h            Show this help");
-                std::process::exit(0);
-            }
-            other => {
-                eprintln!("Unknown argument: {}", other);
-                eprintln!("Run 'claude-server chat --help' for usage.");
-                std::process::exit(1);
-            }
-        }
-    }
+    /// Claude Server API URL
+    #[arg(short = 'a', long, default_value = "http://127.0.0.1:3000")]
+    pub api_url: String,
+}
 
-    // Inject API URL into the HTML template
-    let html = CHAT_HTML.replace("{{API_URL}}", &api_url);
+pub fn run_chat_server(args: ChatArgs) {
+    let html = CHAT_HTML.replace("{{API_URL}}", &args.api_url);
+    let port = args.port;
+    let api_url = args.api_url;
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     rt.block_on(async move {

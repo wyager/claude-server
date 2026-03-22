@@ -782,7 +782,6 @@ impl AgentLoop {
                 env: req.env.clone(),
                 description: req.description.clone(),
                 status: ProcessStatus::Running,
-                alert_timer: Duration::from_secs(req.alert_timer_secs),
                 success_prio: req.success_prio,
                 fail_prio: req.fail_prio,
                 started_at: Utc::now(),
@@ -837,7 +836,7 @@ impl AgentLoop {
                     l
                 };
                 let (child_event_tx, child_event_rx) = mpsc::unbounded_channel::<HarnessEvent>();
-                registration_entries.push((child.name.clone(), child_lineage.clone(), child_event_tx.clone()));
+                registration_entries.push((child.name.clone(), child_event_tx.clone()));
                 child_channels.push((child_event_tx, child_event_rx, child_lineage));
             }
 

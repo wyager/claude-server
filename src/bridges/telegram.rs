@@ -1,67 +1,26 @@
 use anyhow::{Context, Result};
+use clap::Args;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-pub fn run(args: &[String]) {
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        print_help();
-        return;
-    }
+#[derive(Args)]
+pub struct TelegramArgs {
+    /// Bot token from @BotFather
+    #[arg(long)]
+    pub token: String,
+    /// Numeric chat ID to relay with (DM the bot, then check getUpdates)
+    #[arg(long)]
+    pub peer: i64,
+    #[command(flatten)]
+    pub api: super::ApiUrl,
+}
 
-    let (api_url, rest) = super::parse_api_url(args);
-    let mut token = None;
-    let mut peer = None;
-    let mut i = 0;
-    while i < rest.len() {
-        match rest[i].as_str() {
-            "--token" => {
-                token = rest.get(i + 1).cloned();
-                i += 2;
-            }
-            "--peer" => {
-                peer = rest.get(i + 1).cloned();
-                i += 2;
-            }
-            other => {
-                eprintln!("Unknown argument: {}", other);
-                print_help();
-                std::process::exit(1);
-            }
-        }
-    }
-
-    let token = token.unwrap_or_else(|| {
-        eprintln!("--token is required");
-        print_help();
-        std::process::exit(1);
-    });
-    let peer: i64 = peer
-        .and_then(|p| p.parse().ok())
-        .unwrap_or_else(|| {
-            eprintln!("--peer is required (numeric Telegram chat ID)");
-            print_help();
-            std::process::exit(1);
-        });
-
+pub fn run(args: TelegramArgs) {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-    if let Err(e) = rt.block_on(run_async(api_url, token, peer)) {
+    if let Err(e) = rt.block_on(run_async(args.api.api_url, args.token, args.peer)) {
         eprintln!("[telegram bridge] error: {:#}", e);
         std::process::exit(1);
     }
-}
-
-fn print_help() {
-    println!("Usage: claude-server bridge telegram --token TOKEN --peer CHAT_ID [OPTIONS]");
-    println!();
-    println!("Relay Telegram messages via the Bot API (long-polling, no webhook needed).");
-    println!();
-    println!("Options:");
-    println!("  --token TOKEN      Bot token from @BotFather");
-    println!("  --peer CHAT_ID     Numeric chat ID to relay with (DM the bot, then");
-    println!("                     check https://api.telegram.org/bot<token>/getUpdates)");
-    println!("  --api-url URL      Claude Server API URL (default: http://127.0.0.1:3000)");
-    println!();
-    println!("chat_id will be \"telegram:<peer>\".");
 }
 
 async fn run_async(api_url: String, token: String, peer: i64) -> Result<()> {
