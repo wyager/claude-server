@@ -169,14 +169,6 @@ impl WorkQueue {
         true
     }
 
-    pub fn pop_front(&mut self) -> Option<WorkItem> {
-        if self.items.is_empty() {
-            None
-        } else {
-            Some(self.items.remove(0))
-        }
-    }
-
     pub fn remove(&mut self, id: &AgentId) -> Option<WorkItem> {
         if let Some(pos) = self.items.iter().position(|item| &item.id == id) {
             Some(self.items.remove(pos))
@@ -207,10 +199,6 @@ impl WorkQueue {
 
     pub fn remove_filter(&mut self, name: &str) {
         self.filters.retain(|f| f.name != name);
-    }
-
-    pub fn filters(&self) -> &[QueueFilter] {
-        &self.filters
     }
 }
 
@@ -287,10 +275,6 @@ impl EventHistory {
 
     pub fn push(&mut self, entry: HistoryEntry) {
         self.entries.push(entry);
-    }
-
-    pub fn get(&self, id: &AgentId) -> Option<&HistoryEntry> {
-        self.entries.iter().find(|e| e.id() == id)
     }
 
     pub fn remove(&mut self, id: &AgentId) -> Option<HistoryEntry> {
@@ -506,6 +490,7 @@ impl ProcessManager {
         self.processes.iter_mut().find(|p| &p.id == id)
     }
 
+    #[allow(dead_code)] // TODO: alert_timer feature — never wired into the loop
     pub fn check_timeouts(
         &self,
         now: DateTime<Utc>,
@@ -578,11 +563,6 @@ impl HarnessState {
         }
     }
 
-    pub fn should_compact(&self) -> bool {
-        let available = self.context_window.saturating_sub(self.max_tokens);
-        let threshold = (available as f64 * 0.8) as u64;
-        self.last_input_tokens > threshold
-    }
 }
 
 // ---- Attachments ----
@@ -669,6 +649,7 @@ pub struct AgentRegistry {
 }
 
 struct AgentEntry {
+    #[allow(dead_code)]
     pub lineage: Vec<String>,
     pub event_tx: mpsc::UnboundedSender<crate::core_loop::HarnessEvent>,
     /// True if the agent has completed and deregistered. The name stays in the
@@ -775,18 +756,6 @@ impl AgentRegistry {
     pub fn exists(&self, name: &str) -> bool {
         self.agents.lock().unwrap().contains_key(name)
     }
-}
-
-// ---- Deployment Plugin ----
-
-pub trait DeploymentPlugin: Send + Sync {
-    fn deployment_context(&self) -> String;
-    fn python_preamble(&self) -> String;
-    fn handle_call(
-        &self,
-        function: &str,
-        args: &serde_json::Value,
-    ) -> Result<serde_json::Value, String>;
 }
 
 // ---- API Types ----

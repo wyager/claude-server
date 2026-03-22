@@ -498,6 +498,7 @@ impl PyTimerManager {
 }
 
 #[pyclass]
+#[derive(Clone)]
 struct PyHistoryEntry {
     code: String,
     output: String,
@@ -534,10 +535,11 @@ struct PyHistoryManager {
 
 #[pymethods]
 impl PyHistoryManager {
-    fn __getitem__(&self, id: &str) -> PyResult<PyRef<'_, PyHistoryEntry>> {
-        Err(pyo3::exceptions::PyKeyError::new_err(format!(
-            "Direct __getitem__ not supported; use history entries by ID"
-        )))
+    fn __getitem__(&self, id: &str) -> PyResult<PyHistoryEntry> {
+        self.entries
+            .get(id)
+            .cloned()
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!("No history entry with id {}", id)))
     }
 
     fn replace_with_description(&self, id: String, description: String) -> PyResult<()> {
@@ -680,7 +682,7 @@ impl PyHarness {
     /// Fork child agents. Takes a list of ChildSettings objects.
     fn fork<'py>(
         &self,
-        py: Python<'py>,
+        _py: Python<'py>,
         children: &Bound<'py, PyAny>,
     ) -> PyResult<Vec<String>> {
         if self.child_depth_remaining == 0 {

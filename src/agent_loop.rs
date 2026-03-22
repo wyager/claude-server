@@ -162,7 +162,7 @@ impl AgentLoop {
     pub async fn run(&mut self) -> FinishReason {
         dimlog!("[{}] Agent loop started", self.name);
         let mut idle = false;
-        let mut finish_reason = FinishReason::Shutdown; // default
+        let finish_reason;
 
         loop {
             // Drain any pending events

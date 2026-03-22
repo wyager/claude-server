@@ -162,16 +162,6 @@ impl Database {
         Ok(messages)
     }
 
-    // ---- Event Log ----
-
-    pub fn log_event(&self, event_type: &str, data: &serde_json::Value) -> Result<()> {
-        let json = serde_json::to_string(data)?;
-        self.conn.lock().unwrap().execute(
-            "INSERT INTO event_log (event_type, data_json) VALUES (?1, ?2)",
-            rusqlite::params![event_type, json],
-        )?;
-        Ok(())
-    }
 
     // ---- Pinned Memory ----
 

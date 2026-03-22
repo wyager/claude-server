@@ -205,6 +205,12 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
                 "error: {}\n",
                 truncate_with_note(error, content_limit)
             ));
+            if let Some(preview) = output_preview {
+                out.push_str("output_preview:\n");
+                for line in preview.lines() {
+                    out.push_str(&format!("  {}\n", line));
+                }
+            }
         }
         WorkItemType::ProcessTimeout { pid } => {
             out.push_str("type: ProcessTimeout\n");

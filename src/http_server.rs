@@ -63,16 +63,6 @@ struct StatusResponse {
     model: String,
 }
 
-#[derive(Deserialize)]
-struct HistoryQuery {
-    limit: Option<usize>,
-}
-
-#[derive(Serialize)]
-struct HistoryResponse {
-    entries: Vec<serde_json::Value>,
-}
-
 // ---- Handlers ----
 
 async fn handle_message(
