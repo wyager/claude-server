@@ -206,7 +206,9 @@ fn build_tls_acceptor(cert_path: &str, key_path: &str) -> tokio_rustls::TlsAccep
         .expect("Failed to read TLS key PEM")
         .expect("No private key found in TLS key PEM");
 
-    let config = ServerConfig::builder()
+    let config = ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("Failed to set TLS protocol versions")
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .expect("Failed to build TLS config (cert/key mismatch?)");
