@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
+use axum::serve::{Listener, ListenerExt};
 use axum::{Json, Router};
 use clap::Args;
 use rusqlite::Connection;
@@ -120,11 +121,19 @@ pub struct ServerArgs {
     /// Admin Bearer token for GET /feedback (env: CLAUDE_SERVER_FEEDBACK_ADMIN_TOKEN)
     #[arg(long, env = "CLAUDE_SERVER_FEEDBACK_ADMIN_TOKEN")]
     pub admin_token: Option<String>,
+    /// Path to TLS certificate PEM file (enables HTTPS when paired with --tls-key)
+    #[arg(long, requires = "tls_key")]
+    pub tls_cert: Option<String>,
+    /// Path to TLS private key PEM file (enables HTTPS when paired with --tls-cert)
+    #[arg(long, requires = "tls_cert")]
+    pub tls_key: Option<String>,
 }
 
 pub fn run_server(args: ServerArgs) {
     let listen = args.listen;
     let admin_token = args.admin_token;
+    let tls_cert = args.tls_cert;
+    let tls_key = args.tls_key;
     let conn = Connection::open(&args.db).expect("Failed to open feedback database");
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS feedback (
@@ -154,23 +163,84 @@ pub fn run_server(args: ServerArgs) {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     rt.block_on(async move {
         let addr: SocketAddr = listen.parse().expect("Invalid listen address");
-        let listener = tokio::net::TcpListener::bind(addr)
+        let tcp_listener = tokio::net::TcpListener::bind(addr)
             .await
             .expect("Failed to bind");
-        println!("Feedback server listening on {}", addr);
+
+        let protocol = if tls_cert.is_some() { "https" } else { "http" };
+        println!("Feedback server listening on {}://{}", protocol, addr);
         println!("  POST /feedback — public, rate-limited ({}/min/IP)", RATE_LIMIT_PER_MIN);
         println!(
             "  GET  /feedback — {}",
             if has_admin { "admin-only (Bearer token)" } else { "disabled (no admin token set)" }
         );
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .unwrap();
+
+        let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
+
+        if let (Some(cert_path), Some(key_path)) = (tls_cert, tls_key) {
+            let tls_acceptor = build_tls_acceptor(&cert_path, &key_path);
+            let listener = TlsListener { inner: tcp_listener, acceptor: tls_acceptor }
+                .tap_io(|_| {});
+            axum::serve(listener, make_service).await.unwrap();
+        } else {
+            axum::serve(tcp_listener, make_service).await.unwrap();
+        }
     });
 }
+
+fn build_tls_acceptor(cert_path: &str, key_path: &str) -> tokio_rustls::TlsAcceptor {
+    use rustls::ServerConfig;
+    use rustls_pemfile::{certs, private_key};
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let cert_file = File::open(cert_path)
+        .unwrap_or_else(|e| panic!("Failed to open TLS cert {}: {}", cert_path, e));
+    let key_file = File::open(key_path)
+        .unwrap_or_else(|e| panic!("Failed to open TLS key {}: {}", key_path, e));
+
+    let certs: Vec<_> = certs(&mut BufReader::new(cert_file))
+        .collect::<Result<_, _>>()
+        .expect("Failed to parse TLS certificate PEM");
+    let key = private_key(&mut BufReader::new(key_file))
+        .expect("Failed to read TLS key PEM")
+        .expect("No private key found in TLS key PEM");
+
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("Failed to build TLS config (cert/key mismatch?)");
+
+    tokio_rustls::TlsAcceptor::from(Arc::new(config))
+}
+
+// TODO WYAGER: check Claude's work
+struct TlsListener {
+    inner: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+}
+
+impl Listener for TlsListener {
+    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.inner.accept().await {
+                Ok((stream, addr)) => match self.acceptor.accept(stream).await {
+                    Ok(tls_stream) => return (tls_stream, addr),
+                    Err(e) => eprintln!("TLS handshake failed from {}: {}", addr, e),
+                },
+                Err(e) => eprintln!("TCP accept error: {}", e),
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+}
+
 
 async fn handle_post(
     State(state): State<ServerState>,
