@@ -16,15 +16,15 @@ use serde_json::json;
 const DEFAULT_FEEDBACK_URL: &str = "https://feedback.yager.io:3001/feedback";
 
 const FEEDBACK_SERVER_CERT: &[u8] = b"-----BEGIN CERTIFICATE-----
-MIIBjDCCATOgAwIBAgIUKD9aJLinznAVm9BB1u92dhJ6yx8wCgYIKoZIzj0EAwIw
-HDEaMBgGA1UEAwwRZmVlZGJhY2sueWFnZXIuaW8wHhcNMjYwMzIyMjA0MzI1WhcN
-MzYwMzE5MjA0MzI1WjAcMRowGAYDVQQDDBFmZWVkYmFjay55YWdlci5pbzBZMBMG
-ByqGSM49AgEGCCqGSM49AwEHA0IABLN8VGtFHS60C8M1b2mLJlT/PbyAhKvpMiJt
-QmXOHk5vTKvJHSFZwy3bpLcfevKPIoVAD5b/7Mf6oOhd9IdoRGWjUzBRMB0GA1Ud
-DgQWBBTBM3a2JT0z80C/BTjbhRY5VbP+TTAfBgNVHSMEGDAWgBTBM3a2JT0z80C/
-BTjbhRY5VbP+TTAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIFll
-UrDC8H4b2NbRJZVk8h9PNQzlZ+FQumL3TGx6XCXeAiBfimTcegz5Q3IEKIkU0smP
-d1/VPiBL7K8Sa8+avZRPvQ==
+MIIBqTCCAU6gAwIBAgIUZ0VsIgxcQoLptYwun/K5gCMtrL8wCgYIKoZIzj0EAwIw
+HDEaMBgGA1UEAwwRZmVlZGJhY2sueWFnZXIuaW8wHhcNMjYwMzIyMjExNjMyWhcN
+MzYwMzE5MjExNjMyWjAcMRowGAYDVQQDDBFmZWVkYmFjay55YWdlci5pbzBZMBMG
+ByqGSM49AgEGCCqGSM49AwEHA0IABI8RsQCiRpfV4eJHTt7TmkN2MOYhcpsPCnpU
+pfDSgooB3gKR0Q5PJjyomIxi+noujmhhEI6OrDyOY9eSlegLDESjbjBsMB0GA1Ud
+DgQWBBQs6qE14l7MxEAES4kfbfpy3g3TFDAfBgNVHSMEGDAWgBQs6qE14l7MxEAE
+S4kfbfpy3g3TFDAMBgNVHRMBAf8EAjAAMBwGA1UdEQQVMBOCEWZlZWRiYWNrLnlh
+Z2VyLmlvMAoGCCqGSM49BAMCA0kAMEYCIQCubcHvBns3YWvBSL1Nks30juoWV5ne
+gBiP4LMic+obyQIhAPwH7LUAe1Wc8d690c2QXKebW29J/QnBjIv8oapAdA7b
 -----END CERTIFICATE-----
 ";
 const RATE_LIMIT_PER_MIN: u32 = 10;
@@ -87,6 +87,13 @@ pub fn run_client(args: FeedbackArgs) {
         }
         Err(e) => {
             eprintln!("Failed to send feedback to {}: {}", url, e);
+            // Print the full cause chain so the agent can see the real error
+            // (e.g. DNS resolution failed, connection refused, TLS handshake error)
+            let mut source = std::error::Error::source(&e);
+            while let Some(cause) = source {
+                eprintln!("  caused by: {}", cause);
+                source = std::error::Error::source(cause);
+            }
             std::process::exit(1);
         }
     }
