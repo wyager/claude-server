@@ -2,6 +2,12 @@
 
 ## 2026-03-21
 
+### Built-in Local Chat
+- Default launch now includes a stdin/stdout chat interface (chat_id `"local"`).
+  Wired directly to the in-process `event_tx`/`broadcast_tx` channels — no HTTP hop.
+  Shows `[thinking...]`/`[executing...]` status inline. Pass `--daemon` to suppress.
+  Stdin EOF triggers graceful shutdown.
+
 ### Bundled Subcommands + Source Self-Dump
 - `claude-server source [--extract DIR]` dumps an embedded tarball of the harness
   source (built at compile time via `git archive HEAD`). Lets the agent inspect

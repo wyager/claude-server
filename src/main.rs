@@ -13,13 +13,16 @@ mod renderer;
 mod source_dump;
 mod types;
 
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use std::path::PathBuf;
 
 use anyhow::Result;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{broadcast, mpsc};
 
+use http_server::BroadcastMsg;
 use types::TokenAccumulator;
 
 fn main() {
@@ -33,12 +36,13 @@ fn main() {
             println!("Usage: claude-server [OPTIONS] [COMMAND]");
             println!();
             println!("Commands:");
-            println!("  (default)   Start the agent daemon");
+            println!("  (default)   Start the agent daemon with a stdin/stdout chat");
             println!("  chat        Start the chat web UI");
             println!("  source      Dump embedded harness source tarball (--extract DIR)");
             println!("  bridge      Start a messaging bridge (stdio, signal, ...)");
             println!();
             println!("Options (daemon mode):");
+            println!("  --daemon              Run headless (no stdin/stdout chat)");
             println!("  --dump-turns          Print the full context and agent response each turn");
             println!("  --dump-dir <path>     Write turn dumps to files in <path> (parent + children)");
             println!();
@@ -52,12 +56,13 @@ fn main() {
         }
         _ => {
             let dump_turns = args.iter().any(|a| a == "--dump-turns");
+            let daemon = args.iter().any(|a| a == "--daemon");
             let dump_dir = args
                 .windows(2)
                 .find(|w| w[0] == "--dump-dir")
                 .map(|w| PathBuf::from(&w[1]));
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-            if let Err(e) = rt.block_on(run_daemon(dump_turns, dump_dir)) {
+            if let Err(e) = rt.block_on(run_daemon(dump_turns, dump_dir, !daemon)) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -65,7 +70,7 @@ fn main() {
     }
 }
 
-async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>) -> Result<()> {
+async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: bool) -> Result<()> {
     let config = Arc::new(config::Config::from_env()?);
 
     println!("Claude Server starting...");
@@ -170,6 +175,8 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>) -> Result<()> {
         let _ = event_tx_for_signal.send(core_loop::HarnessEvent::Shutdown);
     });
 
+    let local_chat_rx = local_chat.then(|| broadcast_tx.subscribe());
+
     // Start HTTP server
     let router = http_server::create_router(
         event_tx.clone(),
@@ -187,15 +194,23 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>) -> Result<()> {
     });
 
     println!("Claude Server ready.\n");
-    println!("Send messages with:");
-    println!(
-        "  curl -X POST http://{}/message -H 'Content-Type: application/json' \\",
-        config.listen_addr
-    );
-    println!("    -d '{{\"user\":\"you@example.com\",\"content\":\"Hello Claude!\"}}'");
-    println!();
-    println!("Or start the chat UI with: claude-server chat");
-    println!();
+
+    if let Some(rx) = local_chat_rx {
+        println!("Invoke with `--daemon` to run headless without this chat interface.");
+        println!("HTTP API also available at http://{}", config.listen_addr);
+        println!();
+        spawn_local_chat(event_tx.clone(), rx);
+    } else {
+        println!("Send messages with:");
+        println!(
+            "  curl -X POST http://{}/message -H 'Content-Type: application/json' \\",
+            config.listen_addr
+        );
+        println!("    -d '{{\"user\":\"you@example.com\",\"content\":\"Hello Claude!\"}}'");
+        println!();
+        println!("Or start the chat UI with: claude-server chat");
+        println!();
+    }
 
     // Run core loop (blocks until shutdown)
     core.run().await?;
@@ -205,4 +220,76 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>) -> Result<()> {
     println!("State saved. Goodbye.");
 
     Ok(())
+}
+
+const LOCAL_CHAT_ID: &str = "local";
+
+fn spawn_local_chat(
+    event_tx: mpsc::UnboundedSender<core_loop::HarnessEvent>,
+    mut broadcast_rx: broadcast::Receiver<BroadcastMsg>,
+) {
+    // Outbound: agent → stdout
+    tokio::spawn(async move {
+        let mut stdout = std::io::stdout();
+        let mut showing_status = false;
+        loop {
+            match broadcast_rx.recv().await {
+                Ok(BroadcastMsg::Message { chat_id, content, .. }) if chat_id == LOCAL_CHAT_ID => {
+                    if showing_status {
+                        write!(stdout, "\r\x1b[K").ok();
+                        showing_status = false;
+                    }
+                    println!("\n{}\n", content);
+                    prompt();
+                }
+                Ok(BroadcastMsg::Status { status }) => {
+                    if status == "idle" {
+                        if showing_status {
+                            write!(stdout, "\r\x1b[K").ok();
+                            stdout.flush().ok();
+                            showing_status = false;
+                        }
+                    } else {
+                        write!(stdout, "\r\x1b[K[{}...]", status).ok();
+                        stdout.flush().ok();
+                        showing_status = true;
+                    }
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    // Inbound: stdin → agent
+    tokio::spawn(async move {
+        prompt();
+        let stdin = BufReader::new(tokio::io::stdin());
+        let mut lines = stdin.lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = line.trim();
+            if line.is_empty() {
+                prompt();
+                continue;
+            }
+            if event_tx
+                .send(core_loop::HarnessEvent::UserMessage {
+                    chat_id: LOCAL_CHAT_ID.to_string(),
+                    user: "local".to_string(),
+                    content: line.to_string(),
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+        // stdin closed → graceful shutdown
+        let _ = event_tx.send(core_loop::HarnessEvent::Shutdown);
+    });
+}
+
+fn prompt() {
+    print!("> ");
+    std::io::stdout().flush().ok();
 }

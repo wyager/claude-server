@@ -8,10 +8,15 @@ make chat     # build, open browser, and run the chat web UI
 make run-dump # run with full context/response dumps each turn
 make build    # build only
 # CLI flags:
+#   --daemon           run headless (no built-in stdin/stdout chat)
 #   --dump-turns       print full context/response to stdout each turn
 #   --dump-dir <path>  write turn dumps to files (parent-001-dump.txt, child-<id>-001-dump.txt)
 #                      dumps include: CONTEXT, RESPONSE, THINKING, and EXECUTION OUTPUT/ERROR
 ```
+
+By default the daemon launches with a built-in stdin/stdout chat (chat_id `"local"`)
+so you can talk to the agent immediately. Pass `--daemon` to suppress it. The HTTP
+API runs either way.
 
 Ctrl+C triggers a graceful shutdown (saves state before exiting).
 
