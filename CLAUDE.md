@@ -59,6 +59,8 @@ See `INTERPRETER.md` for details on the Python integration.
 | `http_server.rs` | Axum HTTP API: POST /message, POST /event, GET /status, GET /messages/:chat_id, GET /messages/:chat_id/stream (SSE), POST /shutdown |
 | `chat.rs` | Chat UI subcommand: serves embedded HTML with API URL injection |
 | `chat.html` | Single-file HTML/CSS/JS chat interface (embedded via include_str!) |
+| `source_dump.rs` | `source` subcommand: dumps/extracts the embedded source tarball |
+| `bridges/` | `bridge` subcommand: messaging relay daemons (stdio, signal). Shared `relay_loop` in mod.rs. |
 | `system_prompt.txt` | System prompt sent to Claude on every API call |
 | `build.rs` | Discovers Python LIBDIR at build time, bakes rpath into binary |
 | `INTERPRETER.md` | How the Python interpreter integration works (PyO3, side effects, etc.) |
@@ -139,6 +141,13 @@ seeds a child's first-turn attachments via the same mechanism.
 `CLAUDE_SERVER_EVENT_URL` in its environment (computed from `Config.listen_addr`).
 Watcher scripts can `curl -X POST "$CLAUDE_SERVER_EVENT_URL" ...` to send events
 back to the agent without hardcoding the listen address.
+
+**Harness subcommands + `harness_bin`**: The binary bundles helper subcommands
+(`source`, `bridge`) that the agent invokes via `shell_exec(cmd=harness_bin, ...)`.
+`harness_bin` is a Python global set from `std::env::current_exe()` each turn.
+`source` dumps an embedded tarball built by `build.rs` via `git archive HEAD`.
+`bridge` runs a relay daemon that connects an external messaging service (Signal,
+stdio, ...) to the existing `/message` + SSE endpoints — one `chat_id` per bridge.
 
 **Pinned memory (self-improving system prompt)**: `memory.pin(key, content)` writes
 to a shared SQLite tier (`pinned_memory` table) and injects into the system prompt

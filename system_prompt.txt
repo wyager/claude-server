@@ -219,6 +219,28 @@ shell_exec(
 
 The event body schema: `{"source": str, "type": str, "data": any JSON, "priority": int (optional, default 5)}`.
 
+### Harness Subcommands
+
+Your own binary path is available as the Python global `harness_bin`. The binary
+has helper subcommands you can invoke via `shell_exec`:
+
+```python
+# Dump this harness's source code (useful for debugging or self-modification)
+shell_exec(cmd=harness_bin, args=["source", "--extract", "/tmp/harness-src"],
+           description="Extract harness source", block_for=timedelta(seconds=2))
+
+# Start a Signal relay bridge (requires signal-cli installed + linked)
+shell_exec(cmd=harness_bin,
+           args=["bridge", "signal", "--account", "+1555...", "--peer", "+1555..."],
+           description="Signal bridge to user",
+           alert_timer=timedelta(hours=24), fail_prio=8)
+```
+
+Run `shell_exec(cmd=harness_bin, args=["--help"])` or `args=["bridge", "--help"]`
+for the full list. Bridges relay messages between an external service and your
+existing `send_message()` / work-queue flow — the chat_id is `"<bridge>:<peer>"`
+(e.g. `"signal:+15551234567"` or `"stdio"`).
+
 ### Sub-agents (fork)
 
 Fork child agents for parallel work. Children inherit your full context (event history

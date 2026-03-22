@@ -574,6 +574,7 @@ struct PyHarness {
     child_depth_remaining: u32,
     agent_name: String,
     agent_lineage: String,
+    harness_bin: String,
 }
 
 #[pymethods]
@@ -772,6 +773,11 @@ impl PyHarness {
     fn agent_lineage(&self) -> &str {
         &self.agent_lineage
     }
+
+    #[getter]
+    fn harness_bin(&self) -> &str {
+        &self.harness_bin
+    }
 }
 
 #[pyclass]
@@ -819,6 +825,7 @@ message_agent = _harness.message_agent
 done = _harness.done
 agent_name = _harness.agent_name
 agent_lineage = _harness.agent_lineage
+harness_bin = _harness.harness_bin
 "#;
 
 const COMPACTION_PREAMBLE: &str = r#"
@@ -1081,6 +1088,9 @@ fn execute_inner(
                 child_depth_remaining,
                 agent_name: agent_name.to_string(),
                 agent_lineage: agent_lineage.to_string(),
+                harness_bin: std::env::current_exe()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "claude-server".into()),
             },
         )?;
         locals.set_item("_harness", harness)?;
@@ -1617,6 +1627,23 @@ print(agent_lineage)
         let lines: Vec<&str> = result.stdout.trim().lines().collect();
         assert_eq!(lines[0], "api-checker");
         assert_eq!(lines[1], "api-checker, child of plan-builder, child of root");
+    }
+
+    #[test]
+    fn test_harness_bin() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        let result = execute(
+            &state,
+            r#"
+print(harness_bin)
+assert isinstance(harness_bin, str) and len(harness_bin) > 0
+"#,
+            false,
+            &HashMap::new(),
+        );
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert!(!result.stdout.trim().is_empty());
     }
 
     #[test]

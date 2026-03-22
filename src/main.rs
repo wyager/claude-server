@@ -1,5 +1,6 @@
 mod agent_loop;
 mod api_client;
+mod bridges;
 mod chat;
 mod compaction;
 mod config;
@@ -9,6 +10,7 @@ mod http_server;
 mod process;
 mod python;
 mod renderer;
+mod source_dump;
 mod types;
 
 use std::sync::{Arc, Mutex};
@@ -25,12 +27,16 @@ fn main() {
 
     match args.get(1).map(|s| s.as_str()) {
         Some("chat") => chat::run_chat_server(&args[2..]),
+        Some("source") => source_dump::run(&args[2..]),
+        Some("bridge") => bridges::run(&args[2..]),
         Some("--help") | Some("-h") => {
             println!("Usage: claude-server [OPTIONS] [COMMAND]");
             println!();
             println!("Commands:");
             println!("  (default)   Start the agent daemon");
             println!("  chat        Start the chat web UI");
+            println!("  source      Dump embedded harness source tarball (--extract DIR)");
+            println!("  bridge      Start a messaging bridge (stdio, signal, ...)");
             println!();
             println!("Options (daemon mode):");
             println!("  --dump-turns          Print the full context and agent response each turn");

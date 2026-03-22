@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-03-21
+
+### Bundled Subcommands + Source Self-Dump
+- `claude-server source [--extract DIR]` dumps an embedded tarball of the harness
+  source (built at compile time via `git archive HEAD`). Lets the agent inspect
+  or modify its own harness.
+- `claude-server bridge <type>` runs a long-lived relay daemon between an external
+  messaging service and the existing `/message` + SSE endpoints. Bridges own one
+  conversation each (`chat_id = "<type>:<peer>"`). Shared `relay_loop` helper in
+  `src/bridges/mod.rs` handles the inbound POST + outbound SSE subscription.
+  - `bridge stdio` — trivial scaffold example (stdin → agent, agent → stdout)
+  - `bridge signal --account N --peer N` — wraps `signal-cli` (external dep)
+- `harness_bin` Python global exposes the running binary's path so the agent can
+  `shell_exec(cmd=harness_bin, args=["source", ...])` without guessing.
+- Core harness (types, core_loop, agent_loop, renderer, db, http_server, process,
+  api_client, compaction, config) untouched.
+
 ## 2026-02-27
 
 ### Attachments (Vision + Large-File Injection)
