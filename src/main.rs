@@ -87,7 +87,12 @@ fn main() {
         Some(Command::FeedbackServer(a)) => feedback::run_server(a),
         None => {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-            if let Err(e) = rt.block_on(run_daemon(cli.dump_turns, cli.dump_dir, !cli.daemon)) {
+            let result = rt.block_on(run_daemon(cli.dump_turns, cli.dump_dir, !cli.daemon));
+            // tokio::io::stdin() uses a blocking thread that can't be cancelled,
+            // so the runtime's Drop would hang waiting for it. shutdown_background
+            // abandons it instead.
+            rt.shutdown_background();
+            if let Err(e) = result {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }

@@ -11,7 +11,9 @@ const CHAT_ID: &str = "local";
 
 pub fn run(args: ApiUrl) {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-    if let Err(e) = rt.block_on(run_async(args.api_url)) {
+    let result = rt.block_on(run_async(args.api_url));
+    rt.shutdown_background(); // don't hang on the uncancellable stdin thread
+    if let Err(e) = result {
         eprintln!("[stdio bridge] error: {:#}", e);
         std::process::exit(1);
     }
