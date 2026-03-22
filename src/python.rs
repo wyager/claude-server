@@ -124,7 +124,7 @@ pub struct ExecutionResult {
 
 type Collector = Arc<Mutex<SideEffectCollector>>;
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 struct PyWorkItem {
     id: String,
@@ -151,21 +151,19 @@ impl PyWorkItem {
         &self.time
     }
 
-    fn __getattr__(&self, name: &str) -> PyResult<PyObject> {
-        Python::with_gil(|py| {
-            if name == "type" {
-                return Ok(self.item_type.as_str().into_pyobject(py)?.into_any().unbind());
-            }
-            match self.fields.get(name) {
-                Some(val) => json_to_py(py, val),
-                None => Err(PyAttributeError::new_err(format!(
-                    "{} work item has no field '{}'. Available fields: {}",
-                    self.item_type,
-                    name,
-                    self.fields.keys().cloned().collect::<Vec<_>>().join(", ")
-                ))),
-            }
-        })
+    fn __getattr__<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Py<PyAny>> {
+        if name == "type" {
+            return Ok(self.item_type.as_str().into_pyobject(py)?.into_any().unbind());
+        }
+        match self.fields.get(name) {
+            Some(val) => json_to_py(py, val),
+            None => Err(PyAttributeError::new_err(format!(
+                "{} work item has no field '{}'. Available fields: {}",
+                self.item_type,
+                name,
+                self.fields.keys().cloned().collect::<Vec<_>>().join(", ")
+            ))),
+        }
     }
 
     fn __repr__(&self) -> String {
@@ -178,7 +176,7 @@ impl PyWorkItem {
 
 /// Convert a serde_json::Value to a Python object via json.loads.
 /// Used for work item field access and memory retrieval.
-fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
+fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAny>> {
     let json_str = serde_json::to_string(value).map_err(|e| {
         pyo3::exceptions::PyValueError::new_err(format!("json serialize error: {}", e))
     })?;
@@ -331,7 +329,7 @@ struct PyMemory {
 
 impl PyMemory {
     /// Convert a serde_json::Value back to a Python object via json.loads
-    fn value_to_py<'py>(py: Python<'py>, value: &serde_json::Value) -> PyResult<PyObject> {
+    fn value_to_py<'py>(py: Python<'py>, value: &serde_json::Value) -> PyResult<Py<PyAny>> {
         let json_str = serde_json::to_string(value).unwrap();
         let json_mod = py.import("json")?;
         Ok(json_mod.call_method1("loads", (json_str,))?.unbind())
@@ -348,7 +346,7 @@ impl PyMemory {
 
 #[pymethods]
 impl PyMemory {
-    fn __getitem__<'py>(&self, py: Python<'py>, key: &str) -> PyResult<PyObject> {
+    fn __getitem__<'py>(&self, py: Python<'py>, key: &str) -> PyResult<Py<PyAny>> {
         let value = self.data.get(key)
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))?;
         Self::value_to_py(py, value)
@@ -378,7 +376,7 @@ impl PyMemory {
     }
 
     #[pyo3(signature = (key, default=None))]
-    fn get<'py>(&self, py: Python<'py>, key: &str, default: Option<PyObject>) -> PyResult<PyObject> {
+    fn get<'py>(&self, py: Python<'py>, key: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
         if let Some(value) = self.data.get(key) {
             return Self::value_to_py(py, value);
         }
@@ -497,7 +495,7 @@ impl PyTimerManager {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 struct PyHistoryEntry {
     code: String,
@@ -691,7 +689,7 @@ impl PyHarness {
             ));
         }
 
-        let list = children.downcast::<pyo3::types::PyList>()
+        let list = children.cast::<pyo3::types::PyList>()
             .map_err(|_| pyo3::exceptions::PyTypeError::new_err("fork() requires a list of ChildSettings"))?;
 
         if list.is_empty() {
@@ -845,7 +843,7 @@ compaction_script = ""
 // ---- Executor ----
 
 pub fn initialize_python() {
-    pyo3::prepare_freethreaded_python();
+    Python::initialize();
 }
 
 /// Execute Python code with a timeout. If `timeout_secs` is 0, no timeout is applied.
@@ -953,7 +951,7 @@ fn execute_inner(
 
     let stdout_buf = Arc::new(Mutex::new(String::new()));
 
-    let result = Python::with_gil(|py| -> PyResult<()> {
+    let result = Python::attach(|py| -> PyResult<()> {
         let globals = PyDict::new(py);
         let locals = PyDict::new(py);
 
@@ -1151,7 +1149,7 @@ fn execute_inner(
             side_effects,
         },
         Err(e) => {
-            let error_text = Python::with_gil(|py| {
+            let error_text = Python::attach(|py| {
                 let tb_str = e
                     .traceback(py)
                     .map(|tb| tb.format().unwrap_or_default())
