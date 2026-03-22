@@ -1,5 +1,8 @@
+mod discord;
 mod signal;
+mod slack;
 mod stdio;
+mod telegram;
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -10,6 +13,9 @@ pub fn run(args: &[String]) {
     match args.first().map(String::as_str) {
         Some("stdio") => stdio::run(&args[1..]),
         Some("signal") => signal::run(&args[1..]),
+        Some("telegram") => telegram::run(&args[1..]),
+        Some("slack") => slack::run(&args[1..]),
+        Some("discord") => discord::run(&args[1..]),
         Some("--help") | Some("-h") | None => {
             println!("Usage: claude-server bridge <TYPE> [OPTIONS]");
             println!();
@@ -19,6 +25,9 @@ pub fn run(args: &[String]) {
             println!("Bridge types:");
             println!("  stdio     Read stdin, print agent replies to stdout (scaffold example)");
             println!("  signal    Relay via signal-cli (requires signal-cli installed + linked)");
+            println!("  telegram  Relay via Telegram Bot API (long-polling, no webhook)");
+            println!("  slack     Relay via Slack Socket Mode (no public callback URL)");
+            println!("  discord   Relay via Discord Gateway websocket");
             println!();
             println!("Run 'claude-server bridge <TYPE> --help' for type-specific options.");
         }

@@ -26,6 +26,9 @@ pub struct ProcessSupervisor {
     /// every spawned process's environment so watcher scripts can POST events
     /// back to the agent without hardcoding the listen address.
     event_url: String,
+    /// Owning agent's name. Injected as CLAUDE_SERVER_AGENT_NAME so spawned
+    /// subcommands (e.g. `feedback`) can auto-tag which agent invoked them.
+    agent_name: String,
 }
 
 impl ProcessSupervisor {
@@ -33,12 +36,14 @@ impl ProcessSupervisor {
         event_tx: mpsc::UnboundedSender<ProcessEvent>,
         db: Arc<Database>,
         event_url: String,
+        agent_name: String,
     ) -> Self {
         Self {
             event_tx,
             db,
             running: Arc::new(Mutex::new(HashMap::new())),
             event_url,
+            agent_name,
         }
     }
 
@@ -52,6 +57,7 @@ impl ProcessSupervisor {
         cmd.args(&request.args);
         // Auto-inject event URL first so agent-supplied env can override it.
         cmd.env("CLAUDE_SERVER_EVENT_URL", &self.event_url);
+        cmd.env("CLAUDE_SERVER_AGENT_NAME", &self.agent_name);
         for (k, v) in &request.env {
             cmd.env(k, v);
         }

@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-03-21 (later)
+
+### New Bridges: Telegram, Slack, Discord
+- `bridge telegram --token T --peer ID` — Bot API long-polling, pure HTTP
+- `bridge slack --app-token T --bot-token T --channel ID` — Socket Mode websocket
+- `bridge discord --token T --channel ID` — Gateway websocket with heartbeat
+- New dep: `tokio-tungstenite` for the two websocket bridges
+
+### Harness Feedback
+- `claude-server feedback --summary "..." [--details ...] [--repro ...]` — agents
+  self-report harness bugs. POSTs to `CLAUDE_SERVER_FEEDBACK_URL` (default
+  `https://feedback.yager.io/feedback`). Auto-fills `harness_version` and
+  `agent_name` (from `CLAUDE_SERVER_AGENT_NAME` env, now injected by
+  ProcessSupervisor alongside `CLAUDE_SERVER_EVENT_URL`).
+- `claude-server feedback-server [--listen] [--db] [--admin-token]` — collection
+  server. `POST /feedback` is public + rate-limited (10/min/IP). `GET /feedback`
+  requires `Authorization: Bearer <admin-token>` — write-only from field agents'
+  perspective, a dev Claude with the token triages.
+
 ## 2026-03-21
 
 ### Built-in Local Chat

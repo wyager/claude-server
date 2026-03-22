@@ -916,6 +916,7 @@ impl AgentLoop {
                     child_process_event_tx,
                     self.db.clone(),
                     format!("http://{}/event", self.config.listen_addr),
+                    child_name_str.clone(),
                 );
 
                 // Forward process events to child's main event channel

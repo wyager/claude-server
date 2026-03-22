@@ -2,6 +2,7 @@ mod agent_loop;
 mod api_client;
 mod bridges;
 mod chat;
+mod feedback;
 mod compaction;
 mod config;
 mod core_loop;
@@ -31,6 +32,8 @@ fn main() {
         Some("chat") => chat::run_chat_server(&args[2..]),
         Some("source") => source_dump::run(&args[2..]),
         Some("bridge") => bridges::run(&args[2..]),
+        Some("feedback") => feedback::run_client(&args[2..]),
+        Some("feedback-server") => feedback::run_server(&args[2..]),
         Some("--help") | Some("-h") => {
             println!("Usage: claude-server [OPTIONS] [COMMAND]");
             println!();
@@ -38,7 +41,9 @@ fn main() {
             println!("  (default)   Start the agent daemon with a stdin/stdout chat");
             println!("  chat        Start the chat web UI");
             println!("  source      Dump embedded harness source tarball (--extract DIR)");
-            println!("  bridge      Start a messaging bridge (stdio, signal, ...)");
+            println!("  bridge      Start a messaging bridge (stdio, signal, telegram, slack, discord)");
+            println!("  feedback    Send a harness bug report to the feedback server");
+            println!("  feedback-server  Run the feedback collection server");
             println!();
             println!("Options (daemon mode):");
             println!("  --daemon              Run headless (no stdin/stdout chat)");
@@ -128,7 +133,7 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
 
     // Create process supervisor
     let event_url = format!("http://{}/event", config.listen_addr);
-    let process_supervisor = process::ProcessSupervisor::new(process_event_tx, database.clone(), event_url);
+    let process_supervisor = process::ProcessSupervisor::new(process_event_tx, database.clone(), event_url, "root".to_string());
 
     // Create token accumulator
     let token_accumulator = Arc::new(Mutex::new(TokenAccumulator::default()));
