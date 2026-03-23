@@ -175,6 +175,19 @@ impl AgentLoop {
                     .trigger(&mut self.state, self.config.compact_target);
             }
 
+            // Drain pending events every iteration — not just when idle —
+            // so Shutdown is honored even when turns are failing in a loop.
+            loop {
+                match self.event_rx.try_recv() {
+                    Ok(HarnessEvent::Shutdown) => {
+                        dimlog!("[{}] Shutdown requested", self.name);
+                        return FinishReason::Shutdown;
+                    }
+                    Ok(event) => self.apply_event(event),
+                    Err(_) => break,
+                }
+            }
+
             // If work queue is empty, wait for events (messages, process
             // completions, timer fires). Agents exit explicitly via done().
             if self.state.work_queue.is_empty() {
@@ -243,7 +256,18 @@ impl AgentLoop {
                 Ok(false) => {}
                 Err(e) => {
                     eprintln!("[{}] Turn error: {}", self.name, e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    // Race the backoff against incoming events so Shutdown
+                    // isn't delayed by the sleep.
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                        ev = self.event_rx.recv() => {
+                            if let Some(HarnessEvent::Shutdown) = ev {
+                                dimlog!("[{}] Shutdown requested", self.name);
+                                return FinishReason::Shutdown;
+                            }
+                            if let Some(ev) = ev { self.apply_event(ev); }
+                        }
+                    }
                 }
             }
 

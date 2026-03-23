@@ -218,12 +218,15 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
         }
     });
 
-    // Graceful shutdown on Ctrl+C
+    // Graceful shutdown on Ctrl+C. Second Ctrl+C force-exits.
     let event_tx_for_signal = event_tx.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
-        println!("\n[signal] Ctrl+C received, shutting down...");
+        println!("\n[signal] Ctrl+C received, shutting down gracefully (press again to force-exit)...");
         let _ = event_tx_for_signal.send(core_loop::HarnessEvent::Shutdown);
+        tokio::signal::ctrl_c().await.ok();
+        println!("\n[signal] Force exit.");
+        std::process::exit(130);
     });
 
     let local_chat_rx = local_chat.then(|| broadcast_tx.subscribe());
