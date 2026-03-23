@@ -753,7 +753,7 @@ pub struct SystemBlock {
     pub cache_control: Option<CacheControl>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CacheControl {
     #[serde(rename = "type")]
     pub control_type: String,
@@ -785,7 +785,11 @@ pub enum ContentBlock {
     #[serde(rename = "thinking")]
     Thinking { thinking: String },
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,

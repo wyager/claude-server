@@ -12,6 +12,9 @@ pub struct CompactionState {
 
 /// The rendered context ready for the API call.
 pub struct RenderedContext {
+    /// Stable prefix: deployment_context + event_history. Append-only across
+    /// turns, so it gets an explicit cache_control breakpoint in the API request.
+    pub stable_prefix: String,
     /// The main text content (the user message).
     pub text: String,
     /// File-path attachments to include as additional content blocks.
@@ -41,25 +44,24 @@ pub fn render_context(
     pinned_summary: PinnedSummary,
     attachments: Vec<Attachment>,
 ) -> RenderedContext {
-    let mut out = String::with_capacity(8192);
+    // Stable prefix: deployment_context + event_history. These are append-only
+    // across turns so they get an explicit cache_control breakpoint.
+    let mut prefix = String::with_capacity(8192);
+    render_deployment_context(&mut prefix, deployment_context);
+    render_event_history(&mut prefix, &state.event_history, config);
 
-    // Deployment context (stable prefix for KV cache)
-    render_deployment_context(&mut out, deployment_context);
+    // Volatile tail: changes every turn, not cached.
+    let mut tail = String::with_capacity(2048);
+    render_agent_state(&mut tail, state, config);
+    render_context_metadata(&mut tail, state, compaction, compact_at, agent, pinned_summary, attachments.len());
+    render_work_queue(&mut tail, &state.work_queue, config);
 
-    // Event history
-    render_event_history(&mut out, &state.event_history, config);
+    // Concatenated view for callers that want a single string (dumps, char counts).
+    let mut text = String::with_capacity(prefix.len() + tail.len());
+    text.push_str(&prefix);
+    text.push_str(&tail);
 
-    // Agent state (memory, timers, processes)
-    render_agent_state(&mut out, state, config);
-
-    // Context metadata
-    render_context_metadata(&mut out, state, compaction, compact_at, agent, pinned_summary, attachments.len());
-
-    // Work queue (last — changes every turn, so placing it at the end
-    // maximizes KV cache reuse for the stable prefix above)
-    render_work_queue(&mut out, &state.work_queue, config);
-
-    RenderedContext { text: out, attachments }
+    RenderedContext { stable_prefix: prefix, text, attachments }
 }
 
 fn render_deployment_context(out: &mut String, deployment_context: &str) {

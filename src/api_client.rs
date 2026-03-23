@@ -44,6 +44,7 @@ fn resolve_attachment(att: &Attachment) -> ContentBlock {
             },
             Err(e) => ContentBlock::Text {
                 text: format!("[attachment read error: {} — {}]", display, e),
+                cache_control: None,
             },
         },
         None => match std::fs::read_to_string(path) {
@@ -58,10 +59,12 @@ fn resolve_attachment(att: &Attachment) -> ContentBlock {
                 }
                 ContentBlock::Text {
                     text: format!("<attachment path=\"{}\">\n{}\n</attachment>", display, text),
+                    cache_control: None,
                 }
             }
             Err(e) => ContentBlock::Text {
                 text: format!("[attachment read error: {} — {}]", display, e),
+                cache_control: None,
             },
         },
     }
@@ -199,21 +202,25 @@ impl ApiClient {
             }),
         }];
 
-        // Build message content. If there are attachments, use block form with
-        // the rendered text first (preserves KV cache prefix) then attachments.
-        // Otherwise, plain text — byte-identical to before, no cache churn.
-        let content = if rendered.attachments.is_empty() {
-            MessageContent::Text(rendered.text.clone())
-        } else {
-            let mut blocks: Vec<ContentBlock> = Vec::with_capacity(rendered.attachments.len() + 1);
-            blocks.push(ContentBlock::Text {
-                text: rendered.text.clone(),
-            });
-            for att in &rendered.attachments {
-                blocks.push(resolve_attachment(att));
-            }
-            MessageContent::Blocks(blocks)
-        };
+        // Build message content as two text blocks: stable_prefix (cached) + tail
+        // (uncached). The prefix is deployment_context + event_history, which only
+        // ever appends — so the cache breakpoint yields high hit rates across turns.
+        let tail = &rendered.text[rendered.stable_prefix.len()..];
+        let mut blocks: Vec<ContentBlock> = Vec::with_capacity(2 + rendered.attachments.len());
+        blocks.push(ContentBlock::Text {
+            text: rendered.stable_prefix.clone(),
+            cache_control: Some(CacheControl {
+                control_type: "ephemeral".to_string(),
+            }),
+        });
+        blocks.push(ContentBlock::Text {
+            text: tail.to_string(),
+            cache_control: None,
+        });
+        for att in &rendered.attachments {
+            blocks.push(resolve_attachment(att));
+        }
+        let content = MessageContent::Blocks(blocks);
 
         let messages = vec![Message {
             role: "user".to_string(),
@@ -279,7 +286,7 @@ impl ApiClient {
             .content
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -320,7 +327,7 @@ mod tests {
 
         let block = resolve_attachment(&Attachment::new(&tmp));
         match block {
-            ContentBlock::Text { text } => {
+            ContentBlock::Text { text, .. } => {
                 assert!(text.contains("<attachment path="));
                 assert!(text.contains(r#"{"camera": "front", "confidence": 0.92}"#));
             }
@@ -364,7 +371,7 @@ mod tests {
     fn test_resolve_attachment_not_found() {
         let block = resolve_attachment(&Attachment::new("/nonexistent/xyz.jpg"));
         match block {
-            ContentBlock::Text { text } => {
+            ContentBlock::Text { text, .. } => {
                 assert!(text.contains("[attachment read error"));
                 assert!(text.contains("/nonexistent/xyz.jpg"));
             }

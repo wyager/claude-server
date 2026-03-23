@@ -333,13 +333,28 @@ impl AgentLoop {
         // Call Claude API
         let api_result = self.api_client.call(&rendered, &pinned).await?;
 
+        let turn_cost = (api_result.input_tokens as f64 * self.config.cost_per_m_input
+            + api_result.output_tokens as f64 * self.config.cost_per_m_output
+            + api_result.cache_creation_tokens as f64 * self.config.cost_per_m_cache_write
+            + api_result.cache_read_tokens as f64 * self.config.cost_per_m_cache_read)
+            / 1_000_000.0;
+        let total_in = api_result.input_tokens
+            + api_result.cache_creation_tokens
+            + api_result.cache_read_tokens;
+        let cache_hit_pct = if total_in > 0 {
+            100.0 * api_result.cache_read_tokens as f64 / total_in as f64
+        } else {
+            0.0
+        };
         dimlog!(
-           "[{}] API response: {} input tokens, {} output tokens (cache: {} created, {} read)",
+            "[{}] API response: in={} out={} cache_write={} cache_read={} | ${:.4}/turn, {:.0}% cache hit",
             self.name,
             api_result.input_tokens,
             api_result.output_tokens,
             api_result.cache_creation_tokens,
-            api_result.cache_read_tokens
+            api_result.cache_read_tokens,
+            turn_cost,
+            cache_hit_pct
         );
 
         // Update token tracking
