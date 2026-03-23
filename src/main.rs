@@ -157,6 +157,7 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
                 priority: 9,
                 time: chrono::Utc::now(),
                 item_type: types::WorkItemType::AgentStartup,
+                attachments: Vec::new(),
             });
             s
         }
@@ -308,6 +309,7 @@ fn spawn_local_chat(
                     chat_id: LOCAL_CHAT_ID.to_string(),
                     user: "local".to_string(),
                     content: line.to_string(),
+                    attachments: Vec::new(),
                 })
                 .is_err()
             {

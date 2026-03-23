@@ -49,6 +49,8 @@ struct MessageRequest {
     chat_id: Option<String>,
     user: String,
     content: String,
+    #[serde(default)]
+    attachments: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -79,6 +81,7 @@ async fn handle_message(
             chat_id: chat_id.clone(),
             user: body.user,
             content: body.content,
+            attachments: body.attachments,
         })
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 

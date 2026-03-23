@@ -36,6 +36,7 @@ impl CompactionManager {
             priority: 10,
             time: chrono::Utc::now(),
             item_type: WorkItemType::Compaction,
+            attachments: Vec::new(),
         });
     }
 
@@ -51,7 +52,7 @@ impl CompactionManager {
     ) -> u64 {
         if self.script.is_empty() {
             let rendered =
-                renderer::render_context(state, deployment_context, None, config, compact_at, None, None, Vec::new());
+                renderer::render_context(state, deployment_context, None, config, compact_at, None, None);
             return (rendered.text.len() as u64) / 4;
         }
 
@@ -81,7 +82,7 @@ impl CompactionManager {
 
         // Re-render and estimate
         let rendered =
-            renderer::render_context(&clone, deployment_context, None, config, compact_at, None, None, Vec::new());
+            renderer::render_context(&clone, deployment_context, None, config, compact_at, None, None);
         (rendered.text.len() as u64) / 4
     }
 

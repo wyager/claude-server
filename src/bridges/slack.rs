@@ -31,7 +31,7 @@ pub fn run(args: SlackArgs) {
 async fn run_async(api_url: String, app_token: String, bot_token: String, channel: String) -> Result<()> {
     let http = reqwest::Client::new();
     let chat_id = format!("slack:{}", channel);
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::unbounded_channel::<super::Inbound>();
 
     // Inbound: Socket Mode websocket with reconnect loop
     let inbound_http = http.clone();
@@ -76,7 +76,7 @@ async fn socket_mode_loop(
     http: &reqwest::Client,
     app_token: &str,
     channel: &str,
-    tx: &mpsc::UnboundedSender<String>,
+    tx: &mpsc::UnboundedSender<super::Inbound>,
 ) -> Result<()> {
     // Get WSS URL
     let open: Value = http
@@ -128,7 +128,7 @@ async fn socket_mode_loop(
                     && event["subtype"].is_null()
                 {
                     if let Some(text) = event["text"].as_str() {
-                        tx.send(text.to_string()).ok();
+                        tx.send(text.to_string().into()).ok();
                     }
                 }
             }

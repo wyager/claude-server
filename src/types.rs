@@ -113,6 +113,12 @@ pub enum WorkItemType {
         event_type: String,
         data: serde_json::Value,
     },
+    /// Request to render file paths as content blocks. The only item type
+    /// whose attachments are emitted as vision/text blocks — and only when
+    /// this item is at the head of the queue. Created by `view()`.
+    View {
+        paths: Vec<String>,
+    },
     Compaction,
     AgentStartup,
 }
@@ -123,6 +129,17 @@ pub struct WorkItem {
     pub priority: u8,
     pub time: DateTime<Utc>,
     pub item_type: WorkItemType,
+    /// File paths associated with this item — rendered as text metadata in
+    /// the queue view, never as content blocks. To actually see a file,
+    /// the agent calls `view(path)` which creates a View item.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
+}
+
+impl WorkItem {
+    pub fn new(id: AgentId, priority: u8, time: DateTime<Utc>, item_type: WorkItemType) -> Self {
+        Self { id, priority, time, item_type, attachments: Vec::new() }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -395,6 +412,7 @@ impl TimerManager {
                                 every: None,
                                 description: timer.description.clone(),
                             },
+                            attachments: Vec::new(),
                         });
                         to_remove.push(timer.id.clone());
                     }
@@ -414,6 +432,7 @@ impl TimerManager {
                                 every: Some(*every),
                                 description: timer.description.clone(),
                             },
+                            attachments: Vec::new(),
                         });
                         // Don't advance next_fire — wait for acknowledge_timer()
                         timer.pending_ack = true;

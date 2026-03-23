@@ -43,6 +43,7 @@ exist on that variant raises `AttributeError` listing the available fields.
 | `ChildAgentCompleted` | `child_name`, `result` (dict from `done(...)`), `turns_used`, `success`, `summary` |
 | `AgentMessage` | `from_agent`, `content` |
 | `ExternalEvent` | `source`, `event_type`, `data` (arbitrary JSON) |
+| `View` | `paths` — files render as content blocks when at head; created by `view()` |
 | `Compaction` | `description` |
 | `AgentStartup` | `description` — harness restarted; your old processes/bridges are dead |
 
@@ -312,9 +313,9 @@ pays full price to re-ingest a context it may not need. With `False`, the child
 starts with just a fork SystemAlert. Memory, `task`, and `attach` still flow —
 seed any needed context through those.
 
-**`attach`**: Seeds the child's first-turn attachments — same semantics as the child
-calling `attach()` before its first turn. Use this to hand a child images or large
-files without burning a turn:
+**`attach`**: Seeds a `View` work item at the head of the child's queue — same
+semantics as the child calling `view()` on turn 1. Use this to hand a child
+images or large files without burning a turn:
 
 ```python
 # Child sees the camera snapshot on turn 1, no wasted roundtrip
@@ -358,33 +359,41 @@ When a child finishes, the parent receives a `ChildAgentCompleted` work item wit
 `send_message()`. Children can fork their own children if `child_depth_remaining > 0`.
 
 
-### Attachments (images and other files)
+### Viewing files (images and other content)
 
 ```python
-attach("/path/to/image.jpg")   # Attach a file to your NEXT turn's context
+view("/path/to/image.jpg", "/path/to/data.json")   # Pushes a View work item
 ```
 
-**How it works**: Pass a filesystem path. On your **next** turn, the file's contents
-appear as a content block alongside your normal context. Image files (`.jpg`, `.jpeg`,
-`.png`, `.gif`, `.webp`) become vision blocks — you can see them. Any other file type
-becomes a text block containing the file contents.
+**How it works**: `view()` pushes a `View` work item at priority 10 (front of
+queue). When a View item is at the **head** of your queue, its paths are
+rendered as content blocks on that turn. Images (`.jpg`, `.jpeg`, `.png`,
+`.gif`, `.webp`) become vision blocks — you can see them. Other files become
+text blocks. Multiple `view()` calls in one turn merge into a single item.
 
-**Ephemeral**: Attachments are visible for exactly **one turn** and then gone. They are
-not saved to history and not persisted. If you need to remember what you saw, write a
-text description to `memory`.
+The content stays visible until you pop the View item, so you can take
+multiple turns to analyze if needed. Pop when done:
 
 ```python
-# Look at a camera snapshot on my next turn
-attach("/var/frigate/clips/front_door_1739.jpg")
-work_queue.pop_front()
+# Turn N: receive a message with an attachment
+item = work_queue[0]
+if item.attachments:
+    view(*item.attachments)   # pushes View at head, renders next turn
+    # don't pop the UserMessage yet — still processing it
 
-# Next turn: I see the image, describe what I observe, store the verdict
+# Turn N+1: View is at head, image is visible
 memory["front_door_1739"] = "delivery driver with package, benign"
+work_queue.pop_front()        # pop the View item
+send_message(chat_id=item.chat_id, content="It's a delivery driver")
+work_queue.remove(item.id)    # done with the original message
 ```
 
-Calling `attach` on a non-existent file raises `FileNotFoundError` immediately
-(the turn fails). This fail-fast behavior prevents wasting a turn waiting for an
-attachment that will never arrive.
+**Attachment metadata**: Work items can carry `attachments` (a list of paths).
+Bridges populate this when they receive files (e.g. Signal images). This is
+just metadata — the paths appear as text in the queue view. To actually *see*
+the files, call `view()` on them.
+
+Calling `view()` on a nonexistent file raises `FileNotFoundError` immediately.
 
 ## Guidelines
 

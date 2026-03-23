@@ -26,12 +26,21 @@
 - New deps: `hmac`, `sha2`, `hex`, `notify`, `rumqttc`, `async-imap`,
   `async-native-tls`.
 
-### Feedback fixes
-- **#14b**: Agent no longer idles with pending attachments — does one more turn
-  to see them. One-line change to the idle condition in `agent_loop.rs`.
-- **#14a**: Signal bridge now includes attachment paths in forwarded messages
-  as `[attachments: /path, ...]`. Parsed from signal-cli's jsonRpc
-  `dataMessage.attachments[].id`.
+### Attachments refactor: `view()` + View work items
+- **Replaces** `attach()` and `AgentLoop.pending_attachments`. `view(*paths)`
+  now pushes a `WorkItemType::View` work item (priority 10). Renderer emits
+  its paths as content blocks only when the View item is at queue head.
+  Content persists until popped — no magic one-turn expiry.
+- **Idle invariant restored**: idle check is back to pure `queue.is_empty()`.
+  The `&& pending_attachments.is_empty()` hack is gone.
+- `WorkItem.attachments: Vec<String>` is new metadata field — paths shown as
+  text in queue view, never auto-rendered. Bridges populate it (e.g. Signal
+  images); agent calls `view()` to promote to content blocks.
+- `ChildSettings.attach` now pushes a View item to the child's queue.
+- `POST /message` accepts `attachments: [...]`; `HarnessEvent::UserMessage`
+  and `relay_loop` thread it through via `Inbound{text, attachments}`.
+- **#14a**: Signal bridge now parses `dataMessage.attachments[].id` and sets
+  the structured `attachments` field instead of appending text.
 - **#13**: `ChildSettings.inherit_history` (default `True`). When `False`,
   child starts with fresh history containing only a fork SystemAlert. Memory,
   `task`, and `attach` still flow. Avoids cross-model re-ingest cost.

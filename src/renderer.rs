@@ -43,8 +43,15 @@ pub fn render_context(
     compact_at: u64,
     agent: Option<&AgentIdentity>,
     pinned_summary: PinnedSummary,
-    attachments: Vec<Attachment>,
 ) -> RenderedContext {
+    // Attachments render only when a View item is at the head of the queue.
+    let attachments: Vec<Attachment> = match state.work_queue.items().first() {
+        Some(WorkItem { item_type: WorkItemType::View { paths }, .. }) => {
+            paths.iter().map(Attachment::new).collect()
+        }
+        _ => Vec::new(),
+    };
+
     // Cached segments at stride-aligned boundaries. Two segments means when
     // the stride advances, the first segment's new content equals the old
     // second segment's content — its cache entry still hits.
@@ -315,6 +322,17 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
                 truncate_with_note(content, content_limit)
             ));
         }
+        WorkItemType::View { paths } => {
+            out.push_str("type: View\n");
+            out.push_str(&format!("paths: {} files\n", paths.len()));
+            for p in paths.iter().take(5) {
+                out.push_str(&format!("  {}\n", p));
+            }
+            if paths.len() > 5 {
+                out.push_str(&format!("  ... +{} more\n", paths.len() - 5));
+            }
+            out.push_str("(content rendered as blocks below when this item is at head)\n");
+        }
         WorkItemType::Compaction => {
             out.push_str("type: Compaction\n");
             out.push_str("description: \"You must compact your context.\"\n");
@@ -323,6 +341,10 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
             out.push_str("type: AgentStartup\n");
             out.push_str("description: \"Harness restarted. Any processes/bridges you were managing are dead — inspect memory and reconnect as needed.\"\n");
         }
+    }
+
+    if !item.attachments.is_empty() {
+        out.push_str(&format!("attachments: [{}]\n", item.attachments.join(", ")));
     }
 
     out.push_str("</work_item>\n");
@@ -651,6 +673,7 @@ mod tests {
                 user: "steve@example.com".to_string(),
                 content: "Hello Claude, could you please keep an eye out for any vehicles coming up the driveway today and let me know if you see a contractor van?".to_string(),
             },
+            attachments: Vec::new(),
         });
 
         state
@@ -660,7 +683,7 @@ mod tests {
     fn test_render_produces_expected_structure() {
         let state = make_test_state();
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "Test deployment.", None, &config, 150_000, None, None, Vec::new());
+        let rendered = render_context(&state, "Test deployment.", None, &config, 150_000, None, None);
 
         assert!(rendered.text.contains("<deployment_context>"));
         assert!(rendered.text.contains("Test deployment."));
@@ -695,7 +718,7 @@ mod tests {
     fn test_render_empty_state() {
         let state = HarnessState::new(200_000, 16384);
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000, None, None, Vec::new());
+        let rendered = render_context(&state, "", None, &config, 150_000, None, None);
 
         assert!(rendered.text.contains("<deployment_context>\n</deployment_context>"));
         assert!(rendered.text.contains("<event_history>\n</event_history>"));
@@ -722,7 +745,7 @@ mod tests {
         let (prev, cur) = state.event_history.cache_splits(config.cache_stride);
         assert_eq!((prev, cur), (10, 20));
 
-        let r1 = render_context(&state, "", None, &config, 150_000, None, None, Vec::new());
+        let r1 = render_context(&state, "", None, &config, 150_000, None, None);
         // Two segments expected: seg1=entries[0..10], seg2=entries[10..20]
         assert_eq!(r1.cached_segments.len(), 2, "expected 2 cached segments");
         // Concatenation invariant: cached segments are a prefix of full text
@@ -737,7 +760,7 @@ mod tests {
             output: big_output.clone(),
             is_error: false,
         });
-        let r2 = render_context(&state, "", None, &config, 150_000, None, None, Vec::new());
+        let r2 = render_context(&state, "", None, &config, 150_000, None, None);
         assert_eq!(r1.cached_segments, r2.cached_segments, "segments must be byte-identical between strides");
 
         // Advance past next stride: push 9 more → total 40, immutable=35, splits=(20,30)
@@ -752,7 +775,7 @@ mod tests {
         }
         let (prev2, cur2) = state.event_history.cache_splits(config.cache_stride);
         assert_eq!((prev2, cur2), (20, 30));
-        let r3 = render_context(&state, "", None, &config, 150_000, None, None, Vec::new());
+        let r3 = render_context(&state, "", None, &config, 150_000, None, None);
         // On stride advance: new seg1 = old (seg1+seg2), so its cache entry still hits
         assert_eq!(
             r3.cached_segments[0],
@@ -775,7 +798,7 @@ mod tests {
             });
         }
         let config = RenderConfig::default();
-        let r = render_context(&state, "", None, &config, 150_000, None, None, Vec::new());
+        let r = render_context(&state, "", None, &config, 150_000, None, None);
         // Tiny segments should be merged/dropped — no wasted breakpoints
         assert!(r.cached_segments.is_empty(), "tiny segments should not get cache breakpoints");
     }
@@ -790,7 +813,7 @@ mod tests {
             compaction_script: String::new(),
             estimated_post_compaction: 142000,
         };
-        let rendered = render_context(&state, "", Some(&compaction), &config, 150_000, None, None, Vec::new());
+        let rendered = render_context(&state, "", Some(&compaction), &config, 150_000, None, None);
 
         assert!(rendered.text.contains("COMPACTION MODE:"));
         assert!(rendered.text.contains("Current usage: 142000 tokens"));
@@ -832,7 +855,7 @@ mod tests {
         });
 
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000, None, None, Vec::new());
+        let rendered = render_context(&state, "", None, &config, 150_000, None, None);
 
         // Agent state should appear
         assert!(rendered.text.contains("<agent_state>"), "Missing agent_state block");
@@ -855,7 +878,7 @@ mod tests {
     fn test_render_no_agent_state_when_empty() {
         let state = HarnessState::new(200_000, 16384);
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000, None, None, Vec::new());
+        let rendered = render_context(&state, "", None, &config, 150_000, None, None);
 
         // No agent_state block when nothing to show
         assert!(!rendered.text.contains("<agent_state>"));
@@ -863,16 +886,23 @@ mod tests {
 
     #[test]
     fn test_render_with_attachments() {
-        let state = HarnessState::new(200_000, 16384);
+        let mut state = HarnessState::new(200_000, 16384);
+        // View item at head → its paths become rendered attachments
+        state.work_queue.push(WorkItem {
+            id: AgentId("0001".into()),
+            priority: 10,
+            time: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            item_type: WorkItemType::View {
+                paths: vec!["/tmp/camera.jpg".into(), "/tmp/meta.json".into()],
+            },
+            attachments: Vec::new(),
+        });
         let config = RenderConfig::default();
-        let attachments = vec![
-            Attachment::new("/tmp/camera.jpg"),
-            Attachment::new("/tmp/meta.json"),
-        ];
-        let rendered = render_context(&state, "", None, &config, 150_000, None, None, attachments);
+        let rendered = render_context(&state, "", None, &config, 150_000, None, None);
 
         assert_eq!(rendered.attachments.len(), 2);
-        assert!(rendered.text.contains("Attachments this turn: 2"));
+        assert!(rendered.text.contains("type: View"));
+        assert!(rendered.text.contains("paths: 2 files"));
         assert!(rendered.text.contains("ephemeral"));
     }
 
@@ -880,7 +910,7 @@ mod tests {
     fn test_render_no_attachment_line_when_empty() {
         let state = HarnessState::new(200_000, 16384);
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000, None, None, Vec::new());
+        let rendered = render_context(&state, "", None, &config, 150_000, None, None);
 
         assert!(!rendered.text.contains("Attachments this turn"));
     }
@@ -895,7 +925,7 @@ mod tests {
             turn_counter: 3,
             max_turns: Some(10),
         };
-        let rendered = render_context(&state, "", None, &config, 150_000, Some(&agent), None, Vec::new());
+        let rendered = render_context(&state, "", None, &config, 150_000, Some(&agent), None);
 
         assert!(rendered.text.contains("Agent: api-checker"));
         assert!(rendered.text.contains("Lineage: api-checker, child of plan-builder, child of root"));
@@ -912,7 +942,7 @@ mod tests {
             turn_counter: 5,
             max_turns: None,
         };
-        let rendered = render_context(&state, "", None, &config, 150_000, Some(&agent), None, Vec::new());
+        let rendered = render_context(&state, "", None, &config, 150_000, Some(&agent), None);
 
         assert!(rendered.text.contains("Agent: root"));
         assert!(rendered.text.contains("Turns: 5 (no limit)"));

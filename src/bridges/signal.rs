@@ -108,7 +108,7 @@ async fn run_async(
                     continue;
                 }
                 let dm = &env["dataMessage"];
-                let text = dm["message"].as_str().unwrap_or("");
+                let text = dm["message"].as_str().unwrap_or("").to_string();
                 let attachments: Vec<String> = dm["attachments"]
                     .as_array()
                     .into_iter()
@@ -116,12 +116,10 @@ async fn run_async(
                     .filter_map(|a| a["id"].as_str())
                     .map(|id| format!("{}/{}", attach_dir, id))
                     .collect();
-                let content = match (text.is_empty(), attachments.is_empty()) {
-                    (true, true) => continue,
-                    (false, true) => text.to_string(),
-                    (_, false) => format!("{}\n[attachments: {}]", text, attachments.join(", ")),
-                };
-                if inbound_tx.send(content).is_err() {
+                if text.is_empty() && attachments.is_empty() {
+                    continue;
+                }
+                if inbound_tx.send(super::Inbound { text, attachments }).is_err() {
                     return;
                 }
             }

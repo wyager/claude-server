@@ -48,7 +48,18 @@ pub fn run(cmd: BridgeCmd) {
 
 /// Core relay loop shared by all bridges.
 ///
-/// - `inbound_rx`: text messages received from the external service
+pub struct Inbound {
+    pub text: String,
+    pub attachments: Vec<String>,
+}
+
+impl From<String> for Inbound {
+    fn from(text: String) -> Self {
+        Self { text, attachments: Vec::new() }
+    }
+}
+
+/// - `inbound_rx`: messages received from the external service
 /// - `outbound`: called for each agent message pulled from the SSE stream
 ///
 /// Runs until either side closes or errors.
@@ -56,7 +67,7 @@ pub async fn relay_loop<F, Fut>(
     api_url: &str,
     chat_id: &str,
     user: &str,
-    mut inbound_rx: mpsc::UnboundedReceiver<String>,
+    mut inbound_rx: mpsc::UnboundedReceiver<Inbound>,
     outbound: F,
 ) -> Result<()>
 where
@@ -88,10 +99,15 @@ where
     loop {
         tokio::select! {
             // Inbound: external → POST /message
-            maybe_text = inbound_rx.recv() => {
-                match maybe_text {
-                    Some(text) => {
-                        let body = json!({ "chat_id": chat_id, "user": user, "content": text });
+            maybe_msg = inbound_rx.recv() => {
+                match maybe_msg {
+                    Some(msg) => {
+                        let body = json!({
+                            "chat_id": chat_id,
+                            "user": user,
+                            "content": msg.text,
+                            "attachments": msg.attachments,
+                        });
                         match client.post(&msg_url).json(&body).send().await {
                             Ok(r) if r.status().is_success() => {}
                             Ok(r) => eprintln!("[bridge] POST /message returned {}", r.status()),

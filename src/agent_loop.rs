@@ -89,9 +89,6 @@ pub struct AgentLoop {
     local_cache_read_tokens: u64,
     /// Shared agent registry for naming and inter-agent messaging.
     registry: Arc<AgentRegistry>,
-    /// Attachments queued for the next turn's API request. Consumed once, then cleared.
-    /// Populated by attach() or by ChildSettings.attach on fork.
-    pending_attachments: Vec<Attachment>,
     /// Explicit return values from done(**kwargs). Populated on the turn that
     /// calls done(); read by run_child_agent_loop after run() returns.
     done_result: HashMap<String, serde_json::Value>,
@@ -143,14 +140,8 @@ impl AgentLoop {
             local_cache_creation_tokens: 0,
             local_cache_read_tokens: 0,
             registry,
-            pending_attachments: Vec::new(),
             done_result: HashMap::new(),
         }
-    }
-
-    /// Seed attachments for the first turn (used by fork to give children initial content).
-    pub fn set_initial_attachments(&mut self, attachments: Vec<Attachment>) {
-        self.pending_attachments = attachments;
     }
 
     fn broadcast(&self, msg: BroadcastMsg) {
@@ -186,8 +177,7 @@ impl AgentLoop {
 
             // If work queue is empty, wait for events (messages, process
             // completions, timer fires). Agents exit explicitly via done().
-            // Don't idle with pending attachments — do one more turn to see them.
-            if self.state.work_queue.is_empty() && self.pending_attachments.is_empty() {
+            if self.state.work_queue.is_empty() {
                 if !idle {
                     dimlog!("[{}] Idle, waiting for events...", self.name);
                     idle = true;
@@ -304,9 +294,6 @@ impl AgentLoop {
             turn_counter: self.turn_counter,
             max_turns: self.permissions.max_turns,
         };
-        // Consume pending attachments — they're visible for exactly this one turn
-        let attachments = std::mem::take(&mut self.pending_attachments);
-
         let rendered = renderer::render_context(
             &self.state,
             &self.deployment_context,
@@ -315,7 +302,6 @@ impl AgentLoop {
             self.config.compact_at,
             Some(&agent_identity),
             pinned_summary,
-            attachments,
         );
 
         let seg_sizes: Vec<usize> = rendered.cached_segments.iter().map(String::len).collect();
@@ -495,14 +481,16 @@ impl AgentLoop {
                 chat_id,
                 user,
                 content,
+                attachments,
             } => {
                 let id = self.state.id_generator.next();
                 dimlog!(
-                   "[{}] User message from {}: {} (id={})",
+                   "[{}] User message from {}: {} (id={}){}",
                     self.name,
                     user,
                     &content[..content.len().min(50)],
-                    id
+                    id,
+                    if attachments.is_empty() { String::new() } else { format!(" [{} attachments]", attachments.len()) }
                 );
                 self.state.work_queue.push(WorkItem {
                     id,
@@ -513,6 +501,7 @@ impl AgentLoop {
                         user,
                         content,
                     },
+                    attachments,
                 });
             }
             HarnessEvent::Process(pe) => match pe {
@@ -537,6 +526,7 @@ impl AgentLoop {
                             exit_code,
                             output_preview,
                         },
+                        attachments: Vec::new(),
                     });
                 }
                 ProcessEvent::Failed { pid, error } => {
@@ -562,6 +552,7 @@ impl AgentLoop {
                             error,
                             output_preview,
                         },
+                        attachments: Vec::new(),
                     });
                 }
                 ProcessEvent::Timeout { pid } => {
@@ -577,6 +568,7 @@ impl AgentLoop {
                         priority: prio,
                         time: Utc::now(),
                         item_type: WorkItemType::ProcessTimeout { pid },
+                        attachments: Vec::new(),
                     });
                 }
             },
@@ -619,6 +611,7 @@ impl AgentLoop {
                         success,
                         summary,
                     },
+                    attachments: Vec::new(),
                 });
             }
             HarnessEvent::AgentMessage {
@@ -638,6 +631,7 @@ impl AgentLoop {
                     priority,
                     time: Utc::now(),
                     item_type: WorkItemType::AgentMessage { from, content },
+                    attachments: Vec::new(),
                 });
             }
             HarnessEvent::ExternalEvent {
@@ -660,6 +654,7 @@ impl AgentLoop {
                         event_type,
                         data,
                     },
+                    attachments: Vec::new(),
                 });
             }
             HarnessEvent::Shutdown => {} // handled in run()
@@ -831,6 +826,7 @@ impl AgentLoop {
                             error: format!("spawn failed: {}", e),
                             output_preview: None,
                         },
+                        attachments: Vec::new(),
                     });
                 }
             }
@@ -839,8 +835,17 @@ impl AgentLoop {
         // Process kills
         deferred.process_kills = effects.process_kills;
 
-        // Attachments for next turn's context (ephemeral)
-        self.pending_attachments.extend(effects.attachments);
+        // view() calls → one View work item (priority 10, lands at head)
+        if !effects.view_paths.is_empty() {
+            let id = self.state.id_generator.next();
+            self.state.work_queue.push(WorkItem {
+                id,
+                priority: 10,
+                time: Utc::now(),
+                item_type: WorkItemType::View { paths: effects.view_paths },
+                attachments: Vec::new(),
+            });
+        }
 
         // Fork requests (child agent spawns)
         for req in effects.fork_requests {
@@ -873,6 +878,7 @@ impl AgentLoop {
                         success: false,
                         summary: format!("Fork failed: {}", e),
                     },
+                    attachments: Vec::new(),
                 });
                 continue;
             }
@@ -909,6 +915,7 @@ impl AgentLoop {
                                 self.max_children
                             ),
                         },
+                        attachments: Vec::new(),
                     });
                     continue;
                 }
@@ -969,7 +976,9 @@ impl AgentLoop {
                     });
                 }
 
-                // Add task as work item
+                // Add task as work item. Attach paths go on this item as
+                // metadata; if present, also push a View item at head so the
+                // child sees the files on turn 1.
                 let task_id = child_state.id_generator.next();
                 child_state.work_queue.push(WorkItem {
                     id: task_id,
@@ -980,7 +989,18 @@ impl AgentLoop {
                         user: self.permissions.agent_name.clone(),
                         content: child_settings.task,
                     },
+                    attachments: child_settings.attach.clone(),
                 });
+                if !child_settings.attach.is_empty() {
+                    let view_id = child_state.id_generator.next();
+                    child_state.work_queue.push(WorkItem {
+                        id: view_id,
+                        priority: 10,
+                        time: Utc::now(),
+                        item_type: WorkItemType::View { paths: child_settings.attach },
+                        attachments: Vec::new(),
+                    });
+                }
 
                 // Create child API client
                 let child_config = Arc::new(Config {
@@ -1026,6 +1046,7 @@ impl AgentLoop {
                                     success: false,
                                     summary: format!("Failed to create API client: {}", e),
                                 },
+                                attachments: Vec::new(),
                             });
                             continue;
                         }
@@ -1059,7 +1080,6 @@ impl AgentLoop {
                     7, // default priority for ChildAgentCompleted
                     parent_tx,
                     registry,
-                    child_settings.attachments,
                 ));
             }
         }
@@ -1242,7 +1262,6 @@ async fn run_child_agent_loop(
     priority: u8,
     parent_tx: mpsc::UnboundedSender<HarnessEvent>,
     registry: Arc<AgentRegistry>,
-    initial_attachments: Vec<Attachment>,
 ) {
     let mut child_loop = AgentLoop::new(
         child_name.clone(),
@@ -1261,7 +1280,6 @@ async fn run_child_agent_loop(
         None,  // children track tokens locally
         registry.clone(),
     );
-    child_loop.set_initial_attachments(initial_attachments);
 
     let reason = child_loop.run().await;
     let turns_used = child_loop.turn_counter;

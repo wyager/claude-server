@@ -31,7 +31,7 @@ pub fn run(args: DiscordArgs) {
 async fn run_async(api_url: String, token: String, channel: String) -> Result<()> {
     let http = reqwest::Client::new();
     let chat_id = format!("discord:{}", channel);
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::unbounded_channel::<super::Inbound>();
 
     // Inbound: Gateway with reconnect loop
     let gw_token = token.clone();
@@ -76,7 +76,7 @@ async fn gateway_loop(
     http: &reqwest::Client,
     token: &str,
     channel: &str,
-    tx: &mpsc::UnboundedSender<String>,
+    tx: &mpsc::UnboundedSender<super::Inbound>,
 ) -> Result<()> {
     let gw: Value = http
         .get("https://discord.com/api/v10/gateway")
@@ -132,7 +132,7 @@ async fn gateway_loop(
                             {
                                 if let Some(text) = d["content"].as_str() {
                                     if !text.is_empty() {
-                                        tx.send(text.to_string()).ok();
+                                        tx.send(text.to_string().into()).ok();
                                     }
                                 }
                             }

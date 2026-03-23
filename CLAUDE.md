@@ -135,15 +135,15 @@ with `child_name`, `result` (the kwargs dict), `turns_used`, `success`, and `sum
 Max 3 concurrent children.
 `child_depth_remaining: u32` controls recursion depth.
 
-**Attachments (vision + large-file injection)**: `attach(path)` queues a
-file to appear as a content block on the agent's *next* turn. Images (`.jpg`,
-`.jpeg`, `.png`, `.gif`, `.webp`) become vision blocks the model can see; any
-other file becomes a text block. Attachments are ephemeral: visible exactly once,
-not in `HarnessState`, not persisted, not in history. Storage lives in
-`AgentLoop.pending_attachments` which is `std::mem::take`'d into each turn's
-render. File paths (not bytes) are stored in `SideEffectCollector` — encoding
-is deferred to `api_client::resolve_attachment()`. `ChildSettings.attach`
-seeds a child's first-turn attachments via the same mechanism.
+**Attachments (vision + large-file injection)**: `view(*paths)` pushes a
+`WorkItemType::View` item at priority 10. When a View item is at queue head,
+`renderer::render_context` emits its paths as content blocks (images →
+vision, else text; encoding via `api_client::resolve_attachment()`). Content
+stays visible until the item is popped — no separate loop state, so the idle
+check is simply `queue.is_empty()`. `WorkItem.attachments: Vec<String>` is
+metadata-only (rendered as queue text); bridges populate it (e.g. Signal
+images) and the agent promotes paths via `view()`. `ChildSettings.attach`
+pushes a View item to the child's queue.
 
 **Auto-injected process env**: Every process spawned via `shell_exec()` gets
 `CLAUDE_SERVER_EVENT_URL` in its environment (computed from `Config.listen_addr`).

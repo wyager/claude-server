@@ -75,7 +75,7 @@ async fn run_async(api_url: String, token: String, peer: i64) -> Result<()> {
                 let msg = &update["message"];
                 if msg["chat"]["id"].as_i64() == Some(peer) {
                     if let Some(text) = msg["text"].as_str() {
-                        if tx.send(text.to_string()).is_err() {
+                        if tx.send(text.to_string().into()).is_err() {
                             return;
                         }
                     }

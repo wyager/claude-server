@@ -46,7 +46,9 @@ pub struct SideEffectCollector {
     pub history_removes: Vec<String>,
     pub history_replaces: Vec<(String, String)>,
     pub history_adds: Vec<String>,
-    pub attachments: Vec<Attachment>,
+    /// Paths collected by view() calls this turn. Applied as a single View
+    /// work item so multiple view() calls don't spam the queue.
+    pub view_paths: Vec<String>,
     pub fork_requests: Vec<ForkRequest>,
     pub agent_messages: Vec<AgentMessageRequest>,
     pub compaction_script_appends: Vec<String>,
@@ -69,9 +71,8 @@ pub struct ForkChildSettings {
     /// SystemAlert. Useful for cross-model forks where inheriting the parent's
     /// full context means paying a full re-ingest on the new model's cache.
     pub inherit_history: bool,
-    /// File paths to attach on the child's first turn.
-    /// Same semantics as attach() — ephemeral, one turn only.
-    pub attachments: Vec<Attachment>,
+    /// File paths to push as a View work item on the child's queue.
+    pub attach: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -252,6 +253,10 @@ fn work_item_to_py(item: &WorkItem) -> PyWorkItem {
             fields.insert("data".into(), data.clone());
             "ExternalEvent"
         }
+        WorkItemType::View { paths } => {
+            fields.insert("paths".into(), serde_json::Value::from(paths.clone()));
+            "View"
+        }
         WorkItemType::Compaction => {
             fields.insert("description".into(), "You must compact your context.".into());
             "Compaction"
@@ -264,6 +269,8 @@ fn work_item_to_py(item: &WorkItem) -> PyWorkItem {
             "AgentStartup"
         }
     };
+
+    fields.insert("attachments".into(), item.attachments.clone().into());
 
     PyWorkItem {
         id: item.id.0.clone(),
@@ -662,14 +669,16 @@ impl PyHarness {
         self.process_info.clone()
     }
 
-    fn attach(&self, path: String) -> PyResult<()> {
-        let pb = std::path::PathBuf::from(&path);
-        if !pb.is_file() {
-            return Err(pyo3::exceptions::PyFileNotFoundError::new_err(
-                format!("attach: file not found or not a regular file: {}", path)
-            ));
+    #[pyo3(signature = (*paths))]
+    fn view(&self, paths: Vec<String>) -> PyResult<()> {
+        for p in &paths {
+            if !std::path::Path::new(p).is_file() {
+                return Err(pyo3::exceptions::PyFileNotFoundError::new_err(
+                    format!("view: file not found or not a regular file: {}", p)
+                ));
+            }
         }
-        self.collector.lock().unwrap().attachments.push(Attachment::new(pb));
+        self.collector.lock().unwrap().view_paths.extend(paths);
         Ok(())
     }
 
@@ -725,13 +734,11 @@ impl PyHarness {
             // Extract attach paths (None → empty).
             // File existence is NOT checked here — the parent may be queuing a
             // shell_exec that writes the file before the child's turn 1 runs.
-            // Resolution/error handling happens at API-call time.
             let attach_obj = item.getattr("attach")?;
-            let attachments: Vec<Attachment> = if attach_obj.is_none() {
+            let attach: Vec<String> = if attach_obj.is_none() {
                 Vec::new()
             } else {
-                let paths: Vec<String> = attach_obj.extract()?;
-                paths.into_iter().map(Attachment::new).collect()
+                attach_obj.extract()?
             };
 
             let inherit_history: bool = item.getattr("inherit_history")?.extract()?;
@@ -744,7 +751,7 @@ impl PyHarness {
                 max_turns,
                 can_compact,
                 inherit_history,
-                attachments,
+                attach,
             });
         }
 
@@ -841,7 +848,7 @@ shell_kill = _harness.shell_kill
 processes_list = _harness.processes_list
 acknowledge_timer = _harness.acknowledge_timer
 request_compaction = _harness.request_compaction
-attach = _harness.attach
+view = _harness.view
 fork = _harness.fork
 message_agent = _harness.message_agent
 done = _harness.done
@@ -1292,6 +1299,7 @@ print(tid)
                 user: "user@test.com".to_string(),
                 content: "Hello!".to_string(),
             },
+            attachments: Vec::new(),
         });
 
         let result = execute(
@@ -1487,11 +1495,11 @@ print("forked")
         assert_eq!(req.children[1].model, None);
         assert_eq!(req.children[1].max_turns, 20); // default
         assert!(req.children[1].can_compact); // default is true
-        assert!(req.children[0].attachments.is_empty()); // default: no attachments
+        assert!(req.children[0].attach.is_empty()); // default: no attachments
     }
 
     #[test]
-    fn test_attach() {
+    fn test_view() {
         init();
         let state = HarnessState::new(200_000, 16384);
 
@@ -1501,7 +1509,7 @@ print("forked")
 
         let code = format!(
             r#"
-attach({path:?})
+view({path:?})
 print("ok")
 "#,
             path = tmp.to_str().unwrap()
@@ -1509,19 +1517,19 @@ print("ok")
         let result = execute(&state, &code, false, &HashMap::new());
         assert!(!result.is_error, "Error: {}", result.error_text);
         assert_eq!(result.stdout.trim(), "ok");
-        assert_eq!(result.side_effects.attachments.len(), 1);
-        assert_eq!(result.side_effects.attachments[0].path, tmp);
+        assert_eq!(result.side_effects.view_paths.len(), 1);
+        assert_eq!(result.side_effects.view_paths[0], tmp.to_str().unwrap());
 
         std::fs::remove_file(&tmp).ok();
     }
 
     #[test]
-    fn test_attach_file_not_found() {
+    fn test_view_file_not_found() {
         init();
         let state = HarnessState::new(200_000, 16384);
         let result = execute(
             &state,
-            r#"attach("/nonexistent/path/xyz.jpg")"#,
+            r#"view("/nonexistent/path/xyz.jpg")"#,
             false,
             &HashMap::new(),
         );
@@ -1560,15 +1568,9 @@ fork([
         assert!(!result.is_error, "Error: {}", result.error_text);
         let req = &result.side_effects.fork_requests[0];
         assert_eq!(req.children.len(), 1);
-        assert_eq!(req.children[0].attachments.len(), 2);
-        assert_eq!(
-            req.children[0].attachments[0].path.to_str().unwrap(),
-            "/tmp/snapshot.jpg"
-        );
-        assert_eq!(
-            req.children[0].attachments[1].path.to_str().unwrap(),
-            "/tmp/metadata.json"
-        );
+        assert_eq!(req.children[0].attach.len(), 2);
+        assert_eq!(req.children[0].attach[0], "/tmp/snapshot.jpg");
+        assert_eq!(req.children[0].attach[1], "/tmp/metadata.json");
     }
 
     #[test]
@@ -1779,6 +1781,7 @@ done(verdict="all clear", confidence=0.95, details={"camera": "front", "count": 
                 success: true,
                 summary: "done".to_string(),
             },
+            attachments: Vec::new(),
         });
 
         let result = execute(

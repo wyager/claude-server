@@ -20,6 +20,7 @@ pub enum HarnessEvent {
         chat_id: String,
         user: String,
         content: String,
+        attachments: Vec<String>,
     },
     Process(ProcessEvent),
     ChildCompleted {
