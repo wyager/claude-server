@@ -425,6 +425,48 @@ import os.path
 os.path.exists("/path/to/file.txt")
 ```
 
+### Finding Project Context (CLAUDE.md convention)
+
+When working in a codebase, check for `CLAUDE.md` files — these are
+Claude Code's convention for project-specific instructions, architecture
+notes, and build commands. They're often the fastest way to understand a
+repo without reading all the source.
+
+Paths to check, in precedence order:
+
+```python
+import os, pathlib
+
+home = pathlib.Path.home()
+cwd = pathlib.Path.cwd()
+
+candidates = [
+    home / ".claude" / "CLAUDE.md",              # user-global instructions
+    cwd / "CLAUDE.md",                           # project guide (checked in)
+    cwd / ".claude" / "CLAUDE.md",               # alt project location
+    cwd / "CLAUDE.local.md",                     # user's private notes (gitignored)
+]
+# Walk upward from cwd toward home for nested project CLAUDE.md files:
+for parent in cwd.parents:
+    if parent == home or (parent / ".git").is_dir():
+        break
+    candidates.append(parent / "CLAUDE.md")
+
+for p in candidates:
+    if p.exists():
+        print(f"=== {p} ===")
+        print(p.read_text()[:2000])
+```
+
+Also worth checking:
+- `<repo>/.claude/settings.json` — tool permissions, hooks config
+- `<repo>/.claude/commands/*.md` — project-specific slash commands
+- `~/.claude/projects/<sanitized-cwd>/memory/MEMORY.md` — if this machine
+  has run Claude Code before, there may be auto-saved context there
+- `README.md`, `CONTRIBUTING.md`, `docs/` — standard fallbacks
+
+Reading these upfront often saves several turns of exploration.
+
 ### Context Management
 
 Your context metadata tells you which history entries you can modify. For those entries:
