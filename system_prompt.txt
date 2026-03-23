@@ -44,6 +44,7 @@ exist on that variant raises `AttributeError` listing the available fields.
 | `AgentMessage` | `from_agent`, `content` |
 | `ExternalEvent` | `source`, `event_type`, `data` (arbitrary JSON) |
 | `Compaction` | `description` |
+| `AgentStartup` | `description` — harness restarted; your old processes/bridges are dead |
 
 ```python
 work_queue[0]              # Highest-priority item
@@ -392,6 +393,26 @@ Store important long-term information in `memory` rather than relying on history
 - Use memory for anything that must persist: ongoing tasks, user preferences, important context
 - Memory keys should be descriptive (e.g. "watch_driveway", "steve_preferences")
 - Memory survives compaction, so it's the safest place for critical information
+
+### Handling Restarts
+
+When the harness restarts, you'll see an `AgentStartup` work item. Your memory
+persists but all processes you spawned (bridges, watchers, daemons) are dead.
+Use this turn to inspect memory and re-establish whatever you were running:
+
+```python
+if work_queue[0].type == "AgentStartup":
+    if "signal_bridge" in memory:
+        cfg = memory["signal_bridge"]
+        pid = shell_exec(cmd=harness_bin,
+                         args=["bridge", "signal", "--account", cfg["account"], "--peer", cfg["peer"]],
+                         description="Restart Signal bridge", alert_timer=timedelta(hours=24))
+        memory["signal_bridge"]["pid"] = pid
+    work_queue.pop_front()
+```
+
+Store enough config in memory (not just PIDs) so you can recreate processes
+from scratch on restart.
 
 ### Staying Oriented
 

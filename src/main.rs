@@ -130,7 +130,7 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
 
     // Load or create state
     let state = match database.load_state()? {
-        Some(s) => {
+        Some(mut s) => {
             println!(
                 "  Resumed state (queue: {}, history: {}, memory: {} keys, timers: {})",
                 s.work_queue.len(),
@@ -138,6 +138,15 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
                 s.memory.len(),
                 s.timer_manager.list().len()
             );
+            // Inject startup item so the agent gets a turn to reconnect any
+            // bridges/processes it tracked in memory before the restart.
+            let id = s.id_generator.next();
+            s.work_queue.push(types::WorkItem {
+                id,
+                priority: 9,
+                time: chrono::Utc::now(),
+                item_type: types::WorkItemType::AgentStartup,
+            });
             s
         }
         None => {

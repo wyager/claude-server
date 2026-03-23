@@ -114,6 +114,7 @@ pub enum WorkItemType {
         data: serde_json::Value,
     },
     Compaction,
+    AgentStartup,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

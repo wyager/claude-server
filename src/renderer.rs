@@ -296,6 +296,10 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
             out.push_str("type: Compaction\n");
             out.push_str("description: \"You must compact your context.\"\n");
         }
+        WorkItemType::AgentStartup => {
+            out.push_str("type: AgentStartup\n");
+            out.push_str("description: \"Harness restarted. Any processes/bridges you were managing are dead — inspect memory and reconnect as needed.\"\n");
+        }
     }
 
     out.push_str("</work_item>\n");

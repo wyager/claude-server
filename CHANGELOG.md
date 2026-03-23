@@ -1,5 +1,34 @@
 # Changelog
 
+## 2026-03-23
+
+### Prompt caching fix (major cost reduction)
+- Added `cache_control` breakpoint on the user message, not just the system prompt.
+  Previously the entire rendered context (event_history etc.) was billed at full
+  input price every turn. Now `RenderedContext.stable_prefix` (deployment_context +
+  immutable history entries) gets cached; only the modifiable-history tail +
+  agent_state + metadata + work_queue are uncached. Expected ~10x cost reduction
+  on long sessions.
+- Breakpoint sits at the immutable/modifiable boundary (`EventHistory::immutable_count()`)
+  so agent history edits don't invalidate the cache.
+- Per-turn cost + cache hit % now logged: `$0.0421/turn, 92% cache hit`.
+
+### AgentStartup work item (from field feedback #9)
+- On daemon restart with resumed state, inject a priority-9 `AgentStartup` work
+  item so the agent gets a turn to reconnect dead bridges/processes it tracked
+  in memory. Not injected on fresh state.
+
+### Signal bridge rewrite (from field feedback #5-6)
+- Switched from `receive` + spawn-per-`send` (broken by signal-cli's file lock)
+  to single `jsonRpc` daemon over stdin/stdout. One process, no lock contention.
+
+### Feedback server fixes
+- TlsListener now spawns handshakes into background tasks with 10s timeout —
+  slow clients can't block the accept loop. Added `ClientAddr` newtype to
+  satisfy axum's `Connected` trait for both TCP and TLS paths.
+- Embedded cert updated to match the live server (was stale, causing
+  `BadSignature`). Error chain now printed so future TLS failures are diagnosable.
+
 ## 2026-03-22
 
 ### CLI chat over HTTP + `request_compaction()`

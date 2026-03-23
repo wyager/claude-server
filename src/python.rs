@@ -252,6 +252,13 @@ fn work_item_to_py(item: &WorkItem) -> PyWorkItem {
             fields.insert("description".into(), "You must compact your context.".into());
             "Compaction"
         }
+        WorkItemType::AgentStartup => {
+            fields.insert(
+                "description".into(),
+                "Harness restarted. Any processes/bridges you were managing are dead — inspect memory and reconnect as needed.".into(),
+            );
+            "AgentStartup"
+        }
     };
 
     PyWorkItem {
