@@ -1,12 +1,14 @@
 use std::collections::HashMap;
+use std::error::Error;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use axum::extract::connect_info::Connected;
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
-use axum::serve::{Listener, ListenerExt};
+use axum::serve::{IncomingStream, Listener};
 use axum::{Json, Router};
 use clap::Args;
 use rusqlite::Connection;
@@ -16,15 +18,15 @@ use serde_json::json;
 const DEFAULT_FEEDBACK_URL: &str = "https://feedback.yager.io:3001/feedback";
 
 const FEEDBACK_SERVER_CERT: &[u8] = b"-----BEGIN CERTIFICATE-----
-MIIBjDCCATOgAwIBAgIUKD9aJLinznAVm9BB1u92dhJ6yx8wCgYIKoZIzj0EAwIw
-HDEaMBgGA1UEAwwRZmVlZGJhY2sueWFnZXIuaW8wHhcNMjYwMzIyMjA0MzI1WhcN
-MzYwMzE5MjA0MzI1WjAcMRowGAYDVQQDDBFmZWVkYmFjay55YWdlci5pbzBZMBMG
-ByqGSM49AgEGCCqGSM49AwEHA0IABLN8VGtFHS60C8M1b2mLJlT/PbyAhKvpMiJt
-QmXOHk5vTKvJHSFZwy3bpLcfevKPIoVAD5b/7Mf6oOhd9IdoRGWjUzBRMB0GA1Ud
-DgQWBBTBM3a2JT0z80C/BTjbhRY5VbP+TTAfBgNVHSMEGDAWgBTBM3a2JT0z80C/
-BTjbhRY5VbP+TTAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIFll
-UrDC8H4b2NbRJZVk8h9PNQzlZ+FQumL3TGx6XCXeAiBfimTcegz5Q3IEKIkU0smP
-d1/VPiBL7K8Sa8+avZRPvQ==
+MIIBqTCCAU6gAwIBAgIUZ0VsIgxcQoLptYwun/K5gCMtrL8wCgYIKoZIzj0EAwIw
+HDEaMBgGA1UEAwwRZmVlZGJhY2sueWFnZXIuaW8wHhcNMjYwMzIyMjExNjMyWhcN
+MzYwMzE5MjExNjMyWjAcMRowGAYDVQQDDBFmZWVkYmFjay55YWdlci5pbzBZMBMG
+ByqGSM49AgEGCCqGSM49AwEHA0IABI8RsQCiRpfV4eJHTt7TmkN2MOYhcpsPCnpU
+pfDSgooB3gKR0Q5PJjyomIxi+noujmhhEI6OrDyOY9eSlegLDESjbjBsMB0GA1Ud
+DgQWBBQs6qE14l7MxEAES4kfbfpy3g3TFDAfBgNVHSMEGDAWgBQs6qE14l7MxEAE
+S4kfbfpy3g3TFDAMBgNVHRMBAf8EAjAAMBwGA1UdEQQVMBOCEWZlZWRiYWNrLnlh
+Z2VyLmlvMAoGCCqGSM49BAMCA0kAMEYCIQCubcHvBns3YWvBSL1Nks30juoWV5ne
+gBiP4LMic+obyQIhAPwH7LUAe1Wc8d690c2QXKebW29J/QnBjIv8oapAdA7b
 -----END CERTIFICATE-----
 ";
 const RATE_LIMIT_PER_MIN: u32 = 10;
@@ -87,6 +89,11 @@ pub fn run_client(args: FeedbackArgs) {
         }
         Err(e) => {
             eprintln!("Failed to send feedback to {}: {}", url, e);
+            let mut src = e.source();
+            while let Some(s) = src {
+                eprintln!("  caused by: {}", s);
+                src = s.source();
+            }
             std::process::exit(1);
         }
     }
@@ -193,12 +200,11 @@ pub fn run_server(args: ServerArgs) {
             if has_admin { "admin-only (Bearer token)" } else { "disabled (no admin token set)" }
         );
 
-        let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
+        let make_service = app.into_make_service_with_connect_info::<ClientAddr>();
 
         if let (Some(cert_path), Some(key_path)) = (tls_cert, tls_key) {
             let tls_acceptor = build_tls_acceptor(&cert_path, &key_path);
-            let listener = TlsListener { inner: tcp_listener, acceptor: tls_acceptor }
-                .tap_io(|_| {});
+            let listener = TlsListener::new(tcp_listener, tls_acceptor);
             axum::serve(listener, make_service).await.unwrap();
         } else {
             axum::serve(tcp_listener, make_service).await.unwrap();
@@ -234,10 +240,48 @@ fn build_tls_acceptor(cert_path: &str, key_path: &str) -> tokio_rustls::TlsAccep
     tokio_rustls::TlsAcceptor::from(Arc::new(config))
 }
 
-// TODO WYAGER: check Claude's work
+/// TLS listener that spawns handshakes into background tasks so a slow or
+/// stalled client can't block the accept loop.
 struct TlsListener {
-    inner: tokio::net::TcpListener,
-    acceptor: tokio_rustls::TlsAcceptor,
+    local_addr: SocketAddr,
+    ready_rx: tokio::sync::mpsc::Receiver<(
+        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        SocketAddr,
+    )>,
+}
+
+impl TlsListener {
+    fn new(tcp: tokio::net::TcpListener, acceptor: tokio_rustls::TlsAcceptor) -> Self {
+        let local_addr = tcp.local_addr().expect("listener local_addr");
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(async move {
+            loop {
+                match tcp.accept().await {
+                    Ok((stream, addr)) => {
+                        let acceptor = acceptor.clone();
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let handshake = tokio::time::timeout(
+                                Duration::from_secs(10),
+                                acceptor.accept(stream),
+                            );
+                            match handshake.await {
+                                Ok(Ok(tls)) => {
+                                    let _ = tx.send((tls, addr)).await;
+                                }
+                                Ok(Err(e)) => {
+                                    eprintln!("TLS handshake failed from {}: {}", addr, e)
+                                }
+                                Err(_) => eprintln!("TLS handshake timeout from {}", addr),
+                            }
+                        });
+                    }
+                    Err(e) => eprintln!("TCP accept error: {}", e),
+                }
+            }
+        });
+        Self { local_addr, ready_rx: rx }
+    }
 }
 
 impl Listener for TlsListener {
@@ -245,26 +289,35 @@ impl Listener for TlsListener {
     type Addr = SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            match self.inner.accept().await {
-                Ok((stream, addr)) => match self.acceptor.accept(stream).await {
-                    Ok(tls_stream) => return (tls_stream, addr),
-                    Err(e) => eprintln!("TLS handshake failed from {}: {}", addr, e),
-                },
-                Err(e) => eprintln!("TCP accept error: {}", e),
-            }
-        }
+        self.ready_rx.recv().await.expect("TLS accept task exited")
     }
 
-    fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.inner.local_addr()
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        Ok(self.local_addr)
+    }
+}
+
+/// Local newtype so we can impl `Connected` for both the plain TCP and TLS
+/// listeners without hitting orphan rules.
+#[derive(Clone, Copy)]
+struct ClientAddr(SocketAddr);
+
+impl Connected<IncomingStream<'_, tokio::net::TcpListener>> for ClientAddr {
+    fn connect_info(s: IncomingStream<'_, tokio::net::TcpListener>) -> Self {
+        ClientAddr(*s.remote_addr())
+    }
+}
+
+impl Connected<IncomingStream<'_, TlsListener>> for ClientAddr {
+    fn connect_info(s: IncomingStream<'_, TlsListener>) -> Self {
+        ClientAddr(*s.remote_addr())
     }
 }
 
 
 async fn handle_post(
     State(state): State<ServerState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ConnectInfo(ClientAddr(addr)): ConnectInfo<ClientAddr>,
     Json(req): Json<FeedbackReq>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // Rate limit
