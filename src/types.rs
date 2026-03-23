@@ -274,6 +274,21 @@ impl EventHistory {
         self.entries.len().saturating_sub(self.modification_window)
     }
 
+    /// Stride-aligned split points for prompt-cache breakpoints.
+    /// Returns (prev_stride, cur_stride) where both are multiples of `stride`
+    /// ≤ immutable_count(). Two breakpoints mean the "previous stride" absorbs
+    /// the old "current stride" cache entry on transition, so advancing only
+    /// pays cache-write on one stride's worth instead of the whole history.
+    pub fn cache_splits(&self, stride: usize) -> (usize, usize) {
+        let n = self.immutable_count();
+        if stride == 0 {
+            return (n, n);
+        }
+        let cur = (n / stride) * stride;
+        let prev = cur.saturating_sub(stride);
+        (prev, cur)
+    }
+
     pub fn is_modifiable(&self, id: &AgentId) -> bool {
         let len = self.entries.len();
         let start = len.saturating_sub(self.modification_window);
@@ -562,6 +577,10 @@ impl Attachment {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderConfig {
+    /// History entries per cache-breakpoint stride. Breakpoints sit at multiples
+    /// of this value so their content stays byte-identical for `stride` turns,
+    /// giving consistent cache hits instead of missing every turn as the prefix grows.
+    pub cache_stride: usize,
     pub history_entry_max_chars: usize,
     pub history_entry_max_lines: usize,
     pub work_queue_content_limits: Vec<usize>,
@@ -576,6 +595,7 @@ pub struct RenderConfig {
 impl Default for RenderConfig {
     fn default() -> Self {
         Self {
+            cache_stride: 10,
             history_entry_max_chars: 2000,
             history_entry_max_lines: 50,
             work_queue_content_limits: vec![500, 500, 500, 200, 200, 200, 200, 200, 200, 200],

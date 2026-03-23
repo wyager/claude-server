@@ -12,9 +12,10 @@ pub struct CompactionState {
 
 /// The rendered context ready for the API call.
 pub struct RenderedContext {
-    /// Stable prefix: deployment_context + event_history. Append-only across
-    /// turns, so it gets an explicit cache_control breakpoint in the API request.
-    pub stable_prefix: String,
+    /// Cached segments: each gets its own cache_control breakpoint. Two
+    /// stride-aligned segments means transitions only pay cache-write on one
+    /// stride's worth of entries, not the whole history.
+    pub cached_segments: Vec<String>,
     /// The main text content (the user message).
     pub text: String,
     /// File-path attachments to include as additional content blocks.
@@ -44,31 +45,40 @@ pub fn render_context(
     pinned_summary: PinnedSummary,
     attachments: Vec<Attachment>,
 ) -> RenderedContext {
-    // Stable prefix: deployment_context + immutable event_history. Truly
-    // append-only — gets an explicit cache_control breakpoint. The modifiable
-    // tail of history (last N entries, which the agent can edit in-place)
-    // goes in the volatile section so edits don't invalidate the cache.
-    let split = state.event_history.immutable_count();
+    // Cached segments at stride-aligned boundaries. Two segments means when
+    // the stride advances, the first segment's new content equals the old
+    // second segment's content — its cache entry still hits.
+    let (prev, cur) = state.event_history.cache_splits(config.cache_stride);
     let total = state.event_history.entries().len();
-    let mut prefix = String::with_capacity(8192);
-    render_deployment_context(&mut prefix, deployment_context);
-    prefix.push_str("<event_history>\n");
-    render_history_range(&mut prefix, &state.event_history, config, 0..split);
 
-    // Volatile tail: modifiable history + agent_state + metadata + work_queue.
+    let mut seg1 = String::with_capacity(8192);
+    render_deployment_context(&mut seg1, deployment_context);
+    seg1.push_str("<event_history>\n");
+    render_history_range(&mut seg1, &state.event_history, config, 0..prev);
+
+    let mut seg2 = String::new();
+    render_history_range(&mut seg2, &state.event_history, config, prev..cur);
+
+    // Volatile tail: post-stride history + modifiable window + state/meta/queue.
     let mut tail = String::with_capacity(2048);
-    render_history_range(&mut tail, &state.event_history, config, split..total);
+    render_history_range(&mut tail, &state.event_history, config, cur..total);
     tail.push_str("</event_history>\n");
     render_agent_state(&mut tail, state, config);
     render_context_metadata(&mut tail, state, compaction, compact_at, agent, pinned_summary, attachments.len());
     render_work_queue(&mut tail, &state.work_queue, config);
 
     // Concatenated view for callers that want a single string (dumps, char counts).
-    let mut text = String::with_capacity(prefix.len() + tail.len());
-    text.push_str(&prefix);
+    let mut text = String::with_capacity(seg1.len() + seg2.len() + tail.len());
+    text.push_str(&seg1);
+    text.push_str(&seg2);
     text.push_str(&tail);
 
-    RenderedContext { stable_prefix: prefix, text, attachments }
+    let mut cached_segments = vec![seg1];
+    if !seg2.is_empty() {
+        cached_segments.push(seg2);
+    }
+
+    RenderedContext { cached_segments, text, attachments }
 }
 
 fn render_deployment_context(out: &mut String, deployment_context: &str) {

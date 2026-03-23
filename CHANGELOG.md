@@ -2,16 +2,20 @@
 
 ## 2026-03-23
 
-### Prompt caching fix (major cost reduction)
-- Added `cache_control` breakpoint on the user message, not just the system prompt.
-  Previously the entire rendered context (event_history etc.) was billed at full
-  input price every turn. Now `RenderedContext.stable_prefix` (deployment_context +
-  immutable history entries) gets cached; only the modifiable-history tail +
-  agent_state + metadata + work_queue are uncached. Expected ~10x cost reduction
-  on long sessions.
-- Breakpoint sits at the immutable/modifiable boundary (`EventHistory::immutable_count()`)
-  so agent history edits don't invalidate the cache.
-- Per-turn cost + cache hit % now logged: `$0.0421/turn, 92% cache hit`.
+### Prompt caching fix (two-breakpoint stride scheme)
+- Previously only the system prompt was cached; the rendered context (event_history
+  etc.) paid full input price every turn. First attempt put a breakpoint at the
+  immutable-history boundary, but field telemetry showed it never hit — the boundary
+  moves every turn so the breakpoint content is never byte-identical to the prior
+  cache entry.
+- Fixed: `RenderedContext.cached_segments` holds two stride-aligned segments
+  (default `cache_stride=10` entries). Both segments keep byte-identical content
+  for `stride` turns → guaranteed hits. On stride advance, segment 1 moves to
+  segment 2's old position (still hits its cache entry), segment 2 moves forward
+  (cache-write on just one stride's worth). `EventHistory::cache_splits()` computes
+  the boundaries.
+- Per-turn cost + cache hit % logged: `$0.0421/turn, 92% cache hit`. Watch this —
+  if hit % stays near the system-prompt-only baseline (~15-20%), something regressed.
 
 ### AgentStartup work item (from field feedback #9)
 - On daemon restart with resumed state, inject a priority-9 `AgentStartup` work

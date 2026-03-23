@@ -202,17 +202,21 @@ impl ApiClient {
             }),
         }];
 
-        // Build message content as two text blocks: stable_prefix (cached) + tail
-        // (uncached). The prefix is deployment_context + event_history, which only
-        // ever appends — so the cache breakpoint yields high hit rates across turns.
-        let tail = &rendered.text[rendered.stable_prefix.len()..];
-        let mut blocks: Vec<ContentBlock> = Vec::with_capacity(2 + rendered.attachments.len());
-        blocks.push(ContentBlock::Text {
-            text: rendered.stable_prefix.clone(),
-            cache_control: Some(CacheControl {
-                control_type: "ephemeral".to_string(),
-            }),
-        });
+        // Build message content: N cached segments (each with a breakpoint) + uncached tail.
+        // Segments sit at stride-aligned history boundaries so their content is
+        // byte-identical for `cache_stride` turns in a row — guaranteed cache hits.
+        let cached_len: usize = rendered.cached_segments.iter().map(String::len).sum();
+        let tail = &rendered.text[cached_len..];
+        let mut blocks: Vec<ContentBlock> =
+            Vec::with_capacity(rendered.cached_segments.len() + 1 + rendered.attachments.len());
+        for seg in &rendered.cached_segments {
+            blocks.push(ContentBlock::Text {
+                text: seg.clone(),
+                cache_control: Some(CacheControl {
+                    control_type: "ephemeral".to_string(),
+                }),
+            });
+        }
         blocks.push(ContentBlock::Text {
             text: tail.to_string(),
             cache_control: None,
