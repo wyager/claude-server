@@ -267,6 +267,12 @@ impl EventHistory {
         Some(self.entries[start].id())
     }
 
+    /// Index of the first modifiable entry. Entries before this are immutable
+    /// and safe to include in the cached prefix.
+    pub fn immutable_count(&self) -> usize {
+        self.entries.len().saturating_sub(self.modification_window)
+    }
+
     pub fn is_modifiable(&self, id: &AgentId) -> bool {
         let len = self.entries.len();
         let start = len.saturating_sub(self.modification_window);

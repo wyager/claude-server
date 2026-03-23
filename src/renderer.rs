@@ -44,14 +44,21 @@ pub fn render_context(
     pinned_summary: PinnedSummary,
     attachments: Vec<Attachment>,
 ) -> RenderedContext {
-    // Stable prefix: deployment_context + event_history. These are append-only
-    // across turns so they get an explicit cache_control breakpoint.
+    // Stable prefix: deployment_context + immutable event_history. Truly
+    // append-only — gets an explicit cache_control breakpoint. The modifiable
+    // tail of history (last N entries, which the agent can edit in-place)
+    // goes in the volatile section so edits don't invalidate the cache.
+    let split = state.event_history.immutable_count();
+    let total = state.event_history.entries().len();
     let mut prefix = String::with_capacity(8192);
     render_deployment_context(&mut prefix, deployment_context);
-    render_event_history(&mut prefix, &state.event_history, config);
+    prefix.push_str("<event_history>\n");
+    render_history_range(&mut prefix, &state.event_history, config, 0..split);
 
-    // Volatile tail: changes every turn, not cached.
+    // Volatile tail: modifiable history + agent_state + metadata + work_queue.
     let mut tail = String::with_capacity(2048);
+    render_history_range(&mut tail, &state.event_history, config, split..total);
+    tail.push_str("</event_history>\n");
     render_agent_state(&mut tail, state, config);
     render_context_metadata(&mut tail, state, compaction, compact_at, agent, pinned_summary, attachments.len());
     render_work_queue(&mut tail, &state.work_queue, config);
@@ -75,14 +82,15 @@ fn render_deployment_context(out: &mut String, deployment_context: &str) {
     out.push_str("</deployment_context>\n");
 }
 
-fn render_event_history(out: &mut String, history: &EventHistory, config: &RenderConfig) {
-    out.push_str("<event_history>\n");
-
-    for entry in history.entries() {
+fn render_history_range(
+    out: &mut String,
+    history: &EventHistory,
+    config: &RenderConfig,
+    range: std::ops::Range<usize>,
+) {
+    for entry in &history.entries()[range] {
         render_history_entry(out, entry, config);
     }
-
-    out.push_str("</event_history>\n");
 }
 
 fn render_history_entry(out: &mut String, entry: &HistoryEntry, config: &RenderConfig) {
