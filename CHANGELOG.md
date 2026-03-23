@@ -41,6 +41,21 @@
   and `relay_loop` thread it through via `Inbound{text, attachments}`.
 - **#14a**: Signal bridge now parses `dataMessage.attachments[].id` and sets
   the structured `attachments` field instead of appending text.
+
+### Outbound attachments + email bridge
+- `send_message(chat_id, content, attach=[...])` — paths delivered by bridges.
+  Pipeline: `OutboundMessageRequest.attachments` → `outbound_messages.attachments`
+  (JSON TEXT column) → `BroadcastMsg::Message.attachments` → SSE → `relay_loop`
+  outbound closure `Fn(String, Vec<String>)`.
+- Per-bridge delivery: Signal (JSON-RPC `attachments` param), Telegram
+  (`sendPhoto`/`sendDocument` multipart), Discord (`files[n]` multipart),
+  Slack (`files.getUploadURLExternal` → POST → `completeUploadExternal`),
+  stdio (prints paths), email (lettre MIME multipart).
+- **New `bridge email`** — IMAP IDLE inbound (via `async-imap`, filters by
+  `--peer`, `mailparse` for MIME body + attachment extraction to
+  `--attach-dir`) + SMTP outbound (via `lettre`, STARTTLS). chat_id is
+  `email:<peer-address>`.
+- New deps: `lettre`, `mailparse`; `reqwest` gains `multipart` feature.
 - **#13**: `ChildSettings.inherit_history` (default `True`). When `False`,
   child starts with fresh history containing only a fork SystemAlert. Memory,
   `task`, and `attach` still flow. Avoids cross-model re-ingest cost.

@@ -153,6 +153,8 @@ history.add("Summary text")
 
 ```python
 send_message(chat_id="81d4", content="Hello!")
+send_message(chat_id="signal:+1555...", content="Here's the photo",
+             attach=["/tmp/snapshot.jpg"])   # bridges deliver attachments
 ```
 
 ### Process management

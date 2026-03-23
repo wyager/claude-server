@@ -25,6 +25,7 @@ pub enum BroadcastMsg {
     Message {
         chat_id: String,
         content: String,
+        attachments: Vec<String>,
         id: i64,
         created_at: String,
     },
@@ -188,12 +189,14 @@ async fn handle_sse(
                 Ok(BroadcastMsg::Message {
                     chat_id: ref msg_chat_id,
                     ref content,
+                    ref attachments,
                     id,
                     ref created_at,
                 }) if *msg_chat_id == chat_id => {
                     let data = serde_json::json!({
                         "id": id,
                         "content": content,
+                        "attachments": attachments,
                         "created_at": created_at,
                     });
                     Some(Ok(Event::default()

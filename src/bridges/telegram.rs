@@ -84,19 +84,39 @@ async fn run_async(api_url: String, token: String, peer: i64) -> Result<()> {
         }
     });
 
-    // Outbound: sendMessage
+    // Outbound: sendMessage / sendDocument
     let send_base = base.clone();
-    super::relay_loop(&api_url, &chat_id, &format!("tg:{}", peer), rx, move |content| {
+    super::relay_loop(&api_url, &chat_id, &format!("tg:{}", peer), rx, move |content, attachments| {
         let client = client.clone();
-        let url = format!("{}/sendMessage", send_base);
+        let base = send_base.clone();
         async move {
-            let resp = client
-                .post(&url)
-                .json(&json!({"chat_id": peer, "text": content}))
-                .send()
-                .await?;
-            if !resp.status().is_success() {
-                anyhow::bail!("sendMessage returned {}: {}", resp.status(), resp.text().await.unwrap_or_default());
+            if !content.is_empty() {
+                let resp = client
+                    .post(format!("{}/sendMessage", base))
+                    .json(&json!({"chat_id": peer, "text": content}))
+                    .send()
+                    .await?;
+                if !resp.status().is_success() {
+                    anyhow::bail!("sendMessage returned {}: {}", resp.status(), resp.text().await.unwrap_or_default());
+                }
+            }
+            for path in attachments {
+                let bytes = tokio::fs::read(&path).await.with_context(|| format!("reading {}", path))?;
+                let name = std::path::Path::new(&path).file_name()
+                    .map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
+                let is_image = matches!(
+                    std::path::Path::new(&path).extension().and_then(|e| e.to_str()),
+                    Some("jpg" | "jpeg" | "png" | "gif" | "webp")
+                );
+                let (method, field) = if is_image { ("sendPhoto", "photo") } else { ("sendDocument", "document") };
+                let part = reqwest::multipart::Part::bytes(bytes).file_name(name);
+                let form = reqwest::multipart::Form::new()
+                    .text("chat_id", peer.to_string())
+                    .part(field, part);
+                let resp = client.post(format!("{}/{}", base, method)).multipart(form).send().await?;
+                if !resp.status().is_success() {
+                    anyhow::bail!("{} returned {}: {}", method, resp.status(), resp.text().await.unwrap_or_default());
+                }
             }
             Ok(())
         }

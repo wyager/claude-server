@@ -52,17 +52,26 @@ async fn run_async(api_url: String, token: String, channel: String) -> Result<()
     // Outbound: POST to channel
     let out_channel = channel.clone();
     let out_token = token.clone();
-    super::relay_loop(&api_url, &chat_id, &format!("discord:{}", channel), rx, move |content| {
+    super::relay_loop(&api_url, &chat_id, &format!("discord:{}", channel), rx, move |content, attachments| {
         let http = http.clone();
         let url = format!("https://discord.com/api/v10/channels/{}/messages", out_channel);
         let token = out_token.clone();
         async move {
-            let resp = http
-                .post(&url)
-                .header("Authorization", format!("Bot {}", token))
-                .json(&json!({"content": content}))
-                .send()
-                .await?;
+            let req = http.post(&url).header("Authorization", format!("Bot {}", token));
+            let resp = if attachments.is_empty() {
+                req.json(&json!({"content": content})).send().await?
+            } else {
+                let mut form = reqwest::multipart::Form::new()
+                    .text("payload_json", json!({"content": content}).to_string());
+                for (i, path) in attachments.iter().enumerate() {
+                    let bytes = tokio::fs::read(path).await.with_context(|| format!("reading {}", path))?;
+                    let name = std::path::Path::new(path).file_name()
+                        .map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
+                    form = form.part(format!("files[{}]", i),
+                        reqwest::multipart::Part::bytes(bytes).file_name(name));
+                }
+                req.multipart(form).send().await?
+            };
             if !resp.status().is_success() {
                 anyhow::bail!("send returned {}: {}", resp.status(), resp.text().await.unwrap_or_default());
             }

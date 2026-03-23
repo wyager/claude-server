@@ -1,4 +1,5 @@
 mod discord;
+mod email;
 mod signal;
 mod slack;
 mod stdio;
@@ -15,7 +16,7 @@ fn default_api_url() -> String {
         .unwrap_or_else(|_| "http://127.0.0.1:3000".into())
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct ApiUrl {
     /// Claude Server API URL (env: CLAUDE_SERVER_BRIDGE_API)
     #[arg(long, default_value_t = default_api_url())]
@@ -34,6 +35,8 @@ pub enum BridgeCmd {
     Slack(slack::SlackArgs),
     /// Relay via Discord Gateway websocket
     Discord(discord::DiscordArgs),
+    /// Relay via IMAP IDLE (receive) + SMTP (send)
+    Email(email::EmailArgs),
 }
 
 pub fn run(cmd: BridgeCmd) {
@@ -43,6 +46,7 @@ pub fn run(cmd: BridgeCmd) {
         BridgeCmd::Telegram(a) => telegram::run(a),
         BridgeCmd::Slack(a) => slack::run(a),
         BridgeCmd::Discord(a) => discord::run(a),
+        BridgeCmd::Email(a) => email::run(a),
     }
 }
 
@@ -71,7 +75,7 @@ pub async fn relay_loop<F, Fut>(
     outbound: F,
 ) -> Result<()>
 where
-    F: Fn(String) -> Fut,
+    F: Fn(String, Vec<String>) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
     let client = reqwest::Client::new();
@@ -139,7 +143,11 @@ where
                             if pending_event == "message" && !pending_data.is_empty() {
                                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pending_data) {
                                     if let Some(content) = v.get("content").and_then(|c| c.as_str()) {
-                                        if let Err(e) = outbound(content.to_string()).await {
+                                        let attachments: Vec<String> = v.get("attachments")
+                                            .and_then(|a| a.as_array())
+                                            .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+                                            .unwrap_or_default();
+                                        if let Err(e) = outbound(content.to_string(), attachments).await {
                                             eprintln!("[bridge] outbound send failed: {}", e);
                                         }
                                     }

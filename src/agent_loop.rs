@@ -1114,10 +1114,11 @@ impl AgentLoop {
                 msg.chat_id,
                 truncate_for_log(&msg.content, 60)
             );
-            if let Ok(id) = self.db.save_outbound_message(&msg.chat_id, &msg.content) {
+            if let Ok(id) = self.db.save_outbound_message(&msg.chat_id, &msg.content, &msg.attachments) {
                 self.broadcast(BroadcastMsg::Message {
                     chat_id: msg.chat_id,
                     content: msg.content,
+                    attachments: msg.attachments,
                     id,
                     created_at: chrono::Utc::now()
                         .format("%Y-%m-%d %H:%M:%S")

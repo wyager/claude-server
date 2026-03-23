@@ -128,19 +128,18 @@ async fn run_async(
     });
 
     // Writer: serialize send requests to daemon stdin
-    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<String>();
+    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<(String, Vec<String>)>();
     let req_id = Arc::new(AtomicU64::new(1));
     let write_peer = peer.clone();
     tokio::spawn(async move {
         let mut stdin = stdin;
-        while let Some(content) = outbound_rx.recv().await {
+        while let Some((content, attachments)) = outbound_rx.recv().await {
             let id = req_id.fetch_add(1, Ordering::Relaxed);
-            let req = json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": "send",
-                "params": { "recipient": [write_peer.as_str()], "message": content }
-            });
+            let mut params = json!({ "recipient": [write_peer.as_str()], "message": content });
+            if !attachments.is_empty() {
+                params["attachments"] = json!(attachments);
+            }
+            let req = json!({ "jsonrpc": "2.0", "id": id, "method": "send", "params": params });
             let line = format!("{}\n", req);
             if let Err(e) = stdin.write_all(line.as_bytes()).await {
                 eprintln!("[signal bridge] write to daemon failed: {}", e);
@@ -150,10 +149,10 @@ async fn run_async(
     });
 
     // Relay loop: inbound → POST /message, SSE → outbound_tx
-    super::relay_loop(&api_url, &chat_id, &peer, inbound_rx, move |content| {
+    super::relay_loop(&api_url, &chat_id, &peer, inbound_rx, move |content, attachments| {
         let tx = outbound_tx.clone();
         async move {
-            tx.send(content).context("outbound channel closed")?;
+            tx.send((content, attachments)).context("outbound channel closed")?;
             Ok(())
         }
     })

@@ -50,26 +50,62 @@ async fn run_async(api_url: String, app_token: String, bot_token: String, channe
 
     // Outbound: chat.postMessage
     let out_channel = channel.clone();
-    super::relay_loop(&api_url, &chat_id, &format!("slack:{}", channel), rx, move |content| {
+    super::relay_loop(&api_url, &chat_id, &format!("slack:{}", channel), rx, move |content, attachments| {
         let http = http.clone();
         let bot_token = bot_token.clone();
         let channel = out_channel.clone();
         async move {
-            let resp: Value = http
-                .post("https://slack.com/api/chat.postMessage")
-                .bearer_auth(&bot_token)
-                .json(&json!({"channel": channel, "text": content}))
-                .send()
-                .await?
-                .json()
-                .await?;
-            if resp["ok"].as_bool() != Some(true) {
-                anyhow::bail!("chat.postMessage failed: {}", resp["error"].as_str().unwrap_or("?"));
+            if !content.is_empty() {
+                let resp: Value = http
+                    .post("https://slack.com/api/chat.postMessage")
+                    .bearer_auth(&bot_token)
+                    .json(&json!({"channel": channel, "text": content}))
+                    .send()
+                    .await?
+                    .json()
+                    .await?;
+                if resp["ok"].as_bool() != Some(true) {
+                    anyhow::bail!("chat.postMessage failed: {}", resp["error"].as_str().unwrap_or("?"));
+                }
+            }
+            for path in attachments {
+                slack_upload_file(&http, &bot_token, &channel, &path).await
+                    .with_context(|| format!("uploading {}", path))?;
             }
             Ok(())
         }
     })
     .await
+}
+
+/// Slack's files.uploadV2 three-step dance: get URL → POST bytes → complete.
+async fn slack_upload_file(http: &reqwest::Client, token: &str, channel: &str, path: &str) -> Result<()> {
+    let bytes = tokio::fs::read(path).await?;
+    let name = std::path::Path::new(path).file_name()
+        .map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
+
+    let meta: Value = http
+        .post("https://slack.com/api/files.getUploadURLExternal")
+        .bearer_auth(token)
+        .form(&[("filename", name.as_str()), ("length", &bytes.len().to_string())])
+        .send().await?.json().await?;
+    if meta["ok"].as_bool() != Some(true) {
+        anyhow::bail!("getUploadURLExternal failed: {}", meta["error"].as_str().unwrap_or("?"));
+    }
+    let upload_url = meta["upload_url"].as_str().context("no upload_url")?;
+    let file_id = meta["file_id"].as_str().context("no file_id")?;
+
+    http.post(upload_url).body(bytes).send().await?.error_for_status()?;
+
+    let done: Value = http
+        .post("https://slack.com/api/files.completeUploadExternal")
+        .bearer_auth(token)
+        .json(&json!({"files": [{"id": file_id, "title": name}], "channel_id": channel}))
+        .send().await?.json().await?;
+    if done["ok"].as_bool() != Some(true) {
+        anyhow::bail!("completeUploadExternal failed: {}", done["error"].as_str().unwrap_or("?"));
+    }
+    Ok(())
 }
 
 async fn socket_mode_loop(

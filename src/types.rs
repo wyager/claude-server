@@ -136,11 +136,6 @@ pub struct WorkItem {
     pub attachments: Vec<String>,
 }
 
-impl WorkItem {
-    pub fn new(id: AgentId, priority: u8, time: DateTime<Utc>, item_type: WorkItemType) -> Self {
-        Self { id, priority, time, item_type, attachments: Vec::new() }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueFilter {

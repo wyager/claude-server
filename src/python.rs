@@ -101,6 +101,7 @@ pub struct TimerAddRequest {
 pub struct OutboundMessageRequest {
     pub chat_id: String,
     pub content: String,
+    pub attachments: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -598,12 +599,20 @@ struct PyHarness {
 
 #[pymethods]
 impl PyHarness {
-    fn send_message(&self, chat_id: String, content: String) -> PyResult<()> {
+    #[pyo3(signature = (chat_id, content, attach=vec![]))]
+    fn send_message(&self, chat_id: String, content: String, attach: Vec<String>) -> PyResult<()> {
+        for p in &attach {
+            if !std::path::Path::new(p).is_file() {
+                return Err(pyo3::exceptions::PyFileNotFoundError::new_err(
+                    format!("send_message: attachment not found: {}", p),
+                ));
+            }
+        }
         self.collector
             .lock()
             .unwrap()
             .messages
-            .push(OutboundMessageRequest { chat_id, content });
+            .push(OutboundMessageRequest { chat_id, content, attachments: attach });
         Ok(())
     }
 

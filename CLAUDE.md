@@ -65,7 +65,7 @@ See `INTERPRETER.md` for details on the Python integration.
 | `chat.rs` | Chat UI subcommand: serves embedded HTML with API URL injection |
 | `chat.html` | Single-file HTML/CSS/JS chat interface (embedded via include_str!) |
 | `source_dump.rs` | `source` subcommand: dumps/extracts the embedded source tarball |
-| `bridges/` | `bridge` subcommand: messaging relay daemons (stdio, signal, telegram, slack, discord). Shared `relay_loop` in mod.rs. |
+| `bridges/` | `bridge` subcommand: messaging relay daemons (stdio, signal, telegram, slack, discord, email). Shared `relay_loop` in mod.rs with bidirectional attachment support. |
 | `feedback.rs` | `feedback` (client) and `feedback-server` subcommands. Agents POST bug reports to a central server (default feedback.yager.io). |
 | `watchers/` | `watch` subcommand: one-directional event sources (fs, mqtt, imap). Shared `post_event` helper in mod.rs. |
 | `webhook_proxy.rs` | `webhook-proxy` subcommand: HMAC-validated public ingress (GitHub, Slack, generic bearer) that forwards to `/event`. |
