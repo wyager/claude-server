@@ -119,6 +119,16 @@ impl ApiClient {
         pinned_memory: &[(String, String)],
     ) -> Result<ApiTurnResult> {
         let request = self.build_request(rendered, pinned_memory);
+        if let Ok(path) = std::env::var("CLAUDE_SERVER_DUMP_REQUEST") {
+            let json = serde_json::to_string(&request).unwrap_or_default();
+            if path == "1" {
+                eprintln!("=== API REQUEST JSON ===\n{}\n=== END ===",
+                    serde_json::to_string_pretty(&request).unwrap_or_default());
+            } else {
+                let _ = std::fs::write(&path, &json);
+                eprintln!("Request dumped to {}", path);
+            }
+        }
         let mut retries = 0;
         let max_retries = 3;
 

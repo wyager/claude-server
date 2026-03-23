@@ -73,9 +73,22 @@ pub fn render_context(
     text.push_str(&seg2);
     text.push_str(&tail);
 
-    let mut cached_segments = vec![seg1];
-    if !seg2.is_empty() {
-        cached_segments.push(seg2);
+    // Anthropic ignores cache_control on segments under ~1024 tokens. Merge
+    // small segments forward so we don't waste a breakpoint. Anything not
+    // pushed to cached_segments naturally falls into the tail (api_client
+    // computes tail = text[sum(cached_segments.len())..]).
+    const MIN_CACHE_CHARS: usize = 8192; // ~2048 tokens — empirically, ~1K-token
+    // segments don't reliably cache when a system breakpoint already exists
+    let mut cached_segments: Vec<String> = Vec::new();
+    let mut acc = seg1;
+    for seg in [seg2] {
+        if acc.len() >= MIN_CACHE_CHARS {
+            cached_segments.push(std::mem::take(&mut acc));
+        }
+        acc.push_str(&seg);
+    }
+    if acc.len() >= MIN_CACHE_CHARS {
+        cached_segments.push(acc);
     }
 
     RenderedContext { cached_segments, text, attachments }
@@ -687,6 +700,84 @@ mod tests {
         assert!(rendered.text.contains("<deployment_context>\n</deployment_context>"));
         assert!(rendered.text.contains("<event_history>\n</event_history>"));
         assert!(rendered.text.contains("<work_queue>\n</work_queue>"));
+    }
+
+    #[test]
+    fn test_cache_stride_segments() {
+        let mut state = HarnessState::new(200_000, 16384);
+        // Push 30 entries, each ~1000 chars so segments clear the 8192-char minimum.
+        let big_output = "x".repeat(900);
+        for i in 0..30 {
+            state.event_history.push(HistoryEntry::Execution {
+                id: AgentId(format!("{:04x}", i)),
+                time: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, i as u32).unwrap(),
+                code: format!("# turn {}", i),
+                output: big_output.clone(),
+                is_error: false,
+            });
+        }
+        let config = RenderConfig::default(); // cache_stride=10, mod_window=5
+
+        // immutable_count = 30-5 = 25; cache_splits(10) = (10, 20)
+        let (prev, cur) = state.event_history.cache_splits(config.cache_stride);
+        assert_eq!((prev, cur), (10, 20));
+
+        let r1 = render_context(&state, "", None, &config, 150_000, None, None, Vec::new());
+        // Two segments expected: seg1=entries[0..10], seg2=entries[10..20]
+        assert_eq!(r1.cached_segments.len(), 2, "expected 2 cached segments");
+        // Concatenation invariant: cached segments are a prefix of full text
+        let cached_len: usize = r1.cached_segments.iter().map(String::len).sum();
+        assert_eq!(&r1.text[..cached_len], r1.cached_segments.concat());
+
+        // Add one more entry → immutable=26, splits stay (10,20) → segments byte-identical
+        state.event_history.push(HistoryEntry::Execution {
+            id: AgentId("001e".into()),
+            time: Utc.with_ymd_and_hms(2026, 1, 1, 0, 1, 0).unwrap(),
+            code: "# turn 30".into(),
+            output: big_output.clone(),
+            is_error: false,
+        });
+        let r2 = render_context(&state, "", None, &config, 150_000, None, None, Vec::new());
+        assert_eq!(r1.cached_segments, r2.cached_segments, "segments must be byte-identical between strides");
+
+        // Advance past next stride: push 9 more → total 40, immutable=35, splits=(20,30)
+        for i in 31..40 {
+            state.event_history.push(HistoryEntry::Execution {
+                id: AgentId(format!("{:04x}", i)),
+                time: Utc.with_ymd_and_hms(2026, 1, 1, 0, 2, i as u32).unwrap(),
+                code: format!("# turn {}", i),
+                output: big_output.clone(),
+                is_error: false,
+            });
+        }
+        let (prev2, cur2) = state.event_history.cache_splits(config.cache_stride);
+        assert_eq!((prev2, cur2), (20, 30));
+        let r3 = render_context(&state, "", None, &config, 150_000, None, None, Vec::new());
+        // On stride advance: new seg1 = old (seg1+seg2), so its cache entry still hits
+        assert_eq!(
+            r3.cached_segments[0],
+            r1.cached_segments.concat(),
+            "new seg1 must equal old seg1+seg2 (transition hit)"
+        );
+    }
+
+    #[test]
+    fn test_cache_small_entries_merge() {
+        let mut state = HarnessState::new(200_000, 16384);
+        // 20 tiny entries — segments under 4096 chars should not get cache_control
+        for i in 0..20 {
+            state.event_history.push(HistoryEntry::Execution {
+                id: AgentId(format!("{:04x}", i)),
+                time: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, i as u32).unwrap(),
+                code: "x".into(),
+                output: "y".into(),
+                is_error: false,
+            });
+        }
+        let config = RenderConfig::default();
+        let r = render_context(&state, "", None, &config, 150_000, None, None, Vec::new());
+        // Tiny segments should be merged/dropped — no wasted breakpoints
+        assert!(r.cached_segments.is_empty(), "tiny segments should not get cache breakpoints");
     }
 
     #[test]

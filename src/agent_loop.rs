@@ -317,10 +317,12 @@ impl AgentLoop {
             attachments,
         );
 
+        let seg_sizes: Vec<usize> = rendered.cached_segments.iter().map(String::len).collect();
         dimlog!(
-           "[{}] Rendered context: {} chars, queue: {} items, attachments: {}",
+           "[{}] Rendered context: {} chars (cached segs: {:?}), queue: {} items, attachments: {}",
             self.name,
             rendered.text.len(),
+            seg_sizes,
             self.state.work_queue.len(),
             rendered.attachments.len()
         );

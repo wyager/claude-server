@@ -858,3 +858,25 @@ pub struct Usage {
     #[serde(default)]
     pub cache_read_input_tokens: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_content_block_cache_control_serialization() {
+        let with = ContentBlock::Text {
+            text: "hello".into(),
+            cache_control: Some(CacheControl { control_type: "ephemeral".into() }),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert_eq!(json, r#"{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}"#);
+
+        let without = ContentBlock::Text {
+            text: "hello".into(),
+            cache_control: None,
+        };
+        let json = serde_json::to_string(&without).unwrap();
+        assert_eq!(json, r#"{"type":"text","text":"hello"}"#);
+    }
+}
