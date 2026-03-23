@@ -132,19 +132,24 @@ fn render_history_entry(out: &mut String, entry: &HistoryEntry, config: &RenderC
             output,
             is_error,
         } => {
-            out.push_str(&format!("<entry id=\"{}\">\n", id));
-            out.push_str(&format!("time: {}\n", format_time(time)));
-            out.push_str("code:\n");
-            out.push_str(&indent_and_truncate(code, 2, config));
+            // Render body first so we can annotate the opening tag with its
+            // size. Token estimate stays byte-stable since entry content is
+            // immutable — doesn't bust the cache prefix.
+            let mut body = String::new();
+            body.push_str(&format!("time: {}\n", format_time(time)));
+            body.push_str("code:\n");
+            body.push_str(&indent_and_truncate(code, 2, config));
             if *is_error {
-                out.push_str("output: [ERROR]\n");
+                body.push_str("output: [ERROR]\n");
             } else {
-                out.push_str("output:\n");
+                body.push_str("output:\n");
             }
             if !output.is_empty() {
-                out.push_str(&indent_and_truncate(output, 2, config));
+                body.push_str(&indent_and_truncate(output, 2, config));
             }
-            out.push_str(&format!("</entry>\n"));
+            out.push_str(&format!("<entry id=\"{}\" est_tokens=\"{}\">\n", id, body.len() / 4));
+            out.push_str(&body);
+            out.push_str("</entry>\n");
         }
         HistoryEntry::Summary {
             id, description, ..
@@ -690,7 +695,7 @@ mod tests {
         assert!(rendered.text.contains("</deployment_context>"));
 
         assert!(rendered.text.contains("<event_history>"));
-        assert!(rendered.text.contains("<entry id=\"3a6f\">"));
+        assert!(rendered.text.contains("<entry id=\"3a6f\" est_tokens="));
         assert!(rendered.text.contains("print(work_queue[0].content)"));
         assert!(rendered.text.contains("</event_history>"));
 

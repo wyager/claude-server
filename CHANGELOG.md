@@ -60,6 +60,20 @@
   child starts with fresh history containing only a fork SystemAlert. Memory,
   `task`, and `attach` still flow. Avoids cross-model re-ingest cost.
 
+### Agent QoL (feedback #15-20)
+- `shell_output(pid, lines=N)` — optional tail of last N lines. Works on
+  running processes (output is streamed to DB as it arrives).
+- `<entry id="..." est_tokens="N">` — history entries now show their
+  estimated token cost (chars/4) in the tag. Byte-stable since entry
+  content is immutable, so doesn't bust cache prefix. Helps compaction
+  decisions.
+- `http(method, url, headers, body, block_for)` — pure-Python PREAMBLE
+  helper that wraps `shell_exec("curl", ...)` with proper arg construction.
+  Dict body auto-JSON-encoded. No new Rust code.
+- Docs: args-list goes to exec() (no shell escaping), `shlex.quote()` for
+  bash -c, text files can be `open().read()` directly, inbound attachments
+  are opt-in via `view()` (spam protection).
+
 ### Cache stride default: 10 → 1
 - Head-to-head test (25 turns each, same workload): stride=1 at 79% hit /
   $0.38 vs stride=10 at 62% / $0.55 — **31% cheaper**.

@@ -661,12 +661,20 @@ impl PyHarness {
             .unwrap_or_else(|| "unknown".to_string()))
     }
 
-    fn shell_output(&self, pid: String) -> PyResult<String> {
-        Ok(self
+    #[pyo3(signature = (pid, lines=None))]
+    fn shell_output(&self, pid: String, lines: Option<usize>) -> PyResult<String> {
+        let full = self
             .process_outputs
             .get(&pid)
             .cloned()
-            .unwrap_or_default())
+            .unwrap_or_default();
+        Ok(match lines {
+            Some(n) => {
+                let all: Vec<&str> = full.lines().collect();
+                all[all.len().saturating_sub(n)..].join("\n")
+            }
+            None => full,
+        })
     }
 
     fn shell_kill(&self, pid: String) -> PyResult<()> {
@@ -864,6 +872,19 @@ done = _harness.done
 agent_name = _harness.agent_name
 agent_lineage = _harness.agent_lineage
 harness_bin = _harness.harness_bin
+
+def http(method, url, headers=None, body=None, block_for=None, **kw):
+    """Thin curl wrapper — same block_for semantics as shell_exec.
+    Returns a pid; result arrives as ProcessCompleted with output_preview
+    containing the response body followed by the status code on the last line."""
+    args = ["-sS", "-X", method.upper(), url, "-w", "\n%{http_code}"]
+    for k, v in (headers or {}).items():
+        args += ["-H", f"{k}: {v}"]
+    if body is not None:
+        args += ["-d", body if isinstance(body, str) else __import__("json").dumps(body)]
+    return shell_exec(cmd="curl", args=args,
+                      description=f"HTTP {method.upper()} {url}",
+                      block_for=block_for or timedelta(seconds=3), **kw)
 "#;
 
 const COMPACTION_PREAMBLE: &str = r#"

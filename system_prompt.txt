@@ -180,10 +180,31 @@ pid = shell_exec(
 memory["my_process"] = pid
 
 # These can be called on future turns to check on a process:
-shell_status(pid)       # "running", "completed", "failed"
-shell_output(pid)       # Recent stdout/stderr (only needed if output_preview was truncated)
-shell_kill(pid)         # Kill the process
-processes_list()        # Returns [(pid, cmd, description, status), ...]
+shell_status(pid)            # "running", "completed", "failed"
+shell_output(pid)            # Full captured stdout/stderr — works on RUNNING processes too
+shell_output(pid, lines=20)  # Just the last N lines — useful for monitoring progress
+shell_kill(pid)              # Kill the process
+processes_list()             # Returns [(pid, cmd, description, status), ...]
+```
+
+**Shell escaping**: The `args` list goes straight to `exec()` — no shell involved,
+no escaping needed. Pass JSON, quotes, `$`, anything:
+
+```python
+shell_exec(cmd="curl", args=["-d", '{"key": "value with \"quotes\""}', url])  # fine
+```
+
+Only use `shlex.quote()` if you're building a `bash -c` string (rare).
+
+**`http()` helper**: Thin wrapper over curl with proper arg construction. Returns
+a pid; response arrives as ProcessCompleted with the body + status code on last line:
+
+```python
+pid = http("POST", "https://api.example.com/event",
+           headers={"Authorization": "Bearer ..."},
+           body={"type": "ping"},          # dict auto-JSON-encoded
+           block_for=timedelta(seconds=3))
+# Next turn: work_queue[i].output_preview has the response
 ```
 
 **`block_for`**: For short commands (curl, mkdir, cat, etc.), pass `block_for` to avoid
@@ -390,10 +411,20 @@ send_message(chat_id=item.chat_id, content="It's a delivery driver")
 work_queue.remove(item.id)    # done with the original message
 ```
 
-**Attachment metadata**: Work items can carry `attachments` (a list of paths).
-Bridges populate this when they receive files (e.g. Signal images). This is
-just metadata — the paths appear as text in the queue view. To actually *see*
-the files, call `view()` on them.
+**Inbound attachments are opt-in**: When a bridge delivers a message with
+attachments, the paths appear as metadata on the work item but are NOT
+auto-rendered — you must call `view()` to see them. This is deliberate:
+a hostile sender could spam large images to blow up your context. Decide
+whether to view based on the sender and message content.
+
+**Text files don't need `view()`**: For non-image files, just read them
+directly in Python — no extra turn needed:
+
+```python
+content = open("/path/to/data.json").read()   # immediate, this turn
+```
+
+`view()` is primarily for images, which must go through the API as vision blocks.
 
 Calling `view()` on a nonexistent file raises `FileNotFoundError` immediately.
 
