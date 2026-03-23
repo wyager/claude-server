@@ -2,6 +2,40 @@
 
 ## 2026-03-23
 
+### Watchers (`watch fs|mqtt|imap`)
+- New `src/watchers/` subcommand family. Long-lived daemons that POST batched
+  `ExternalEvent` items to `/event`.
+- **Shared debounce loop** (`watchers/mod.rs::debounce_loop`): events are
+  collected with a reset-on-event debounce (default 3s) and a force-flush cap
+  (default 10s) so a steady stream can't stall indefinitely. Each batch is one
+  work item with `data = {count, events: [...]}`. Both timers configurable
+  per-watcher via `--debounce-ms`/`--force-ms`.
+- `watch fs` — filesystem events via the `notify` crate. Native backend by
+  default; `--poll-interval-ms N` switches to `PollWatcher` for NFS/SMB/sshfs
+  where inotify/FSEvents miss remote writes.
+- `watch mqtt` — MQTT subscriber via `rumqttc`. Topic wildcards, auth, retain.
+- `watch imap` — IMAP IDLE via `async-imap`. Push-based, reconnects, fetches
+  `{from, subject, uid}` for new messages.
+
+### Webhook proxy
+- `claude-server webhook-proxy` — authenticated public ingress. Routes:
+  `/github` (X-Hub-Signature-256 HMAC), `/slack` (X-Slack-Signature with 5-min
+  replay protection, handles URL verification challenge), `/generic` (Bearer
+  token passthrough). Optional TLS via the same `TlsListener` as
+  feedback-server (now `pub`).
+- New deps: `hmac`, `sha2`, `hex`, `notify`, `rumqttc`, `async-imap`,
+  `async-native-tls`.
+
+### Feedback fixes
+- **#14b**: Agent no longer idles with pending attachments — does one more turn
+  to see them. One-line change to the idle condition in `agent_loop.rs`.
+- **#14a**: Signal bridge now includes attachment paths in forwarded messages
+  as `[attachments: /path, ...]`. Parsed from signal-cli's jsonRpc
+  `dataMessage.attachments[].id`.
+- **#13**: `ChildSettings.inherit_history` (default `True`). When `False`,
+  child starts with fresh history containing only a fork SystemAlert. Memory,
+  `task`, and `attach` still flow. Avoids cross-model re-ingest cost.
+
 ### Prompt caching fix (two-breakpoint stride scheme)
 - Previously only the system prompt was cached; the rendered context (event_history
   etc.) paid full input price every turn. First attempt put a breakpoint at the

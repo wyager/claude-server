@@ -77,6 +77,13 @@ async fn run_async(
     let chat_id = format!("signal:{}", peer);
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
 
+    // signal-cli saves received attachments here; we include the full path in
+    // the forwarded message so the agent can attach() them.
+    let attach_dir = std::env::var("XDG_DATA_HOME")
+        .map(|d| format!("{}/signal-cli/attachments", d))
+        .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.local/share/signal-cli/attachments", h)))
+        .unwrap_or_else(|_| "~/.local/share/signal-cli/attachments".into());
+
     // Reader: parse JSON-RPC lines from daemon stdout
     let read_peer = peer.clone();
     tokio::spawn(async move {
@@ -100,12 +107,22 @@ async fn run_async(
                 if src != Some(read_peer.as_str()) {
                     continue;
                 }
-                if let Some(text) = env["dataMessage"]["message"].as_str() {
-                    if !text.is_empty() {
-                        if inbound_tx.send(text.to_string()).is_err() {
-                            return;
-                        }
-                    }
+                let dm = &env["dataMessage"];
+                let text = dm["message"].as_str().unwrap_or("");
+                let attachments: Vec<String> = dm["attachments"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|a| a["id"].as_str())
+                    .map(|id| format!("{}/{}", attach_dir, id))
+                    .collect();
+                let content = match (text.is_empty(), attachments.is_empty()) {
+                    (true, true) => continue,
+                    (false, true) => text.to_string(),
+                    (_, false) => format!("{}\n[attachments: {}]", text, attachments.join(", ")),
+                };
+                if inbound_tx.send(content).is_err() {
+                    return;
                 }
             }
         }

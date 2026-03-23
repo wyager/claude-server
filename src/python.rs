@@ -65,6 +65,10 @@ pub struct ForkChildSettings {
     pub model: Option<String>,  // None = inherit parent's model
     pub max_turns: u32,
     pub can_compact: bool,
+    /// If false, child starts with fresh history containing only a fork
+    /// SystemAlert. Useful for cross-model forks where inheriting the parent's
+    /// full context means paying a full re-ingest on the new model's cache.
+    pub inherit_history: bool,
     /// File paths to attach on the child's first turn.
     /// Same semantics as attach() — ephemeral, one turn only.
     pub attachments: Vec<Attachment>,
@@ -730,6 +734,8 @@ impl PyHarness {
                 paths.into_iter().map(Attachment::new).collect()
             };
 
+            let inherit_history: bool = item.getattr("inherit_history")?.extract()?;
+
             names.push(name.clone());
             child_settings.push(ForkChildSettings {
                 name,
@@ -737,6 +743,7 @@ impl PyHarness {
                 model,
                 max_turns,
                 can_compact,
+                inherit_history,
                 attachments,
             });
         }
@@ -823,6 +830,7 @@ class ChildSettings:
     model: str | None = None
     max_turns: int = 20
     can_compact: bool = True
+    inherit_history: bool = True
     attach: list[str] | None = None
 
 send_message = _harness.send_message

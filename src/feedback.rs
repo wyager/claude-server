@@ -212,7 +212,7 @@ pub fn run_server(args: ServerArgs) {
     });
 }
 
-fn build_tls_acceptor(cert_path: &str, key_path: &str) -> tokio_rustls::TlsAcceptor {
+pub fn build_tls_acceptor(cert_path: &str, key_path: &str) -> tokio_rustls::TlsAcceptor {
     use rustls::ServerConfig;
     use rustls_pemfile::{certs, private_key};
     use std::fs::File;
@@ -242,7 +242,7 @@ fn build_tls_acceptor(cert_path: &str, key_path: &str) -> tokio_rustls::TlsAccep
 
 /// TLS listener that spawns handshakes into background tasks so a slow or
 /// stalled client can't block the accept loop.
-struct TlsListener {
+pub struct TlsListener {
     local_addr: SocketAddr,
     ready_rx: tokio::sync::mpsc::Receiver<(
         tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
@@ -251,7 +251,7 @@ struct TlsListener {
 }
 
 impl TlsListener {
-    fn new(tcp: tokio::net::TcpListener, acceptor: tokio_rustls::TlsAcceptor) -> Self {
+    pub fn new(tcp: tokio::net::TcpListener, acceptor: tokio_rustls::TlsAcceptor) -> Self {
         let local_addr = tcp.local_addr().expect("listener local_addr");
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         tokio::spawn(async move {

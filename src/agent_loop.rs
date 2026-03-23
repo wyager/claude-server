@@ -186,7 +186,8 @@ impl AgentLoop {
 
             // If work queue is empty, wait for events (messages, process
             // completions, timer fires). Agents exit explicitly via done().
-            if self.state.work_queue.is_empty() {
+            // Don't idle with pending attachments — do one more turn to see them.
+            if self.state.work_queue.is_empty() && self.pending_attachments.is_empty() {
                 if !idle {
                     dimlog!("[{}] Idle, waiting for events...", self.name);
                     idle = true;
@@ -954,6 +955,19 @@ impl AgentLoop {
                 child_state.timer_manager = TimerManager::new();
                 child_state.process_manager = ProcessManager::new();
                 child_state.last_input_tokens = 0;
+
+                if !child_settings.inherit_history {
+                    child_state.event_history = EventHistory::new();
+                    let alert_id = child_state.id_generator.next();
+                    child_state.event_history.push(HistoryEntry::SystemAlert {
+                        id: alert_id,
+                        time: Utc::now(),
+                        message: format!(
+                            "Forked from '{}' with fresh history. Task: {}",
+                            self.permissions.agent_name, child_settings.task
+                        ),
+                    });
+                }
 
                 // Add task as work item
                 let task_id = child_state.id_generator.next();

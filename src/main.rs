@@ -13,6 +13,8 @@ mod python;
 mod renderer;
 mod source_dump;
 mod types;
+mod watchers;
+mod webhook_proxy;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -74,6 +76,13 @@ enum Command {
     Feedback(feedback::FeedbackArgs),
     /// Run the feedback collection server
     FeedbackServer(feedback::ServerArgs),
+    /// Start an event watcher (fs, mqtt, imap)
+    Watch {
+        #[command(subcommand)]
+        watch: watchers::WatchCmd,
+    },
+    /// Authenticated public webhook ingress (GitHub, Slack, generic)
+    WebhookProxy(webhook_proxy::WebhookArgs),
 }
 
 fn main() {
@@ -85,6 +94,8 @@ fn main() {
         Some(Command::Bridge { bridge }) => bridges::run(bridge),
         Some(Command::Feedback(a)) => feedback::run_client(a),
         Some(Command::FeedbackServer(a)) => feedback::run_server(a),
+        Some(Command::Watch { watch }) => watchers::run(watch),
+        Some(Command::WebhookProxy(a)) => webhook_proxy::run(a),
         None => {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             let result = rt.block_on(run_daemon(cli.dump_turns, cli.dump_dir, !cli.daemon));

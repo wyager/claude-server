@@ -67,6 +67,8 @@ See `INTERPRETER.md` for details on the Python integration.
 | `source_dump.rs` | `source` subcommand: dumps/extracts the embedded source tarball |
 | `bridges/` | `bridge` subcommand: messaging relay daemons (stdio, signal, telegram, slack, discord). Shared `relay_loop` in mod.rs. |
 | `feedback.rs` | `feedback` (client) and `feedback-server` subcommands. Agents POST bug reports to a central server (default feedback.yager.io). |
+| `watchers/` | `watch` subcommand: one-directional event sources (fs, mqtt, imap). Shared `post_event` helper in mod.rs. |
+| `webhook_proxy.rs` | `webhook-proxy` subcommand: HMAC-validated public ingress (GitHub, Slack, generic bearer) that forwards to `/event`. |
 | `system_prompt.txt` | System prompt sent to Claude on every API call |
 | `build.rs` | Discovers Python LIBDIR at build time, bakes rpath into binary |
 | `INTERPRETER.md` | How the Python interpreter integration works (PyO3, side effects, etc.) |

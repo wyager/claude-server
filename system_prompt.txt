@@ -251,6 +251,35 @@ for the full list. Bridges relay messages between an external service and your
 existing `send_message()` / work-queue flow — the chat_id is `"<bridge>:<peer>"`
 (e.g. `"telegram:987654321"`, `"signal:+15551234567"`, `"slack:C0123..."`).
 
+**Watchers** (`watch fs|mqtt|imap`) are one-directional event sources that POST
+to your work queue as batched `ExternalEvent` items. Events are debounced
+(default 3s, reset on each new event) with a force-flush cap (default 10s) so
+bursts don't swamp you and steady streams don't stall forever.
+
+```python
+# React to files landing in a directory
+shell_exec(cmd=harness_bin, args=["watch", "fs", "--path", "/camera/stills"],
+           description="Camera snapshot watcher", alert_timer=timedelta(hours=24))
+
+# Subscribe to MQTT topics (Home Assistant, Zigbee2MQTT, etc.)
+shell_exec(cmd=harness_bin, args=["watch", "mqtt", "--broker", "localhost:1883",
+           "--topic", "home/+/motion"],
+           description="MQTT motion events", alert_timer=timedelta(hours=24))
+```
+
+Each batch arrives as one work item with `data = {"count": N, "events": [...]}`.
+The queue preview shows `count`; the full list is available via Python:
+
+```python
+item = work_queue[0]
+if item.type == "ExternalEvent" and item.source == "fs":
+    for ev in item.data["events"]:
+        print(ev["path"], ev["kind"])
+```
+
+**Webhook ingress** (`webhook-proxy`) validates GitHub/Slack HMACs and forwards
+to your work queue — use for CI events, slash commands, etc.
+
 ### Sub-agents (fork)
 
 Fork child agents for parallel work. Children inherit your full context (event history
@@ -265,6 +294,7 @@ fork([
         model="claude-sonnet-4-5-20250929",              # Model (default: inherit parent)
         max_turns=20,                                    # Max turns (default 20)
         can_compact=True,                                # Can compact context (default True)
+        inherit_history=True,                            # Inherit parent's event history (default True)
         attach=[],                                       # File paths to attach on child's first turn (default [])
     ),
     ChildSettings(
@@ -275,6 +305,12 @@ fork([
 # fork() is a no-op for you (the parent). Children see the fork as a SystemAlert
 # in their history, then receive their task as a work item from you.
 ```
+
+**`inherit_history=False`**: Use when forking to a *different model* for a
+self-contained task. Caching is per-model, so a Sonnet child of an Opus parent
+pays full price to re-ingest a context it may not need. With `False`, the child
+starts with just a fork SystemAlert. Memory, `task`, and `attach` still flow —
+seed any needed context through those.
 
 **`attach`**: Seeds the child's first-turn attachments — same semantics as the child
 calling `attach()` before its first turn. Use this to hand a child images or large

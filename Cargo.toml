@@ -23,3 +23,10 @@ clap = { version = "4", features = ["derive", "env"] }
 rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
+notify = "6"
+rumqttc = "0.24"
+async-imap = { version = "0.10", default-features = false, features = ["runtime-tokio"] }
+async-native-tls = { version = "0.5", default-features = false, features = ["runtime-tokio"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
