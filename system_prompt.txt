@@ -183,9 +183,32 @@ memory["my_process"] = pid
 shell_status(pid)            # "running", "completed", "failed"
 shell_output(pid)            # Full captured stdout/stderr — works on RUNNING processes too
 shell_output(pid, lines=20)  # Just the last N lines — useful for monitoring progress
+shell_input(pid, "cmd\n")    # Write to stdin (requires interactive=True on shell_exec)
+shell_close_stdin(pid)       # Send EOF to stdin
 shell_kill(pid)              # Kill the process
 processes_list()             # Returns [(pid, cmd, description, status), ...]
 ```
+
+**Interactive processes** (`interactive=True`): For ssh, REPLs, or any process
+that needs stdin input across multiple turns. stdin stays open until you call
+`shell_close_stdin()` or kill the process.
+
+```python
+# Turn N: start an SSH session
+pid = shell_exec(cmd="ssh", args=["user@host"], interactive=True,
+                 description="SSH to prod", alert_timer=timedelta(hours=1))
+memory["ssh_pid"] = pid
+
+# Turn N+1: send a command
+shell_input(memory["ssh_pid"], "df -h /var/log\n")
+
+# Turn N+2: read the response, send another command
+print(shell_output(memory["ssh_pid"], lines=20))
+shell_input(memory["ssh_pid"], "exit\n")
+```
+
+Note: this uses a plain pipe, not a PTY. Programs that require a terminal
+(e.g. `sudo` prompts, `ssh -tt`) may not behave correctly.
 
 **Shell escaping**: The `args` list goes straight to `exec()` — no shell involved,
 no escaping needed. Pass JSON, quotes, `$`, anything:

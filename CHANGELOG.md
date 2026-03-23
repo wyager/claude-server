@@ -74,6 +74,14 @@
   bash -c, text files can be `open().read()` directly, inbound attachments
   are opt-in via `view()` (spam protection).
 
+### Interactive processes (`shell_input`)
+- `shell_exec(..., interactive=True)` pipes stdin and keeps it open.
+- `shell_input(pid, data)` writes bytes to the process's stdin via an
+  unbounded channel → dedicated writer task (non-blocking from Python).
+- `shell_close_stdin(pid)` sends EOF by dropping the writer.
+- Enables SSH sessions, REPLs, interactive CLIs across turns. Plain pipe,
+  not PTY — programs requiring a terminal may misbehave.
+
 ### Cache stride default: 10 → 1
 - Head-to-head test (25 turns each, same workload): stride=1 at 79% hit /
   $0.38 vs stride=10 at 62% / $0.55 — **31% cheaper**.

@@ -852,6 +852,8 @@ impl AgentLoop {
 
         // Process kills
         deferred.process_kills = effects.process_kills;
+        deferred.stdin_writes = effects.stdin_writes;
+        deferred.stdin_closes = effects.stdin_closes;
 
         // view() calls → one View work item (priority 10, lands at head)
         if !effects.view_paths.is_empty() {
@@ -1255,6 +1257,14 @@ impl AgentLoop {
                 eprintln!("[{}] Failed to kill process {}: {}", self.name, id, e);
             }
         }
+
+        // Interactive process stdin
+        for (pid, data) in deferred.stdin_writes {
+            self.process_supervisor.send_stdin(&pid, data).await;
+        }
+        for pid in deferred.stdin_closes {
+            self.process_supervisor.close_stdin(&pid).await;
+        }
     }
 }
 
@@ -1265,6 +1275,8 @@ struct DeferredOps {
     block_for_waiters: Vec<(u64, tokio::sync::oneshot::Receiver<()>)>,
     /// Process IDs to kill
     process_kills: Vec<String>,
+    stdin_writes: Vec<(String, Vec<u8>)>,
+    stdin_closes: Vec<String>,
 }
 
 /// Standalone async function to run a child agent loop.

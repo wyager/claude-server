@@ -43,6 +43,10 @@ pub struct SideEffectCollector {
     pub messages: Vec<OutboundMessageRequest>,
     pub process_starts: Vec<ProcessStartRequest>,
     pub process_kills: Vec<String>,
+    /// (pid, bytes) pairs to write to interactive process stdin.
+    pub stdin_writes: Vec<(String, Vec<u8>)>,
+    /// pids whose stdin should be closed (EOF).
+    pub stdin_closes: Vec<String>,
     pub history_removes: Vec<String>,
     pub history_replaces: Vec<(String, String)>,
     pub history_adds: Vec<String>,
@@ -115,6 +119,8 @@ pub struct ProcessStartRequest {
     pub success_prio: u8,
     pub fail_prio: u8,
     pub block_for_ms: Option<u64>,
+    /// Keep stdin open for shell_input(). When false, stdin is /dev/null.
+    pub interactive: bool,
 }
 
 // ---- Execution Result ----
@@ -616,7 +622,7 @@ impl PyHarness {
         Ok(())
     }
 
-    #[pyo3(signature = (cmd, args=vec![], env=HashMap::new(), description="".to_string(), alert_timer=None, success_prio=7, fail_prio=8, block_for=None))]
+    #[pyo3(signature = (cmd, args=vec![], env=HashMap::new(), description="".to_string(), alert_timer=None, success_prio=7, fail_prio=8, block_for=None, interactive=false))]
     fn shell_exec<'py>(
         &self,
         cmd: String,
@@ -627,6 +633,7 @@ impl PyHarness {
         success_prio: u8,
         fail_prio: u8,
         block_for: Option<&Bound<'py, PyAny>>,
+        interactive: bool,
     ) -> PyResult<String> {
         let alert_secs = match alert_timer {
             Some(val) => extract_seconds(val)? as u64,
@@ -649,8 +656,19 @@ impl PyHarness {
             success_prio,
             fail_prio,
             block_for_ms,
+            interactive,
         });
         Ok(id_str)
+    }
+
+    fn shell_input(&self, pid: String, data: String) -> PyResult<()> {
+        self.collector.lock().unwrap().stdin_writes.push((pid, data.into_bytes()));
+        Ok(())
+    }
+
+    fn shell_close_stdin(&self, pid: String) -> PyResult<()> {
+        self.collector.lock().unwrap().stdin_closes.push(pid);
+        Ok(())
     }
 
     fn shell_status(&self, pid: String) -> PyResult<String> {
@@ -861,6 +879,8 @@ send_message = _harness.send_message
 shell_exec = _harness.shell_exec
 shell_status = _harness.shell_status
 shell_output = _harness.shell_output
+shell_input = _harness.shell_input
+shell_close_stdin = _harness.shell_close_stdin
 shell_kill = _harness.shell_kill
 processes_list = _harness.processes_list
 acknowledge_timer = _harness.acknowledge_timer
