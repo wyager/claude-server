@@ -41,6 +41,7 @@ struct AppState {
     broadcast_tx: broadcast::Sender<BroadcastMsg>,
     token_accumulator: Arc<Mutex<TokenAccumulator>>,
     config: Arc<Config>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 // ---- Request/Response types ----
@@ -115,8 +116,8 @@ async fn handle_shutdown(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     state
-        .event_tx
-        .send(HarnessEvent::Shutdown)
+        .shutdown_tx
+        .send(true)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(serde_json::json!({ "status": "shutting_down" })))
@@ -224,6 +225,7 @@ pub fn create_router(
     broadcast_tx: broadcast::Sender<BroadcastMsg>,
     token_accumulator: Arc<Mutex<TokenAccumulator>>,
     config: Arc<Config>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) -> Router {
     let state = AppState {
         event_tx,
@@ -231,6 +233,7 @@ pub fn create_router(
         broadcast_tx,
         token_accumulator,
         config,
+        shutdown_tx,
     };
 
     Router::new()

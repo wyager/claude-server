@@ -89,6 +89,9 @@ pub struct AgentLoop {
     local_cache_read_tokens: u64,
     /// Shared agent registry for naming and inter-agent messaging.
     registry: Arc<AgentRegistry>,
+    /// Shutdown signal. When true, run() exits at the next cancellation point
+    /// — including mid-API-retry, since run_turn() is wrapped in select!.
+    shutdown: tokio::sync::watch::Receiver<bool>,
     /// Explicit return values from done(**kwargs). Populated on the turn that
     /// calls done(); read by run_child_agent_loop after run() returns.
     done_result: HashMap<String, serde_json::Value>,
@@ -111,6 +114,7 @@ impl AgentLoop {
         dump_to_stdout: bool,
         token_accumulator: Option<Arc<Mutex<TokenAccumulator>>>,
         registry: Arc<AgentRegistry>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
         let max_children: u32 = std::env::var("CLAUDE_SERVER_MAX_CHILDREN")
             .ok()
@@ -140,6 +144,7 @@ impl AgentLoop {
             local_cache_creation_tokens: 0,
             local_cache_read_tokens: 0,
             registry,
+            shutdown,
             done_result: HashMap::new(),
         }
     }
@@ -153,7 +158,6 @@ impl AgentLoop {
     pub async fn run(&mut self) -> FinishReason {
         dimlog!("[{}] Agent loop started", self.name);
         let mut idle = false;
-        let finish_reason;
 
         loop {
             // Drain any pending events
@@ -175,17 +179,9 @@ impl AgentLoop {
                     .trigger(&mut self.state, self.config.compact_target);
             }
 
-            // Drain pending events every iteration — not just when idle —
-            // so Shutdown is honored even when turns are failing in a loop.
-            loop {
-                match self.event_rx.try_recv() {
-                    Ok(HarnessEvent::Shutdown) => {
-                        dimlog!("[{}] Shutdown requested", self.name);
-                        return FinishReason::Shutdown;
-                    }
-                    Ok(event) => self.apply_event(event),
-                    Err(_) => break,
-                }
+            if *self.shutdown.borrow() {
+                dimlog!("[{}] Shutdown requested", self.name);
+                return FinishReason::Shutdown;
             }
 
             // If work queue is empty, wait for events (messages, process
@@ -212,22 +208,17 @@ impl AgentLoop {
                 tokio::select! {
                     event = self.event_rx.recv() => {
                         match event {
-                            Some(HarnessEvent::Shutdown) => {
-                                dimlog!("[{}] Shutdown requested", self.name);
-                                finish_reason = FinishReason::Shutdown;
-                                break;
-                            }
                             Some(event) => self.apply_event(event),
                             None => {
                                 dimlog!("[{}] Event channel closed, shutting down", self.name);
-                                finish_reason = FinishReason::ChannelClosed;
-                                break;
+                                return FinishReason::ChannelClosed;
                             }
                         }
                     }
                     _ = timer_sleep => {
                         self.check_timers();
                     }
+                    _ = self.shutdown.changed() => {}
                 }
                 continue;
             }
@@ -241,32 +232,32 @@ impl AgentLoop {
                        "[{}] Max turns ({}) reached, exiting",
                         self.name, max
                     );
-                    finish_reason = FinishReason::MaxTurns(max);
-                    break;
+                    return FinishReason::MaxTurns(max);
                 }
             }
 
-            // Run a turn
-            match self.run_turn().await {
+            // Run a turn. Wrapping in select! makes the entire turn future
+            // (API call, retry sleeps, Python exec) cancellable on shutdown —
+            // dropping the future cancels in-flight HTTP requests and sleeps.
+            let mut shutdown = self.shutdown.clone();
+            let turn_result = tokio::select! {
+                r = self.run_turn() => r,
+                _ = shutdown.changed() => {
+                    dimlog!("[{}] Shutdown requested (mid-turn)", self.name);
+                    return FinishReason::Shutdown;
+                }
+            };
+            match turn_result {
                 Ok(true) => {
                     dimlog!("[{}] done() called, exiting", self.name);
-                    finish_reason = FinishReason::Done;
-                    break;
+                    return FinishReason::Done;
                 }
                 Ok(false) => {}
                 Err(e) => {
                     eprintln!("[{}] Turn error: {}", self.name, e);
-                    // Race the backoff against incoming events so Shutdown
-                    // isn't delayed by the sleep.
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_secs(5)) => {}
-                        ev = self.event_rx.recv() => {
-                            if let Some(HarnessEvent::Shutdown) = ev {
-                                dimlog!("[{}] Shutdown requested", self.name);
-                                return FinishReason::Shutdown;
-                            }
-                            if let Some(ev) = ev { self.apply_event(ev); }
-                        }
+                        _ = self.shutdown.changed() => {}
                     }
                 }
             }
@@ -278,8 +269,6 @@ impl AgentLoop {
                 }
             }
         }
-
-        finish_reason
     }
 
     /// Run a single turn. Returns Ok(true) if the agent called done().
@@ -687,7 +676,6 @@ impl AgentLoop {
                     attachments: Vec::new(),
                 });
             }
-            HarnessEvent::Shutdown => {} // handled in run()
         }
     }
 
@@ -1110,6 +1098,7 @@ impl AgentLoop {
                     7, // default priority for ChildAgentCompleted
                     parent_tx,
                     registry,
+                    self.shutdown.clone(),
                 ));
             }
         }
@@ -1296,6 +1285,7 @@ async fn run_child_agent_loop(
     priority: u8,
     parent_tx: mpsc::UnboundedSender<HarnessEvent>,
     registry: Arc<AgentRegistry>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut child_loop = AgentLoop::new(
         child_name.clone(),
@@ -1313,6 +1303,7 @@ async fn run_child_agent_loop(
         false, // children don't dump to stdout
         None,  // children track tokens locally
         registry.clone(),
+        shutdown,
     );
 
     let reason = child_loop.run().await;

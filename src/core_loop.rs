@@ -46,7 +46,6 @@ pub enum HarnessEvent {
         data: serde_json::Value,
         priority: u8,
     },
-    Shutdown,
 }
 
 pub struct CoreLoop {
@@ -68,6 +67,7 @@ impl CoreLoop {
         broadcast_tx: broadcast::Sender<BroadcastMsg>,
         token_accumulator: Arc<Mutex<TokenAccumulator>>,
         registry: Arc<AgentRegistry>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
         // Register root agent in the registry
         registry
@@ -98,6 +98,7 @@ impl CoreLoop {
             dump_turns,
             Some(token_accumulator),
             registry,
+            shutdown,
         );
 
         Self { agent_loop }

@@ -188,6 +188,10 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
     // Create agent registry
     let registry = Arc::new(types::AgentRegistry::new());
 
+    // Shutdown signal — watch channel so every select! can race against it.
+    // Setting it cancels in-flight turns (API retries, sleeps) via future drop.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
     // Create core loop
     let mut core = core_loop::CoreLoop::new(
         state,
@@ -203,6 +207,7 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
         broadcast_tx.clone(),
         token_accumulator.clone(),
         registry,
+        shutdown_rx,
     );
 
     // Forward process events to the main event channel
@@ -219,11 +224,11 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
     });
 
     // Graceful shutdown on Ctrl+C. Second Ctrl+C force-exits.
-    let event_tx_for_signal = event_tx.clone();
+    let shutdown_tx_sig = shutdown_tx.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         println!("\n[signal] Ctrl+C received, shutting down gracefully (press again to force-exit)...");
-        let _ = event_tx_for_signal.send(core_loop::HarnessEvent::Shutdown);
+        let _ = shutdown_tx_sig.send(true);
         tokio::signal::ctrl_c().await.ok();
         println!("\n[signal] Force exit.");
         std::process::exit(130);
@@ -238,6 +243,7 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
         broadcast_tx,
         token_accumulator.clone(),
         config.clone(),
+        shutdown_tx.clone(),
     );
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     println!("  HTTP server listening on {}", config.listen_addr);
@@ -254,7 +260,7 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
         println!("Attach another CLI chat: claude-server bridge stdio --api-url http://{}", config.listen_addr);
         println!("HTTP API also available at http://{}", config.listen_addr);
         println!();
-        spawn_local_chat(event_tx.clone(), rx);
+        spawn_local_chat(event_tx.clone(), rx, shutdown_tx.clone());
     } else {
         println!("CLI chat:  claude-server bridge stdio --api-url http://{}", config.listen_addr);
         println!("Web UI:    claude-server chat --api-url http://{}", config.listen_addr);
@@ -276,6 +282,7 @@ const LOCAL_CHAT_ID: &str = "local";
 fn spawn_local_chat(
     event_tx: mpsc::UnboundedSender<core_loop::HarnessEvent>,
     mut broadcast_rx: broadcast::Receiver<BroadcastMsg>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) {
     // Outbound: agent → stdout. Prompt is printed on the `idle` status broadcast
     // so it always lands after the agent loop's own "Idle, waiting..." log line.
@@ -320,7 +327,7 @@ fn spawn_local_chat(
             }
         }
         // stdin closed → graceful shutdown
-        let _ = event_tx.send(core_loop::HarnessEvent::Shutdown);
+        let _ = shutdown_tx.send(true);
     });
 }
 
