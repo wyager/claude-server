@@ -424,7 +424,13 @@ impl AgentLoop {
         );
 
         if !stdout.is_empty() {
-            print!("\x1b[2m[stdout] {}\x1b[0m", stdout);
+            let preview = truncate_for_log(&stdout, 200);
+            let extra = stdout.lines().count().saturating_sub(preview.lines().count());
+            print!("\x1b[2m[stdout] {}", preview);
+            if extra > 0 {
+                print!(" [+{} more lines]", extra);
+            }
+            println!("\x1b[0m");
         }
 
         // Apply side effects (only if no error)
@@ -1138,17 +1144,20 @@ impl AgentLoop {
                 msg.chat_id,
                 truncate_for_log(&msg.content, 60)
             );
-            if let Ok(id) = self.db.save_outbound_message(&msg.chat_id, &msg.content, &msg.attachments) {
-                self.broadcast(BroadcastMsg::Message {
-                    chat_id: msg.chat_id,
-                    content: msg.content,
-                    attachments: msg.attachments,
-                    id,
-                    created_at: chrono::Utc::now()
-                        .format("%Y-%m-%d %H:%M:%S")
-                        .to_string(),
+            let id = self.db.save_outbound_message(&msg.chat_id, &msg.content, &msg.attachments)
+                .unwrap_or_else(|e| {
+                    eprintln!("[{}] save_outbound_message failed (schema mismatch? rm the .db): {}", self.name, e);
+                    0
                 });
-            }
+            self.broadcast(BroadcastMsg::Message {
+                chat_id: msg.chat_id,
+                content: msg.content,
+                attachments: msg.attachments,
+                id,
+                created_at: chrono::Utc::now()
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string(),
+            });
         }
 
         // Pinned memory (shared, cached in system prompt)

@@ -29,6 +29,22 @@ fn sniff_image_media_type(path: &Path) -> Option<&'static str> {
 /// Images → base64-encoded image block. Everything else → text block.
 /// File-not-found or read errors → text block with an error message
 /// (don't fail the turn — the agent gets feedback and moves on).
+/// Exponential backoff with cap and ±25% jitter. Base 2s, doubles each attempt.
+fn backoff(attempt: u32, cap_secs: u64) -> Duration {
+    let base = 2u64.saturating_pow(attempt).min(cap_secs);
+    let jitter = (base as f64 * 0.25 * (fastrand_ish() * 2.0 - 1.0)) as i64;
+    Duration::from_secs((base as i64 + jitter).max(1) as u64)
+}
+
+fn fastrand_ish() -> f64 {
+    use std::time::SystemTime;
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    (nanos % 1000) as f64 / 1000.0
+}
+
 fn resolve_attachment(att: &Attachment) -> ContentBlock {
     let path = &att.path;
     let display = path.display();
@@ -129,11 +145,11 @@ impl ApiClient {
                 eprintln!("Request dumped to {}", path);
             }
         }
-        let mut retries = 0;
-        let max_retries = 3;
+        let mut attempt = 0u32;
 
         loop {
-            let response = self
+            attempt += 1;
+            let send_result = self
                 .client
                 .post(format!("{}/v1/messages", self.config.api_base_url))
                 .header("x-api-key", &self.config.api_key)
@@ -141,34 +157,43 @@ impl ApiClient {
                 .header("content-type", "application/json")
                 .json(&request)
                 .send()
-                .await
-                .context("Failed to send API request")?;
+                .await;
 
-            let status = response.status();
+            let (kind, max, wait, detail) = match send_result {
+                Ok(resp) if resp.status().is_success() => {
+                    let api_response: ApiResponse = resp
+                        .json()
+                        .await
+                        .context("Failed to parse API response")?;
+                    return self.extract_code(api_response);
+                }
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let retry_after = resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .map(Duration::from_secs);
+                    let body = resp.text().await.unwrap_or_default();
+                    match status {
+                        529 => ("overloaded", 20, backoff(attempt, 60), body),
+                        429 => ("rate-limited", 8, retry_after.unwrap_or_else(|| backoff(attempt, 60)), body),
+                        500..=599 => ("server error", 5, backoff(attempt, 30), body),
+                        s => bail!("API returned {}: {}", s, body),
+                    }
+                }
+                Err(e) => ("network", 8, backoff(attempt, 30), e.to_string()),
+            };
 
-            if status.is_success() {
-                let api_response: ApiResponse = response
-                    .json()
-                    .await
-                    .context("Failed to parse API response")?;
-                return self.extract_code(api_response);
+            if attempt >= max {
+                bail!("API {} after {} attempts: {}", kind, attempt, detail);
             }
-
-            // Retry on rate limit (429) or overloaded (529)
-            if (status.as_u16() == 429 || status.as_u16() == 529) && retries < max_retries {
-                retries += 1;
-                let body = response.text().await.unwrap_or_default();
-                eprintln!(
-                    "[api] {} (attempt {}/{}): {}",
-                    status, retries, max_retries, body
-                );
-                let backoff = Duration::from_secs(2u64.pow(retries as u32));
-                tokio::time::sleep(backoff).await;
-                continue;
-            }
-
-            let body = response.text().await.unwrap_or_default();
-            bail!("API returned {}: {}", status, body);
+            eprintln!(
+                "[api] {} (attempt {}/{}), retrying in {:?}: {}",
+                kind, attempt, max, wait, detail
+            );
+            tokio::time::sleep(wait).await;
         }
     }
 

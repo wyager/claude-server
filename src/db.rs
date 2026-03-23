@@ -7,6 +7,7 @@ use crate::types::HarnessState;
 
 pub struct Database {
     conn: Mutex<Connection>,
+    path: std::path::PathBuf,
 }
 
 impl Database {
@@ -19,6 +20,7 @@ impl Database {
 
         let db = Self {
             conn: Mutex::new(conn),
+            path: path.to_path_buf(),
         };
         db.init_schema()?;
         Ok(db)
@@ -64,6 +66,25 @@ impl Database {
             );
             ",
         )?;
+        // Idempotent schema migrations for existing DBs. ALTER TABLE fails
+        // with "duplicate column" on DBs that already have it — that's fine.
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "ALTER TABLE outbound_messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+
+        // Hard-fail if the schema is still wrong after migration. Better to
+        // blow up here than silently drop messages at runtime.
+        conn.prepare(
+            "SELECT id, chat_id, content, attachments, created_at \
+             FROM outbound_messages LIMIT 0",
+        )
+        .map_err(|e| anyhow::anyhow!(
+            "DB schema check failed — delete {} and restart: {}",
+            self.path.display(), e
+        ))?;
+
         Ok(())
     }
 
