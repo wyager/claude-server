@@ -608,8 +608,16 @@ pub struct RenderConfig {
 
 impl Default for RenderConfig {
     fn default() -> Self {
+        // stride=1: head-to-head test (2026-03-23, 25 turns each) showed
+        // stride=1 at 79% hit / $0.38 vs stride=10 at 62% / $0.55. The API's
+        // prefix matching means a growing segment still hits the cached
+        // prefix — the conservative stride=10 was unnecessary.
+        let cache_stride = std::env::var("CLAUDE_SERVER_CACHE_STRIDE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
         Self {
-            cache_stride: 10,
+            cache_stride,
             history_entry_max_chars: 2000,
             history_entry_max_lines: 50,
             work_queue_content_limits: vec![500, 500, 500, 200, 200, 200, 200, 200, 200, 200],

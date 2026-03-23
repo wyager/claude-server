@@ -60,6 +60,17 @@
   child starts with fresh history containing only a fork SystemAlert. Memory,
   `task`, and `attach` still flow. Avoids cross-model re-ingest cost.
 
+### Cache stride default: 10 → 1
+- Head-to-head test (25 turns each, same workload): stride=1 at 79% hit /
+  $0.38 vs stride=10 at 62% / $0.55 — **31% cheaper**.
+- Anthropic's cache does prefix matching: when seg1 grows by one entry per
+  turn, `cache_read` climbs smoothly at 1024-chunk boundaries (8192 → 10240
+  → 12288). The conservative stride=10 was unnecessary.
+- stride=10 was actually *worse* with small entries: seg2 (10 entries ≈
+  5500 chars) stayed under the 8192-char threshold and got dropped entirely,
+  leaving 10 entries uncached.
+- Configurable via `CLAUDE_SERVER_CACHE_STRIDE` (default 1).
+
 ### Prompt caching fix (two-breakpoint stride scheme)
 - Previously only the system prompt was cached; the rendered context (event_history
   etc.) paid full input price every turn. First attempt put a breakpoint at the

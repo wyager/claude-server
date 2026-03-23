@@ -739,7 +739,7 @@ mod tests {
                 is_error: false,
             });
         }
-        let config = RenderConfig::default(); // cache_stride=10, mod_window=5
+        let config = RenderConfig { cache_stride: 10, ..RenderConfig::default() };
 
         // immutable_count = 30-5 = 25; cache_splits(10) = (10, 20)
         let (prev, cur) = state.event_history.cache_splits(config.cache_stride);
