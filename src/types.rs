@@ -895,7 +895,22 @@ pub enum ContentBlock {
         is_error: Option<bool>,
     },
     #[serde(rename = "image")]
-    Image { source: ImageSource },
+    Image {
+        source: ImageSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
+}
+
+impl ContentBlock {
+    /// Set cache_control on Text or Image blocks. No-op on other variants.
+    pub fn set_cache_control(&mut self, cc: CacheControl) {
+        match self {
+            ContentBlock::Text { cache_control, .. }
+            | ContentBlock::Image { cache_control, .. } => *cache_control = Some(cc),
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

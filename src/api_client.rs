@@ -57,6 +57,7 @@ fn resolve_attachment(att: &Attachment) -> ContentBlock {
                     media_type: media_type.to_string(),
                     data: base64::engine::general_purpose::STANDARD.encode(&bytes),
                 },
+                cache_control: None,
             },
             Err(e) => ContentBlock::Text {
                 text: format!("[attachment read error: {} — {}]", display, e),
@@ -252,8 +253,16 @@ impl ApiClient {
                 cache_control: None,
             });
         }
-        for att in &rendered.prefix_attachments {
-            blocks.push(resolve_attachment(att));
+        let n_prefix = rendered.prefix_attachments.len();
+        for (i, att) in rendered.prefix_attachments.iter().enumerate() {
+            let mut block = resolve_attachment(att);
+            // Breakpoint on the last prefix attachment guarantees the static
+            // region (system + prefix_text + all images) caches even if seg1's
+            // growing content doesn't prefix-match across block boundaries.
+            if i == n_prefix - 1 {
+                block.set_cache_control(CacheControl { control_type: "ephemeral".to_string() });
+            }
+            blocks.push(block);
         }
         for seg in &rendered.cached_segments {
             blocks.push(ContentBlock::Text {
@@ -405,7 +414,7 @@ mod tests {
 
         let block = resolve_attachment(&Attachment::new(&tmp));
         match block {
-            ContentBlock::Image { source } => {
+            ContentBlock::Image { source, .. } => {
                 assert_eq!(source.source_type, "base64");
                 assert_eq!(source.media_type, "image/png");
                 // Decode and verify it's the same bytes

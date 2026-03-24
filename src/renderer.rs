@@ -64,30 +64,38 @@ pub fn render_context(
         _ => Vec::new(),
     };
 
-    // Prefix = deploy + role_context. This text block gets NO cache_control —
-    // the breakpoint lands on seg1 (after prefix attachments) so the images
-    // are included in the cached region.
-    let mut prefix_text = String::with_capacity(4096);
-    render_deployment_context(&mut prefix_text, deployment_context);
+    // Build deploy + role_context text and collect prefix attachments.
+    let mut head = String::with_capacity(4096);
+    render_deployment_context(&mut head, deployment_context);
     let prefix_attachments: Vec<Attachment> = if let Some(rp) = role_prefix {
         if !rp.context.is_empty() {
-            prefix_text.push_str("<role_context>\n");
-            prefix_text.push_str(&rp.context);
-            if !prefix_text.ends_with('\n') { prefix_text.push('\n'); }
-            prefix_text.push_str("</role_context>\n");
+            head.push_str("<role_context>\n");
+            head.push_str(&rp.context);
+            if !head.ends_with('\n') { head.push('\n'); }
+            head.push_str("</role_context>\n");
         }
         rp.attach.iter().map(Attachment::new).collect()
     } else {
         Vec::new()
     };
 
-    // Cached segments at stride-aligned boundaries. seg1 now starts at
-    // <event_history> since deploy+role live in prefix_text.
+    // Block layout depends on prefix attachments. With images, we MUST split
+    // so they can sit between text blocks. Without images, splitting hurts:
+    // Anthropic's cache prefix-matches per-block, so a separate static block
+    // followed by a growing seg1 means seg1 never hashes to a prior entry.
+    // (Regression caught via feedback #22: root hit rate dropped from 46% to
+    // 17% after the unconditional split.) No images → merge head into seg1
+    // to restore one-growing-block semantics.
     let (prev, cur) = state.event_history.cache_splits(config.cache_stride);
     let total = state.event_history.entries().len();
 
-    let mut seg1 = String::with_capacity(4096);
-    seg1.push_str("<event_history>\n");
+    let (prefix_text, mut seg1) = if prefix_attachments.is_empty() {
+        let mut s = head;
+        s.push_str("<event_history>\n");
+        (String::new(), s)
+    } else {
+        (head, String::from("<event_history>\n"))
+    };
     render_history_range(&mut seg1, &state.event_history, config, 0..prev);
 
     let mut seg2 = String::new();

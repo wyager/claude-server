@@ -31,9 +31,17 @@
   region. Byte-identical across repeated forks → 500 camera-inspector spawns
   pay the reference-image cost once.
 - `RenderedContext` restructured: `prefix_text` + `prefix_attachments` +
-  `cached_segments` + tail. `api_client::build_request` emits blocks as
-  `[prefix_text, prefix_images..., seg1+cc, seg2+cc, tail, tail_images...]` —
-  the first cache_control breakpoint caches everything before it.
+  `cached_segments` + tail.
+- **Block layout is conditional on prefix_attachments** (cache regression
+  fix, feedback #22): with images, split `[prefix_text][imgs][seg1+cc]`;
+  without, merge deploy+history into one growing `[seg1+cc]` block. The
+  unconditional split broke root's cache (hit rate 46%→17%) because the
+  API prefix-matches per-block — a static block followed by a growing block
+  never hash-matches. Verified: root back to 82-90% hit, `cache_write=0`.
+- **cache_control on last prefix image**: guarantees the static region
+  (system + prefix_text + all images) caches even if seg1's growth doesn't
+  prefix-match across the image→text boundary. Defense-in-depth for
+  persistent children with prefix images.
 - **Determinism**: child's id_generator state, timestamps, and task string all
   land in the tail (immutable_count=0 for fresh history with mod_window=5). No
   RNG leaks into the cached prefix.
