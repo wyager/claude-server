@@ -42,6 +42,10 @@
   (system + prefix_text + all images) caches even if seg1's growth doesn't
   prefix-match across the image→text boundary. Defense-in-depth for
   persistent children with prefix images.
+- **CACHE BLOCKS dump section** (`--dump-dir`): per-turn FNV-1a hash +
+  length + head/tail snippet for prefix_text, each cached_segment, and tail,
+  plus the API usage numbers and block-order summary. Diffing hashes across
+  consecutive turns pinpoints which block's content is drifting.
 - **Determinism**: child's id_generator state, timestamps, and task string all
   land in the tail (immutable_count=0 for fresh history with mod_window=5). No
   RNG leaks into the cached prefix.

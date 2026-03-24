@@ -479,8 +479,13 @@ impl AgentLoop {
             write_turn_dump(
                 &self.name,
                 self.turn_counter,
-                &rendered.text,
-                &rendered.attachments,
+                &rendered,
+                (
+                    api_result.input_tokens,
+                    api_result.output_tokens,
+                    api_result.cache_creation_tokens,
+                    api_result.cache_read_tokens,
+                ),
                 api_result.thinking.as_deref(),
                 &api_result.code,
                 &output,

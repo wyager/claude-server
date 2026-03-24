@@ -119,11 +119,27 @@ impl CoreLoop {
 }
 
 /// Write a turn dump to stdout and/or a file.
+/// FNV-1a hash — fast, non-cryptographic, good enough to detect content drift
+/// between consecutive turns. Collision risk is irrelevant here.
+fn quick_hash(s: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{:016x}", h)
+}
+
+fn snip(s: &str, n: usize) -> String {
+    if s.len() <= n * 2 { return s.replace('\n', "⏎") }
+    format!("{}…{}", &s[..n].replace('\n', "⏎"), &s[s.len()-n..].replace('\n', "⏎"))
+}
+
 pub fn write_turn_dump(
     agent_name: &str,
     turn_number: u32,
-    context: &str,
-    attachments: &[crate::types::Attachment],
+    rendered: &crate::renderer::RenderedContext,
+    usage: (u64, u64, u64, u64),  // (input, output, cache_write, cache_read)
     thinking: Option<&str>,
     code: &str,
     output: &str,
@@ -131,10 +147,71 @@ pub fn write_turn_dump(
     to_stdout: bool,
     dump_dir: Option<&std::path::Path>,
 ) {
+    let context = &rendered.text;
+    let attachments = &rendered.attachments;
     let sep = "=".repeat(80);
     let dash = "-".repeat(80);
 
     let mut dump = String::with_capacity(context.len() + code.len() + 512);
+
+    // Cache-debug section: block structure + hashes. Diffing hashes across
+    // consecutive turns pinpoints which block's content drifted.
+    dump.push_str(&format!("{}\n", sep));
+    dump.push_str(&format!("[{}] Turn {} — CACHE BLOCKS\n", agent_name, turn_number));
+    dump.push_str(&format!("{}\n\n", sep));
+    let (in_t, out_t, cw, cr) = usage;
+    dump.push_str(&format!(
+        "API usage: in={} out={} cache_write={} cache_read={}\n\n",
+        in_t, out_t, cw, cr
+    ));
+    if rendered.prefix_text.is_empty() {
+        dump.push_str("prefix_text: (empty — merged into seg1)\n");
+    } else {
+        dump.push_str(&format!(
+            "prefix_text: {} chars  hash={}  {}\n",
+            rendered.prefix_text.len(),
+            quick_hash(&rendered.prefix_text),
+            snip(&rendered.prefix_text, 40)
+        ));
+    }
+    if rendered.prefix_attachments.is_empty() {
+        dump.push_str("prefix_attachments: (none)\n");
+    } else {
+        for (i, a) in rendered.prefix_attachments.iter().enumerate() {
+            let last = i == rendered.prefix_attachments.len() - 1;
+            dump.push_str(&format!(
+                "prefix_attach[{}]: {} {}\n",
+                i, a.path.display(),
+                if last { "  [+cache_control]" } else { "" }
+            ));
+        }
+    }
+    for (i, seg) in rendered.cached_segments.iter().enumerate() {
+        dump.push_str(&format!(
+            "cached_seg[{}]: {} chars  hash={}  [+cache_control]\n  {}\n",
+            i, seg.len(), quick_hash(seg), snip(seg, 60)
+        ));
+    }
+    if rendered.cached_segments.is_empty() {
+        dump.push_str("cached_segments: (none — all in tail)\n");
+    }
+    let cached_len: usize = rendered.cached_segments.iter().map(String::len).sum();
+    let tail = &rendered.text[rendered.prefix_text.len() + cached_len..];
+    dump.push_str(&format!(
+        "tail: {} chars  hash={}\n  {}\n",
+        tail.len(), quick_hash(tail), snip(tail, 60)
+    ));
+    dump.push_str(&format!("\nAPI block order: [system+cc]{}{}{}{}[tail:{}]\n",
+        if rendered.prefix_text.is_empty() { "" } else { " [prefix_text] " },
+        (0..rendered.prefix_attachments.len()).map(|i|
+            if i == rendered.prefix_attachments.len()-1 { "[img+cc]" } else { "[img]" }
+        ).collect::<String>(),
+        if rendered.prefix_attachments.is_empty() { "" } else { " " },
+        rendered.cached_segments.iter().map(|s| format!("[seg:{}+cc]", s.len())).collect::<String>(),
+        tail.len()
+    ));
+    dump.push_str(&format!("{}\n\n", dash));
+
     dump.push_str(&format!("{}\n", sep));
     dump.push_str(&format!(
         "[{}] Turn {} — CONTEXT SENT TO MODEL ({} chars)\n",
