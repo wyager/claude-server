@@ -350,7 +350,7 @@ impl AgentLoop {
         });
 
         // Call Claude API
-        let api_result = self.api_client.call(&rendered, &pinned).await?;
+        let api_result = self.api_client.call(&rendered, &pinned, &self.name, self.turn_counter).await?;
 
         let turn_cost = (api_result.input_tokens as f64 * self.config.cost_per_m_input
             + api_result.output_tokens as f64 * self.config.cost_per_m_output

@@ -87,10 +87,43 @@ fn resolve_attachment(att: &Attachment) -> ContentBlock {
     }
 }
 
+/// Ring buffer of recent API exchanges for self-service diagnostics. Agents
+/// can attach this to feedback reports via --with-api-trace so we don't
+/// need a separate debug build + redeploy cycle to see wire-level data.
+#[derive(Debug, serde::Serialize)]
+pub struct TraceEntry {
+    pub agent: String,
+    pub turn: u32,
+    pub request: serde_json::Value,
+    pub response: serde_json::Value,
+}
+
+pub struct ApiTrace {
+    entries: std::collections::VecDeque<TraceEntry>,
+    capacity: usize,
+}
+
+impl ApiTrace {
+    pub fn new(capacity: usize) -> Self {
+        Self { entries: std::collections::VecDeque::with_capacity(capacity), capacity }
+    }
+    fn push(&mut self, entry: TraceEntry) {
+        if self.capacity == 0 { return; }
+        while self.entries.len() >= self.capacity {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(entry);
+    }
+    pub fn snapshot(&self) -> &std::collections::VecDeque<TraceEntry> {
+        &self.entries
+    }
+}
+
 pub struct ApiClient {
     client: reqwest::Client,
     config: Arc<Config>,
     base_system_prompt: String,
+    trace: Option<Arc<std::sync::Mutex<ApiTrace>>>,
 }
 
 pub struct ApiTurnResult {
@@ -114,6 +147,7 @@ impl ApiClient {
             client,
             config,
             base_system_prompt,
+            trace: None,
         })
     }
 
@@ -127,13 +161,21 @@ impl ApiClient {
             client,
             config,
             base_system_prompt: system_prompt.to_string(),
+            trace: None,
         })
+    }
+
+    pub fn with_trace(mut self, trace: Arc<std::sync::Mutex<ApiTrace>>) -> Self {
+        self.trace = Some(trace);
+        self
     }
 
     pub async fn call(
         &self,
         rendered: &RenderedContext,
         pinned_memory: &[(String, String)],
+        agent_name: &str,
+        turn: u32,
     ) -> Result<ApiTurnResult> {
         let request = self.build_request(rendered, pinned_memory);
         if let Ok(path) = std::env::var("CLAUDE_SERVER_DUMP_REQUEST") {
@@ -142,8 +184,11 @@ impl ApiClient {
                 eprintln!("=== API REQUEST JSON ===\n{}\n=== END ===",
                     serde_json::to_string_pretty(&request).unwrap_or_default());
             } else {
-                let _ = std::fs::write(&path, &json);
-                eprintln!("Request dumped to {}", path);
+                // Treat as directory: write one file per agent-turn for diffing.
+                let _ = std::fs::create_dir_all(&path);
+                let file = format!("{}/{}-{:03}.json", path, agent_name, turn);
+                let _ = std::fs::write(&file, &json);
+                eprintln!("[{}] Request JSON dumped to {}", agent_name, file);
             }
         }
         let mut attempt = 0u32;
@@ -162,10 +207,20 @@ impl ApiClient {
 
             let (kind, max, wait, detail) = match send_result {
                 Ok(resp) if resp.status().is_success() => {
-                    let api_response: ApiResponse = resp
+                    let raw: serde_json::Value = resp
                         .json()
                         .await
                         .context("Failed to parse API response")?;
+                    if let Some(trace) = &self.trace {
+                        trace.lock().unwrap().push(TraceEntry {
+                            agent: agent_name.to_string(),
+                            turn,
+                            request: serde_json::to_value(&request).unwrap_or_default(),
+                            response: raw.clone(),
+                        });
+                    }
+                    let api_response: ApiResponse = serde_json::from_value(raw)
+                        .context("Failed to decode API response")?;
                     return self.extract_code(api_response);
                 }
                 Ok(resp) => {

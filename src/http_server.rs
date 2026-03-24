@@ -43,6 +43,7 @@ struct AppState {
     config: Arc<Config>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     registry: Arc<AgentRegistry>,
+    api_trace: Arc<Mutex<crate::api_client::ApiTrace>>,
 }
 
 // ---- Request/Response types ----
@@ -92,6 +93,11 @@ async fn handle_message(
         status: "queued".to_string(),
         chat_id,
     }))
+}
+
+async fn handle_api_trace(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let trace = state.api_trace.lock().unwrap();
+    Json(serde_json::to_value(trace.snapshot()).unwrap_or_default())
 }
 
 async fn handle_status() -> Json<StatusResponse> {
@@ -245,6 +251,7 @@ pub fn create_router(
     config: Arc<Config>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     registry: Arc<AgentRegistry>,
+    api_trace: Arc<Mutex<crate::api_client::ApiTrace>>,
 ) -> Router {
     let state = AppState {
         event_tx,
@@ -254,6 +261,7 @@ pub fn create_router(
         config,
         shutdown_tx,
         registry,
+        api_trace,
     };
 
     Router::new()
@@ -261,6 +269,7 @@ pub fn create_router(
         .route("/event", post(handle_event))
         .route("/status", get(handle_status))
         .route("/cost", get(handle_cost))
+        .route("/api-trace", get(handle_api_trace))
         .route("/messages/{chat_id}", get(handle_get_messages))
         .route("/messages/{chat_id}/stream", get(handle_sse))
         .route("/shutdown", post(handle_shutdown))

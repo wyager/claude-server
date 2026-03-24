@@ -52,19 +52,41 @@ pub struct FeedbackArgs {
     /// Feedback server URL (env: CLAUDE_SERVER_FEEDBACK_URL)
     #[arg(long, default_value_t = default_feedback_url())]
     pub url: String,
+    /// Attach the daemon's last N API request/response pairs (full JSON,
+    /// including images). Fetched from the local daemon's /api-trace endpoint.
+    #[arg(long)]
+    pub with_api_trace: bool,
 }
 
 pub fn run_client(args: FeedbackArgs) {
     let url = args.url;
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+
+    let api_trace = if args.with_api_trace {
+        let daemon = std::env::var("CLAUDE_SERVER_EVENT_URL")
+            .ok()
+            .and_then(|u| u.strip_suffix("/event").map(String::from))
+            .unwrap_or_else(|| "http://127.0.0.1:3000".to_string());
+        rt.block_on(async {
+            reqwest::Client::new()
+                .get(format!("{}/api-trace", daemon))
+                .timeout(Duration::from_secs(5))
+                .send().await.ok()?
+                .json::<serde_json::Value>().await.ok()
+        })
+    } else {
+        None
+    };
+
     let body = json!({
         "summary": args.summary,
         "details": args.details,
         "repro": args.repro,
         "harness_version": env!("CARGO_PKG_VERSION"),
         "agent_name": std::env::var("CLAUDE_SERVER_AGENT_NAME").ok(),
+        "api_trace": api_trace,
     });
 
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     let result = rt.block_on(async {
         let cert = reqwest::Certificate::from_pem(FEEDBACK_SERVER_CERT)
             .expect("Failed to parse embedded feedback server certificate");
@@ -115,6 +137,8 @@ struct FeedbackReq {
     repro: Option<String>,
     harness_version: Option<String>,
     agent_name: Option<String>,
+    #[serde(default)]
+    api_trace: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -127,6 +151,8 @@ struct FeedbackRow {
     harness_version: Option<String>,
     agent_name: Option<String>,
     remote_addr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    has_api_trace: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -169,10 +195,13 @@ pub fn run_server(args: ServerArgs) {
             repro TEXT,
             harness_version TEXT,
             agent_name TEXT,
-            remote_addr TEXT NOT NULL
+            remote_addr TEXT NOT NULL,
+            api_trace TEXT
         );",
     )
     .expect("Failed to create feedback table");
+    // Migration for existing DBs — ignore error if column already exists.
+    let _ = conn.execute("ALTER TABLE feedback ADD COLUMN api_trace TEXT", []);
 
     let has_admin = admin_token.is_some();
     let state = ServerState {
@@ -184,6 +213,7 @@ pub fn run_server(args: ServerArgs) {
     let app = Router::new()
         .route("/feedback", post(handle_post).get(handle_get))
         .route("/feedback/{id}", delete(handle_delete))
+        .route("/feedback/{id}/trace", axum::routing::get(handle_get_trace))
         .with_state(state);
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
@@ -336,10 +366,11 @@ async fn handle_post(
     }
 
     let ts = chrono::Utc::now().to_rfc3339();
+    let trace_json = req.api_trace.as_ref().map(|v| v.to_string());
     let db = state.db.lock().unwrap();
     db.execute(
-        "INSERT INTO feedback (timestamp, summary, details, repro, harness_version, agent_name, remote_addr)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO feedback (timestamp, summary, details, repro, harness_version, agent_name, remote_addr, api_trace)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![
             ts,
             req.summary,
@@ -347,7 +378,8 @@ async fn handle_post(
             req.repro,
             req.harness_version,
             req.agent_name,
-            addr.ip().to_string()
+            addr.ip().to_string(),
+            trace_json
         ],
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -368,6 +400,28 @@ fn check_admin(state: &ServerState, headers: &HeaderMap) -> Result<(), StatusCod
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(())
+}
+
+async fn handle_get_trace(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    check_admin(&state, &headers)?;
+    let db = state.db.lock().unwrap();
+    let trace: Option<String> = db
+        .query_row(
+            "SELECT api_trace FROM feedback WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    match trace {
+        Some(t) => serde_json::from_str(&t)
+            .map(Json)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR),
+        None => Err(StatusCode::NOT_FOUND),
+    }
 }
 
 async fn handle_delete(
@@ -398,7 +452,8 @@ async fn handle_get(
     let db = state.db.lock().unwrap();
     let mut stmt = db
         .prepare(
-            "SELECT id, timestamp, summary, details, repro, harness_version, agent_name, remote_addr
+            "SELECT id, timestamp, summary, details, repro, harness_version, agent_name, remote_addr,
+                    api_trace IS NOT NULL
              FROM feedback WHERE id > ?1 ORDER BY id DESC LIMIT ?2",
         )
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -413,6 +468,7 @@ async fn handle_get(
                 harness_version: r.get(5)?,
                 agent_name: r.get(6)?,
                 remote_addr: r.get(7)?,
+                has_api_trace: Some(r.get(8)?),
             })
         })
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?

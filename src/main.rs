@@ -175,7 +175,11 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
     let (broadcast_tx, _) = broadcast::channel::<http_server::BroadcastMsg>(256);
 
     // Create API client
-    let api_client = api_client::ApiClient::new(config.clone())?;
+    let trace_size: usize = std::env::var("CLAUDE_SERVER_API_TRACE_SIZE")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+    let api_trace = Arc::new(Mutex::new(api_client::ApiTrace::new(trace_size)));
+    let api_client = api_client::ApiClient::new(config.clone())?
+        .with_trace(api_trace.clone());
     println!("  API client ready");
 
     // Create process supervisor
@@ -246,6 +250,7 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
         config.clone(),
         shutdown_tx.clone(),
         registry_for_http,
+        api_trace,
     );
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     println!("  HTTP server listening on {}", config.listen_addr);

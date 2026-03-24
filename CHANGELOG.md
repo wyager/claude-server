@@ -46,6 +46,13 @@
   length + head/tail snippet for prefix_text, each cached_segment, and tail,
   plus the API usage numbers and block-order summary. Diffing hashes across
   consecutive turns pinpoints which block's content is drifting.
+- **API trace ring buffer + `--with-api-trace`**: daemon keeps the last N
+  (default 10, `CLAUDE_SERVER_API_TRACE_SIZE`) API request/response pairs
+  in RAM as exact JSON (images included). `GET /api-trace` exposes it; the
+  `feedback --with-api-trace` flag fetches and attaches to the report.
+  Server stores in an `api_trace` column, fetched via `GET /feedback/:id/trace`
+  (admin-only). Eliminates the redeploy-with-debug-flags cycle — agents can
+  self-report with wire-level data when they notice cache anomalies.
 - **Determinism**: child's id_generator state, timestamps, and task string all
   land in the tail (immutable_count=0 for fresh history with mod_window=5). No
   RNG leaks into the cached prefix.
