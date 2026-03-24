@@ -10,16 +10,27 @@ pub struct CompactionState {
     pub estimated_post_compaction: u64,
 }
 
+/// Stable per-child prefix that renders before event_history. Same bytes
+/// across repeated forks → cache hits even when task/attach vary.
+#[derive(Debug, Clone, Default)]
+pub struct RolePrefix {
+    pub context: String,
+    pub attach: Vec<String>,
+}
+
 /// The rendered context ready for the API call.
 pub struct RenderedContext {
-    /// Cached segments: each gets its own cache_control breakpoint. Two
-    /// stride-aligned segments means transitions only pay cache-write on one
-    /// stride's worth of entries, not the whole history.
+    /// Text before prefix_attachments: deploy + role_context. No cache_control
+    /// on this block — the breakpoint comes after the prefix images on seg1.
+    pub prefix_text: String,
+    /// Attachments that render in the cached region (reference images).
+    pub prefix_attachments: Vec<Attachment>,
+    /// Cached segments after the prefix: event_history content with
+    /// cache_control breakpoints. Stride-aligned for stable caching.
     pub cached_segments: Vec<String>,
-    /// The main text content (the user message).
+    /// Full concatenated text (prefix + segments + tail) for dumps/char counts.
     pub text: String,
-    /// File-path attachments to include as additional content blocks.
-    /// Resolved to image/text blocks at API-call time.
+    /// Tail attachments from the head View work item.
     pub attachments: Vec<Attachment>,
 }
 
@@ -38,13 +49,14 @@ pub type PinnedSummary = Option<(usize, usize)>;
 pub fn render_context(
     state: &HarnessState,
     deployment_context: &str,
+    role_prefix: Option<&RolePrefix>,
     compaction: Option<&CompactionState>,
     config: &RenderConfig,
     compact_at: u64,
     agent: Option<&AgentIdentity>,
     pinned_summary: PinnedSummary,
 ) -> RenderedContext {
-    // Attachments render only when a View item is at the head of the queue.
+    // Tail attachments: only when a View item is at the head of the queue.
     let attachments: Vec<Attachment> = match state.work_queue.items().first() {
         Some(WorkItem { item_type: WorkItemType::View { paths }, .. }) => {
             paths.iter().map(Attachment::new).collect()
@@ -52,14 +64,29 @@ pub fn render_context(
         _ => Vec::new(),
     };
 
-    // Cached segments at stride-aligned boundaries. Two segments means when
-    // the stride advances, the first segment's new content equals the old
-    // second segment's content — its cache entry still hits.
+    // Prefix = deploy + role_context. This text block gets NO cache_control —
+    // the breakpoint lands on seg1 (after prefix attachments) so the images
+    // are included in the cached region.
+    let mut prefix_text = String::with_capacity(4096);
+    render_deployment_context(&mut prefix_text, deployment_context);
+    let prefix_attachments: Vec<Attachment> = if let Some(rp) = role_prefix {
+        if !rp.context.is_empty() {
+            prefix_text.push_str("<role_context>\n");
+            prefix_text.push_str(&rp.context);
+            if !prefix_text.ends_with('\n') { prefix_text.push('\n'); }
+            prefix_text.push_str("</role_context>\n");
+        }
+        rp.attach.iter().map(Attachment::new).collect()
+    } else {
+        Vec::new()
+    };
+
+    // Cached segments at stride-aligned boundaries. seg1 now starts at
+    // <event_history> since deploy+role live in prefix_text.
     let (prev, cur) = state.event_history.cache_splits(config.cache_stride);
     let total = state.event_history.entries().len();
 
-    let mut seg1 = String::with_capacity(8192);
-    render_deployment_context(&mut seg1, deployment_context);
+    let mut seg1 = String::with_capacity(4096);
     seg1.push_str("<event_history>\n");
     render_history_range(&mut seg1, &state.event_history, config, 0..prev);
 
@@ -74,31 +101,38 @@ pub fn render_context(
     render_context_metadata(&mut tail, state, compaction, compact_at, agent, pinned_summary, attachments.len());
     render_work_queue(&mut tail, &state.work_queue, config);
 
-    // Concatenated view for callers that want a single string (dumps, char counts).
-    let mut text = String::with_capacity(seg1.len() + seg2.len() + tail.len());
+    // Full text for dumps/char counts. Prefix attachments aren't text so
+    // aren't included here.
+    let mut text = String::with_capacity(prefix_text.len() + seg1.len() + seg2.len() + tail.len());
+    text.push_str(&prefix_text);
     text.push_str(&seg1);
     text.push_str(&seg2);
     text.push_str(&tail);
 
     // Anthropic ignores cache_control on segments under ~1024 tokens. Merge
-    // small segments forward so we don't waste a breakpoint. Anything not
-    // pushed to cached_segments naturally falls into the tail (api_client
-    // computes tail = text[sum(cached_segments.len())..]).
-    const MIN_CACHE_CHARS: usize = 8192; // ~2048 tokens — empirically, ~1K-token
-    // segments don't reliably cache when a system breakpoint already exists
+    // small segments forward so we don't waste a breakpoint. The threshold
+    // counts prefix_text too since it's part of the cached region up to
+    // seg1's breakpoint.
+    const MIN_CACHE_CHARS: usize = 8192;
     let mut cached_segments: Vec<String> = Vec::new();
+    let prefix_boost = prefix_text.len() + prefix_attachments.len() * 4096; // rough image size
     let mut acc = seg1;
+    // seg1's effective size for the threshold includes the prefix content
+    // that precedes it (they share the same cache_control breakpoint).
+    let mut acc_effective = acc.len() + prefix_boost;
     for seg in [seg2] {
-        if acc.len() >= MIN_CACHE_CHARS {
+        if acc_effective >= MIN_CACHE_CHARS {
             cached_segments.push(std::mem::take(&mut acc));
+            acc_effective = 0;
         }
         acc.push_str(&seg);
+        acc_effective += seg.len();
     }
-    if acc.len() >= MIN_CACHE_CHARS {
+    if acc_effective >= MIN_CACHE_CHARS {
         cached_segments.push(acc);
     }
 
-    RenderedContext { cached_segments, text, attachments }
+    RenderedContext { prefix_text, prefix_attachments, cached_segments, text, attachments }
 }
 
 fn render_deployment_context(out: &mut String, deployment_context: &str) {
@@ -267,11 +301,14 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
             success,
             summary,
             result,
+            cost_usd,
+            cache_hit_pct,
         } => {
             out.push_str("type: ChildAgentCompleted\n");
             out.push_str(&format!("child_name: {}\n", child_name));
             out.push_str(&format!("success: {}\n", success));
             out.push_str(&format!("turns_used: {}\n", turns_used));
+            out.push_str(&format!("cost: ${:.4} ({}% cache hit)\n", cost_usd, cache_hit_pct));
 
             if result.is_empty() {
                 out.push_str("result: (empty)\n");
@@ -688,7 +725,7 @@ mod tests {
     fn test_render_produces_expected_structure() {
         let state = make_test_state();
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "Test deployment.", None, &config, 150_000, None, None);
+        let rendered = render_context(&state, "Test deployment.", None, None, &config, 150_000, None, None);
 
         assert!(rendered.text.contains("<deployment_context>"));
         assert!(rendered.text.contains("Test deployment."));
@@ -723,7 +760,7 @@ mod tests {
     fn test_render_empty_state() {
         let state = HarnessState::new(200_000, 16384);
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000, None, None);
+        let rendered = render_context(&state, "", None, None, &config, 150_000, None, None);
 
         assert!(rendered.text.contains("<deployment_context>\n</deployment_context>"));
         assert!(rendered.text.contains("<event_history>\n</event_history>"));
@@ -750,12 +787,14 @@ mod tests {
         let (prev, cur) = state.event_history.cache_splits(config.cache_stride);
         assert_eq!((prev, cur), (10, 20));
 
-        let r1 = render_context(&state, "", None, &config, 150_000, None, None);
+        let r1 = render_context(&state, "", None, None, &config, 150_000, None, None);
         // Two segments expected: seg1=entries[0..10], seg2=entries[10..20]
         assert_eq!(r1.cached_segments.len(), 2, "expected 2 cached segments");
-        // Concatenation invariant: cached segments are a prefix of full text
+        // Concatenation invariant: text = prefix_text ++ cached_segments ++ tail
         let cached_len: usize = r1.cached_segments.iter().map(String::len).sum();
-        assert_eq!(&r1.text[..cached_len], r1.cached_segments.concat());
+        let p = r1.prefix_text.len();
+        assert_eq!(&r1.text[..p], r1.prefix_text);
+        assert_eq!(&r1.text[p..p + cached_len], r1.cached_segments.concat());
 
         // Add one more entry → immutable=26, splits stay (10,20) → segments byte-identical
         state.event_history.push(HistoryEntry::Execution {
@@ -765,7 +804,7 @@ mod tests {
             output: big_output.clone(),
             is_error: false,
         });
-        let r2 = render_context(&state, "", None, &config, 150_000, None, None);
+        let r2 = render_context(&state, "", None, None, &config, 150_000, None, None);
         assert_eq!(r1.cached_segments, r2.cached_segments, "segments must be byte-identical between strides");
 
         // Advance past next stride: push 9 more → total 40, immutable=35, splits=(20,30)
@@ -780,7 +819,7 @@ mod tests {
         }
         let (prev2, cur2) = state.event_history.cache_splits(config.cache_stride);
         assert_eq!((prev2, cur2), (20, 30));
-        let r3 = render_context(&state, "", None, &config, 150_000, None, None);
+        let r3 = render_context(&state, "", None, None, &config, 150_000, None, None);
         // On stride advance: new seg1 = old (seg1+seg2), so its cache entry still hits
         assert_eq!(
             r3.cached_segments[0],
@@ -803,7 +842,7 @@ mod tests {
             });
         }
         let config = RenderConfig::default();
-        let r = render_context(&state, "", None, &config, 150_000, None, None);
+        let r = render_context(&state, "", None, None, &config, 150_000, None, None);
         // Tiny segments should be merged/dropped — no wasted breakpoints
         assert!(r.cached_segments.is_empty(), "tiny segments should not get cache breakpoints");
     }
@@ -818,7 +857,7 @@ mod tests {
             compaction_script: String::new(),
             estimated_post_compaction: 142000,
         };
-        let rendered = render_context(&state, "", Some(&compaction), &config, 150_000, None, None);
+        let rendered = render_context(&state, "", None, Some(&compaction), &config, 150_000, None, None);
 
         assert!(rendered.text.contains("COMPACTION MODE:"));
         assert!(rendered.text.contains("Current usage: 142000 tokens"));
@@ -860,7 +899,7 @@ mod tests {
         });
 
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000, None, None);
+        let rendered = render_context(&state, "", None, None, &config, 150_000, None, None);
 
         // Agent state should appear
         assert!(rendered.text.contains("<agent_state>"), "Missing agent_state block");
@@ -883,7 +922,7 @@ mod tests {
     fn test_render_no_agent_state_when_empty() {
         let state = HarnessState::new(200_000, 16384);
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000, None, None);
+        let rendered = render_context(&state, "", None, None, &config, 150_000, None, None);
 
         // No agent_state block when nothing to show
         assert!(!rendered.text.contains("<agent_state>"));
@@ -903,7 +942,7 @@ mod tests {
             attachments: Vec::new(),
         });
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000, None, None);
+        let rendered = render_context(&state, "", None, None, &config, 150_000, None, None);
 
         assert_eq!(rendered.attachments.len(), 2);
         assert!(rendered.text.contains("type: View"));
@@ -915,7 +954,7 @@ mod tests {
     fn test_render_no_attachment_line_when_empty() {
         let state = HarnessState::new(200_000, 16384);
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000, None, None);
+        let rendered = render_context(&state, "", None, None, &config, 150_000, None, None);
 
         assert!(!rendered.text.contains("Attachments this turn"));
     }
@@ -930,7 +969,7 @@ mod tests {
             turn_counter: 3,
             max_turns: Some(10),
         };
-        let rendered = render_context(&state, "", None, &config, 150_000, Some(&agent), None);
+        let rendered = render_context(&state, "", None, None, &config, 150_000, Some(&agent), None);
 
         assert!(rendered.text.contains("Agent: api-checker"));
         assert!(rendered.text.contains("Lineage: api-checker, child of plan-builder, child of root"));
@@ -947,7 +986,7 @@ mod tests {
             turn_counter: 5,
             max_turns: None,
         };
-        let rendered = render_context(&state, "", None, &config, 150_000, Some(&agent), None);
+        let rendered = render_context(&state, "", None, None, &config, 150_000, Some(&agent), None);
 
         assert!(rendered.text.contains("Agent: root"));
         assert!(rendered.text.contains("Turns: 5 (no limit)"));

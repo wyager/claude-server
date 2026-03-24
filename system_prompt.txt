@@ -373,6 +373,38 @@ fork([ChildSettings(
 )])
 ```
 
+**`prefix_context` / `prefix_attach` — cached role templates**: For children
+you spawn repeatedly with the same role (camera inspector, log analyzer, etc.),
+put the stable parts here instead of in `task`/`attach`. They render *before*
+event_history and sit in the cached prefix — byte-identical across forks, so
+500 invocations pay the prefix cost once.
+
+```python
+import dataclasses
+# One-time setup: store the stable role definition
+base = ChildSettings(
+    name="", task="",  # overridden per-fork
+    model="claude-sonnet-4-5", max_turns=5, inherit_history=False,
+    prefix_context="You analyze security camera footage. "
+                   "Reference images of residents are shown below. "
+                   "Alert only on strangers.",
+    prefix_attach=["/config/residents/alice.jpg",
+                   "/config/residents/bob.jpg"],
+)
+memory["inspector"] = dataclasses.asdict(base)
+
+# Per-photo (many times per day — prefix caches across all of them):
+cfg = ChildSettings(**memory["inspector"])
+cfg.name = f"inspector-{photo_id}"
+cfg.task = f"New photo at {photo_path}. Stranger or resident?"
+cfg.attach = [photo_path]  # varies per fork — lands in uncached tail
+fork([cfg])
+```
+
+`ChildAgentCompleted` now includes `cost_usd` and `cache_hit_pct` so you can
+track per-child spend: `sum(item.cost_usd for item in ...)` to answer "how much
+are we spending on camera analysis?"
+
 **Agent identity**: Every agent has a name and lineage. Access via `agent_name` and
 `agent_lineage`. The root agent is always named `"root"`. Names must be globally
 unique — if any name in a fork collides with an existing agent, the entire fork fails.

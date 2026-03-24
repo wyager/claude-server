@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-03-24
+
+### Cached role-prefix for repeated child agents
+- `ChildSettings.prefix_context` (str) and `prefix_attach` (list[str]) render
+  between `<deployment_context>` and `<event_history>`, inside the cached
+  region. Byte-identical across repeated forks → 500 camera-inspector spawns
+  pay the reference-image cost once.
+- `RenderedContext` restructured: `prefix_text` + `prefix_attachments` +
+  `cached_segments` + tail. `api_client::build_request` emits blocks as
+  `[prefix_text, prefix_images..., seg1+cc, seg2+cc, tail, tail_images...]` —
+  the first cache_control breakpoint caches everything before it.
+- **Determinism**: child's id_generator state, timestamps, and task string all
+  land in the tail (immutable_count=0 for fresh history with mod_window=5). No
+  RNG leaks into the cached prefix.
+- `ChildAgentCompleted` gains `cost_usd` and `cache_hit_pct` — computed from
+  the child's token counts at completion. Parent can track per-role spend.
+
+
 ## 2026-03-23
 
 ### Watchers (`watch fs|mqtt|imap`)

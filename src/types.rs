@@ -103,6 +103,8 @@ pub enum WorkItemType {
         turns_used: u32,
         success: bool,
         summary: String,
+        cost_usd: f64,
+        cache_hit_pct: u8,
     },
     AgentMessage {
         from: String,

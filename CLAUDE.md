@@ -125,8 +125,10 @@ globally unique name and lineage (e.g., `"api-checker, child of plan-builder,
 child of root"`). The root agent is always named `"root"`. Names are registered
 atomically via `AgentRegistry` — if any name collides, the entire fork fails.
 `ChildSettings` fields: `name`, `task`, `model` (Optional, inherits parent),
-`max_turns` (default 20), `can_compact` (default True), `attach` (list
-of file paths to attach on the child's first turn — see Attachments below).
+`max_turns` (default 20), `can_compact` (default True), `attach` (list of
+file paths → View item on child's queue), `prefix_context` + `prefix_attach`
+(stable role definition — renders before event_history in the cached region;
+use for repeated spawns of the same role so the prefix caches across forks).
 Children can compact their own context. `message_agent(name, content, priority=6)`
 enables inter-agent messaging (parent↔child, sibling↔sibling). If any message
 targets a nonexistent agent, the entire turn's side effects roll back. Children

@@ -237,13 +237,24 @@ impl ApiClient {
             }),
         }];
 
-        // Build message content: N cached segments (each with a breakpoint) + uncached tail.
-        // Segments sit at stride-aligned history boundaries so their content is
-        // byte-identical for `cache_stride` turns in a row — guaranteed cache hits.
+        // Block order: [prefix_text, prefix_images..., seg1+cc, seg2+cc, tail, tail_images...].
+        // The first cache_control breakpoint (on seg1) caches everything before it
+        // — including prefix_text and prefix_images. That's the stable per-role
+        // content for templated child agents.
+        let prefix_len = rendered.prefix_text.len();
         let cached_len: usize = rendered.cached_segments.iter().map(String::len).sum();
-        let tail = &rendered.text[cached_len..];
-        let mut blocks: Vec<ContentBlock> =
-            Vec::with_capacity(rendered.cached_segments.len() + 1 + rendered.attachments.len());
+        let tail = &rendered.text[prefix_len + cached_len..];
+        let mut blocks: Vec<ContentBlock> = Vec::new();
+
+        if !rendered.prefix_text.is_empty() {
+            blocks.push(ContentBlock::Text {
+                text: rendered.prefix_text.clone(),
+                cache_control: None,
+            });
+        }
+        for att in &rendered.prefix_attachments {
+            blocks.push(resolve_attachment(att));
+        }
         for seg in &rendered.cached_segments {
             blocks.push(ContentBlock::Text {
                 text: seg.clone(),

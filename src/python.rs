@@ -77,6 +77,13 @@ pub struct ForkChildSettings {
     pub inherit_history: bool,
     /// File paths to push as a View work item on the child's queue.
     pub attach: Vec<String>,
+    /// Stable text rendered between deployment_context and event_history.
+    /// Sits in the cached prefix — byte-identical across repeated forks of
+    /// the same role, so the cache hits even when task/attach vary.
+    pub prefix_context: Option<String>,
+    /// Attachments rendered as content blocks in the cached prefix (before
+    /// event_history). For reference images that don't change between forks.
+    pub prefix_attach: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -241,12 +248,14 @@ fn work_item_to_py(item: &WorkItem) -> PyWorkItem {
             fields.insert("pid".into(), pid.0.clone().into());
             "ProcessTimeout"
         }
-        WorkItemType::ChildAgentCompleted { child_name, result, turns_used, success, summary } => {
+        WorkItemType::ChildAgentCompleted { child_name, result, turns_used, success, summary, cost_usd, cache_hit_pct } => {
             fields.insert("child_name".into(), child_name.clone().into());
             fields.insert("result".into(), serde_json::to_value(result).unwrap_or_default());
             fields.insert("turns_used".into(), (*turns_used).into());
             fields.insert("success".into(), (*success).into());
             fields.insert("summary".into(), summary.clone().into());
+            fields.insert("cost_usd".into(), serde_json::json!(cost_usd));
+            fields.insert("cache_hit_pct".into(), (*cache_hit_pct).into());
             "ChildAgentCompleted"
         }
         WorkItemType::AgentMessage { from, content } => {
@@ -778,6 +787,15 @@ impl PyHarness {
 
             let inherit_history: bool = item.getattr("inherit_history")?.extract()?;
 
+            let prefix_context: Option<String> = {
+                let obj = item.getattr("prefix_context")?;
+                if obj.is_none() { None } else { Some(obj.extract()?) }
+            };
+            let prefix_attach: Vec<String> = {
+                let obj = item.getattr("prefix_attach")?;
+                if obj.is_none() { Vec::new() } else { obj.extract()? }
+            };
+
             names.push(name.clone());
             child_settings.push(ForkChildSettings {
                 name,
@@ -787,6 +805,8 @@ impl PyHarness {
                 can_compact,
                 inherit_history,
                 attach,
+                prefix_context,
+                prefix_attach,
             });
         }
 
@@ -874,6 +894,8 @@ class ChildSettings:
     can_compact: bool = True
     inherit_history: bool = True
     attach: list[str] | None = None
+    prefix_context: str | None = None
+    prefix_attach: list[str] | None = None
 
 send_message = _harness.send_message
 shell_exec = _harness.shell_exec
@@ -1830,6 +1852,8 @@ done(verdict="all clear", confidence=0.95, details={"camera": "front", "count": 
                 turns_used: 2,
                 success: true,
                 summary: "done".to_string(),
+                cost_usd: 0.0123,
+                cache_hit_pct: 85,
             },
             attachments: Vec::new(),
         });

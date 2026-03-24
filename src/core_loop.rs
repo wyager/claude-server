@@ -93,6 +93,7 @@ impl CoreLoop {
             event_rx,
             event_tx,
             deployment_context,
+            None,  // root agent has no role_prefix
             Some(broadcast_tx),
             dump_dir,
             dump_turns,

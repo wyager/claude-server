@@ -74,6 +74,10 @@ pub struct AgentLoop {
     event_rx: mpsc::UnboundedReceiver<HarnessEvent>,
     event_tx: mpsc::UnboundedSender<HarnessEvent>,
     deployment_context: String,
+    /// Per-child stable prefix (role instructions + reference images) that
+    /// renders before event_history and sits in the cached region. None for
+    /// the root agent.
+    role_prefix: Option<renderer::RolePrefix>,
     broadcast_tx: Option<broadcast::Sender<BroadcastMsg>>,
     dump_dir: Option<PathBuf>,
     dump_to_stdout: bool,
@@ -109,6 +113,7 @@ impl AgentLoop {
         event_rx: mpsc::UnboundedReceiver<HarnessEvent>,
         event_tx: mpsc::UnboundedSender<HarnessEvent>,
         deployment_context: String,
+        role_prefix: Option<renderer::RolePrefix>,
         broadcast_tx: Option<broadcast::Sender<BroadcastMsg>>,
         dump_dir: Option<PathBuf>,
         dump_to_stdout: bool,
@@ -132,6 +137,7 @@ impl AgentLoop {
             event_rx,
             event_tx,
             deployment_context,
+            role_prefix,
             broadcast_tx,
             dump_dir,
             dump_to_stdout,
@@ -310,6 +316,7 @@ impl AgentLoop {
         let rendered = renderer::render_context(
             &self.state,
             &self.deployment_context,
+            self.role_prefix.as_ref(),
             compaction_state.as_ref(),
             &self.config.render_config,
             self.config.compact_at,
@@ -619,6 +626,18 @@ impl AgentLoop {
                     acc.cache_read_tokens += child_cache_read_tokens;
                 }
 
+                let cost_usd = (child_input_tokens as f64 * self.config.cost_per_m_input
+                    + child_output_tokens as f64 * self.config.cost_per_m_output
+                    + child_cache_creation_tokens as f64 * self.config.cost_per_m_cache_write
+                    + child_cache_read_tokens as f64 * self.config.cost_per_m_cache_read)
+                    / 1_000_000.0;
+                let total_in = child_input_tokens + child_cache_read_tokens;
+                let cache_hit_pct = if total_in > 0 {
+                    (child_cache_read_tokens * 100 / total_in) as u8
+                } else {
+                    0
+                };
+
                 self.state.work_queue.push(WorkItem {
                     id,
                     priority,
@@ -629,6 +648,8 @@ impl AgentLoop {
                         turns_used,
                         success,
                         summary,
+                        cost_usd,
+                        cache_hit_pct,
                     },
                     attachments: Vec::new(),
                 });
@@ -897,6 +918,8 @@ impl AgentLoop {
                         turns_used: 0,
                         success: false,
                         summary: format!("Fork failed: {}", e),
+                        cost_usd: 0.0,
+                        cache_hit_pct: 0,
                     },
                     attachments: Vec::new(),
                 });
@@ -934,6 +957,8 @@ impl AgentLoop {
                                 "Could not spawn: max {} concurrent children reached",
                                 self.max_children
                             ),
+                            cost_usd: 0.0,
+                            cache_hit_pct: 0,
                         },
                         attachments: Vec::new(),
                     });
@@ -1065,6 +1090,8 @@ impl AgentLoop {
                                     turns_used: 0,
                                     success: false,
                                     summary: format!("Failed to create API client: {}", e),
+                                    cost_usd: 0.0,
+                                    cache_hit_pct: 0,
                                 },
                                 attachments: Vec::new(),
                             });
@@ -1085,6 +1112,15 @@ impl AgentLoop {
                 let parent_tx = self.event_tx.clone();
                 let registry = self.registry.clone();
 
+                let child_role_prefix =
+                    if child_settings.prefix_context.is_some() || !child_settings.prefix_attach.is_empty() {
+                        Some(renderer::RolePrefix {
+                            context: child_settings.prefix_context.unwrap_or_default(),
+                            attach: child_settings.prefix_attach,
+                        })
+                    } else {
+                        None
+                    };
                 tokio::spawn(run_child_agent_loop(
                     child_name_str,
                     child_permissions,
@@ -1096,6 +1132,7 @@ impl AgentLoop {
                     child_event_rx,
                     child_event_tx,
                     self.deployment_context.clone(),
+                    child_role_prefix,
                     dump_dir,
                     7, // default priority for ChildAgentCompleted
                     parent_tx,
@@ -1293,6 +1330,7 @@ async fn run_child_agent_loop(
     child_event_rx: mpsc::UnboundedReceiver<HarnessEvent>,
     child_event_tx: mpsc::UnboundedSender<HarnessEvent>,
     child_deployment: String,
+    child_role_prefix: Option<renderer::RolePrefix>,
     dump_dir: Option<PathBuf>,
     priority: u8,
     parent_tx: mpsc::UnboundedSender<HarnessEvent>,
@@ -1310,6 +1348,7 @@ async fn run_child_agent_loop(
         child_event_rx,
         child_event_tx,
         child_deployment,
+        child_role_prefix,
         None,  // children don't broadcast
         dump_dir,
         false, // children don't dump to stdout
