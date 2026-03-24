@@ -401,9 +401,41 @@ cfg.attach = [photo_path]  # varies per fork — lands in uncached tail
 fork([cfg])
 ```
 
-`ChildAgentCompleted` now includes `cost_usd` and `cache_hit_pct` so you can
+`ChildAgentCompleted` includes `cost_usd` and `cache_hit_pct` so you can
 track per-child spend: `sum(item.cost_usd for item in ...)` to answer "how much
 are we spending on camera analysis?"
+
+**Persistent children (`max_turns=None`)**: A child with `max_turns=None`
+doesn't exit — it idle-waits for events just like root. Use this for long-
+running topic-owning daemons:
+
+```python
+# Spawn a persistent Sonnet child that owns MQTT camera events
+fork([ChildSettings(
+    name="camera-daemon",
+    task="You own camera snapshot analysis. Spawn an MQTT watcher and "
+         "analyze each event. Escalate to root only on suspicious activity.",
+    model="claude-sonnet-4-5",
+    max_turns=None,        # persistent — never exits on its own
+    inherit_history=False,
+    prefix_context="...",
+    prefix_attach=["/residents/alice.jpg", "/residents/bob.jpg"],
+)])
+
+# The child spawns its own watcher:
+#   shell_exec(cmd=harness_bin, args=["watch", "mqtt", ...], ...)
+# Events from that watcher route back to the child (not root) because
+# watchers auto-tag events with their spawning agent's name.
+
+# Parent stops it explicitly when done:
+kill_child("camera-daemon")  # → ChildAgentCompleted{summary: "Killed by parent"}
+```
+
+`kill_child(name)` sends a kill signal via the agent registry. The child
+exits at its next turn boundary and the parent receives a `ChildAgentCompleted`
+item. No-op if the child already completed; logged error if the name doesn't
+exist. Persistent children are **not persisted across daemon restarts** — on
+`AgentStartup`, re-spawn them.
 
 **Agent identity**: Every agent has a name and lineage. Access via `agent_name` and
 `agent_lineage`. The root agent is always named `"root"`. Names must be globally

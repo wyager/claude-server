@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::connect_info::Connected;
-use axum::extract::{ConnectInfo, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::post;
+use axum::routing::{delete, post};
 use axum::serve::{IncomingStream, Listener};
 use axum::{Json, Router};
 use clap::Args;
@@ -183,6 +183,7 @@ pub fn run_server(args: ServerArgs) {
 
     let app = Router::new()
         .route("/feedback", post(handle_post).get(handle_get))
+        .route("/feedback/{id}", delete(handle_delete))
         .with_state(state);
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
@@ -355,11 +356,7 @@ async fn handle_post(
     Ok(Json(json!({"status": "ok", "id": id})))
 }
 
-async fn handle_get(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Query(q): Query<ListQuery>,
-) -> Result<Json<Vec<FeedbackRow>>, StatusCode> {
+fn check_admin(state: &ServerState, headers: &HeaderMap) -> Result<(), StatusCode> {
     let Some(admin_token) = &state.admin_token else {
         return Err(StatusCode::FORBIDDEN);
     };
@@ -370,6 +367,31 @@ async fn handle_get(
     if auth != Some(admin_token.as_str()) {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    Ok(())
+}
+
+async fn handle_delete(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    check_admin(&state, &headers)?;
+    let db = state.db.lock().unwrap();
+    let n = db
+        .execute("DELETE FROM feedback WHERE id = ?1", rusqlite::params![id])
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if n == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(json!({"status": "deleted", "id": id})))
+}
+
+async fn handle_get(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(q): Query<ListQuery>,
+) -> Result<Json<Vec<FeedbackRow>>, StatusCode> {
+    check_admin(&state, &headers)?;
 
     let limit = q.limit.unwrap_or(100).min(1000);
     let since = q.since.unwrap_or(0);

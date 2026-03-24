@@ -43,6 +43,8 @@ pub enum FinishReason {
     MaxTurns(u32),
     /// Shutdown signal received.
     Shutdown,
+    /// Parent sent kill_child().
+    Killed,
     /// Event channel closed (parent dropped).
     ChannelClosed,
 }
@@ -93,6 +95,8 @@ pub struct AgentLoop {
     local_cache_read_tokens: u64,
     /// Shared agent registry for naming and inter-agent messaging.
     registry: Arc<AgentRegistry>,
+    /// Set when a KillSignal is received; checked each turn boundary.
+    killed: bool,
     /// Shutdown signal. When true, run() exits at the next cancellation point
     /// — including mid-API-retry, since run_turn() is wrapped in select!.
     shutdown: tokio::sync::watch::Receiver<bool>,
@@ -150,6 +154,7 @@ impl AgentLoop {
             local_cache_creation_tokens: 0,
             local_cache_read_tokens: 0,
             registry,
+            killed: false,
             shutdown,
             done_result: HashMap::new(),
         }
@@ -231,6 +236,11 @@ impl AgentLoop {
 
             idle = false;
 
+            if self.killed {
+                dimlog!("[{}] Kill signal received, exiting", self.name);
+                return FinishReason::Killed;
+            }
+
             // Check max_turns limit
             if let Some(max) = self.permissions.max_turns {
                 if self.turn_counter >= max {
@@ -268,8 +278,8 @@ impl AgentLoop {
                 }
             }
 
-            // Persist state (parent only — children don't persist)
-            if self.permissions.max_turns.is_none() {
+            // Persist state (root only — children, even persistent ones, don't)
+            if self.permissions.agent_name.is_root() {
                 if let Err(e) = self.db.save_state(&self.state) {
                     eprintln!("[{}] Failed to persist state: {}", self.name, e);
                 }
@@ -308,7 +318,7 @@ impl AgentLoop {
         };
 
         let agent_identity = renderer::AgentIdentity {
-            name: &self.permissions.agent_name,
+            name: self.permissions.agent_name.as_str(),
             lineage: &lineage_str,
             turn_counter: self.turn_counter,
             max_turns: self.permissions.max_turns,
@@ -403,7 +413,7 @@ impl AgentLoop {
             &process_outputs,
             self.config.python_timeout_secs,
             self.permissions.child_depth_remaining,
-            &self.permissions.agent_name,
+            self.permissions.agent_name.as_str(),
             &lineage_str,
             &pinned_snapshot,
         );
@@ -697,6 +707,9 @@ impl AgentLoop {
                     attachments: Vec::new(),
                 });
             }
+            HarnessEvent::KillSignal => {
+                self.killed = true;
+            }
         }
     }
 
@@ -876,6 +889,16 @@ impl AgentLoop {
         deferred.stdin_writes = effects.stdin_writes;
         deferred.stdin_closes = effects.stdin_closes;
 
+        // Child agent kills: send KillSignal via registry. Unknown names are
+        // logged but don't fail the turn — the child may have already exited.
+        for name in effects.child_kills {
+            match self.registry.send_to(&name, HarnessEvent::KillSignal) {
+                Ok(true) => dimlog!("[{}] Sent kill signal to child '{}'", self.name, name),
+                Ok(false) => dimlog!("[{}] kill_child('{}'): already completed", self.name, name),
+                Err(e) => eprintln!("[{}] kill_child('{}') failed: {}", self.name, name, e),
+            }
+        }
+
         // view() calls → one View work item (priority 10, lands at head)
         if !effects.view_paths.is_empty() {
             let id = self.state.id_generator.next();
@@ -974,7 +997,7 @@ impl AgentLoop {
                 let model = child_settings.model.unwrap_or_else(|| self.config.model.clone());
 
                 dimlog!(
-                   "[{}] Forking child '{}' (model={}, max_turns={}, depth_remaining={})",
+                   "[{}] Forking child '{}' (model={}, max_turns={:?}, depth_remaining={})",
                     self.name, child_name_str, model, max_turns, child_depth
                 );
 
@@ -1031,7 +1054,7 @@ impl AgentLoop {
                     time: Utc::now(),
                     item_type: WorkItemType::UserMessage {
                         chat_id: "child-agent".to_string(),
-                        user: self.permissions.agent_name.clone(),
+                        user: self.permissions.agent_name.to_string(),
                         content: child_settings.task,
                     },
                     attachments: child_settings.attach.clone(),
@@ -1101,9 +1124,10 @@ impl AgentLoop {
 
                 let child_permissions = AgentPermissions {
                     can_compact: child_settings.can_compact,
-                    max_turns: Some(max_turns),
+                    max_turns,
                     child_depth_remaining: child_depth,
-                    agent_name: child_name_str.clone(),
+                    agent_name: AgentName::new_child(&child_name_str)
+                        .expect("child name validated at registration"),
                     lineage: child_lineage,
                 };
 
@@ -1147,7 +1171,7 @@ impl AgentLoop {
             match self.registry.send_to(
                 &msg.recipient,
                 HarnessEvent::AgentMessage {
-                    from: self.permissions.agent_name.clone(),
+                    from: self.permissions.agent_name.to_string(),
                     content: msg.content,
                     priority: msg.priority,
                 },
@@ -1223,7 +1247,7 @@ impl AgentLoop {
                 &HashMap::new(),
                 self.config.python_timeout_secs,
                 0, // compaction doesn't need to spawn children
-                &self.permissions.agent_name,
+                self.permissions.agent_name.as_str(),
                 &format_lineage(&self.permissions.lineage),
                 &HashMap::new(), // compaction doesn't need pinned memory
             );
@@ -1364,6 +1388,7 @@ async fn run_child_agent_loop(
         FinishReason::Done => (true, "Called done()".to_string()),
         FinishReason::MaxTurns(max) => (false, format!("Max turns ({}) exceeded", max)),
         FinishReason::Shutdown => (false, "Shutdown".to_string()),
+        FinishReason::Killed => (false, "Killed by parent".to_string()),
         FinishReason::ChannelClosed => (false, "Parent disconnected".to_string()),
     };
 

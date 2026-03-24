@@ -68,6 +68,9 @@ pub async fn debounce_loop(
 
     let client = reqwest::Client::new();
     let url = format!("{}/event", common.api_url);
+    // Route back to whichever agent spawned this watcher (ProcessSupervisor
+    // injects the owning agent's name). Falls back to root if unset.
+    let agent = std::env::var("CLAUDE_SERVER_AGENT_NAME").ok();
     let debounce = Duration::from_millis(common.debounce_ms);
     let force = Duration::from_millis(common.force_ms);
 
@@ -106,6 +109,7 @@ pub async fn debounce_loop(
                 "type": "batch",
                 "data": {"count": count, "events": events},
                 "priority": common.priority,
+                "agent": agent,
             });
             match client.post(&url).json(&body).send().await {
                 Ok(r) if r.status().is_success() => {

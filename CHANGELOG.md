@@ -2,6 +2,29 @@
 
 ## 2026-03-24
 
+### Persistent children + event routing + kill_child
+- `ChildSettings.max_turns=None` → persistent child that idle-waits like
+  root. `AgentPermissions.max_turns` was already `Option<u32>` — just exposed
+  `None` to the fork path. State-persistence gate changed from
+  `max_turns.is_none()` to `agent_name == "root"` so persistent children
+  don't accidentally save to SQLite.
+- `POST /event` accepts optional `agent` field — routes via `AgentRegistry`
+  to that agent's channel. Unknown/completed agents fall back to root with a
+  synthetic `agent-not-found` event so nothing is silently dropped. Watchers
+  auto-include `CLAUDE_SERVER_AGENT_NAME` (already in their env from
+  ProcessSupervisor) so events route back to the spawning agent.
+- `kill_child(name)` Python builtin → `HarnessEvent::KillSignal` via
+  `registry.send_to()`. Child's `apply_event` sets `killed=true`, checked at
+  turn boundary → `FinishReason::Killed` → parent gets `ChildAgentCompleted
+  {summary: "Killed by parent"}`.
+- Feedback server: `DELETE /feedback/:id` (admin-only) for triage cleanup.
+  Extracted `check_admin()` helper shared with GET.
+- `AgentName` enum (`Root | Child(String)`) replaces `agent_name: String`.
+  Closes the injection vector where a child named `"root"` could pass the
+  `== "root"` state-persistence check. `new_child()` rejects the reserved
+  name; fork() validates via this before registration.
+
+
 ### Cached role-prefix for repeated child agents
 - `ChildSettings.prefix_context` (str) and `prefix_attach` (list[str]) render
   between `<deployment_context>` and `<event_history>`, inside the cached

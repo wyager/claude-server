@@ -47,6 +47,8 @@ pub struct SideEffectCollector {
     pub stdin_writes: Vec<(String, Vec<u8>)>,
     /// pids whose stdin should be closed (EOF).
     pub stdin_closes: Vec<String>,
+    /// Child agent names to terminate via HarnessEvent::Shutdown.
+    pub child_kills: Vec<String>,
     pub history_removes: Vec<String>,
     pub history_replaces: Vec<(String, String)>,
     pub history_adds: Vec<String>,
@@ -69,7 +71,9 @@ pub struct ForkChildSettings {
     pub name: String,
     pub task: String,
     pub model: Option<String>,  // None = inherit parent's model
-    pub max_turns: u32,
+    /// None → persistent child: idle-waits like root, no turn limit.
+    /// Parent must kill_child() to stop it.
+    pub max_turns: Option<u32>,
     pub can_compact: bool,
     /// If false, child starts with fresh history containing only a fork
     /// SystemAlert. Useful for cross-model forks where inheriting the parent's
@@ -680,6 +684,11 @@ impl PyHarness {
         Ok(())
     }
 
+    fn kill_child(&self, name: String) -> PyResult<()> {
+        self.collector.lock().unwrap().child_kills.push(name);
+        Ok(())
+    }
+
     fn shell_status(&self, pid: String) -> PyResult<String> {
         Ok(self
             .process_statuses
@@ -765,6 +774,11 @@ impl PyHarness {
 
         for item in list.iter() {
             let name: String = item.getattr("name")?.extract()?;
+            if let Err(e) = crate::types::AgentName::new_child(&name) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("ChildSettings.name invalid: {}", e)
+                ));
+            }
             let task: String = item.getattr("task")?.extract()?;
             let model_obj = item.getattr("model")?;
             let model: Option<String> = if model_obj.is_none() {
@@ -772,7 +786,12 @@ impl PyHarness {
             } else {
                 Some(model_obj.extract()?)
             };
-            let max_turns: u32 = item.getattr("max_turns")?.extract::<u32>()?.min(50);
+            let max_turns_obj = item.getattr("max_turns")?;
+            let max_turns: Option<u32> = if max_turns_obj.is_none() {
+                None
+            } else {
+                Some(max_turns_obj.extract::<u32>()?.min(50))
+            };
             let can_compact: bool = item.getattr("can_compact")?.extract()?;
 
             // Extract attach paths (None → empty).
@@ -890,7 +909,7 @@ class ChildSettings:
     name: str
     task: str
     model: str | None = None
-    max_turns: int = 20
+    max_turns: int | None = 20
     can_compact: bool = True
     inherit_history: bool = True
     attach: list[str] | None = None
@@ -909,6 +928,7 @@ acknowledge_timer = _harness.acknowledge_timer
 request_compaction = _harness.request_compaction
 view = _harness.view
 fork = _harness.fork
+kill_child = _harness.kill_child
 message_agent = _harness.message_agent
 done = _harness.done
 agent_name = _harness.agent_name
@@ -1561,13 +1581,31 @@ print("forked")
         assert_eq!(req.children[0].name, "test-runner");
         assert_eq!(req.children[0].task, "Write tests");
         assert_eq!(req.children[0].model, Some("claude-sonnet-4-5-20250929".to_string()));
-        assert_eq!(req.children[0].max_turns, 10);
+        assert_eq!(req.children[0].max_turns, Some(10));
         assert_eq!(req.children[1].name, "linter");
         assert_eq!(req.children[1].task, "Run linting");
         assert_eq!(req.children[1].model, None);
-        assert_eq!(req.children[1].max_turns, 20); // default
+        assert_eq!(req.children[1].max_turns, Some(20)); // default
         assert!(req.children[1].can_compact); // default is true
         assert!(req.children[0].attach.is_empty()); // default: no attachments
+    }
+
+    #[test]
+    fn test_fork_rejects_root_name() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        let result = execute(
+            &state,
+            r#"fork([ChildSettings(name="root", task="impersonate")])"#,
+            false,
+            &HashMap::new(),
+        );
+        assert!(result.is_error, "fork with name='root' should fail");
+        assert!(
+            result.error_text.contains("reserved"),
+            "Error should mention reserved name: {}",
+            result.error_text
+        );
     }
 
     #[test]

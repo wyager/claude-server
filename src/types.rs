@@ -635,12 +635,52 @@ impl Default for RenderConfig {
 
 // ---- Agent Permissions ----
 
+/// Agent identity. `Root` is reserved for the single persistent daemon agent
+/// that owns SQLite state. Using an enum instead of `name == "root"` closes
+/// the injection vector where a child named "root" could masquerade as root.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AgentName {
+    Root,
+    Child(String),
+}
+
+impl AgentName {
+    /// Construct a child name. Rejects the reserved "root" string and empty names.
+    pub fn new_child(name: impl Into<String>) -> Result<Self, String> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err("agent name cannot be empty".into());
+        }
+        if name == "root" {
+            return Err("'root' is a reserved agent name".into());
+        }
+        Ok(Self::Child(name))
+    }
+
+    pub fn is_root(&self) -> bool {
+        matches!(self, Self::Root)
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Root => "root",
+            Self::Child(s) => s,
+        }
+    }
+}
+
+impl std::fmt::Display for AgentName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentPermissions {
     pub can_compact: bool,
-    pub max_turns: Option<u32>,      // None = unlimited (parent)
+    pub max_turns: Option<u32>,      // None = unlimited
     pub child_depth_remaining: u32,  // 0 = can't spawn children
-    pub agent_name: String,
+    pub agent_name: AgentName,
     pub lineage: Vec<String>,
 }
 

@@ -17,7 +17,7 @@ use tower_http::cors::CorsLayer;
 use crate::config::Config;
 use crate::core_loop::HarnessEvent;
 use crate::db::Database;
-use crate::types::TokenAccumulator;
+use crate::types::{AgentRegistry, TokenAccumulator};
 
 /// Broadcast message sent from the core loop to SSE subscribers.
 #[derive(Debug, Clone)]
@@ -42,6 +42,7 @@ struct AppState {
     token_accumulator: Arc<Mutex<TokenAccumulator>>,
     config: Arc<Config>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    registry: Arc<AgentRegistry>,
 }
 
 // ---- Request/Response types ----
@@ -154,6 +155,8 @@ struct EventRequest {
     event_type: String,
     data: serde_json::Value,
     priority: Option<u8>,
+    /// Route to a specific agent by name. Omitted/null → root.
+    agent: Option<String>,
 }
 
 async fn handle_event(
@@ -161,20 +164,35 @@ async fn handle_event(
     Json(body): Json<EventRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let priority = body.priority.unwrap_or(5);
+    let event = HarnessEvent::ExternalEvent {
+        source: body.source,
+        event_type: body.event_type,
+        data: body.data,
+        priority,
+    };
 
-    state
-        .event_tx
-        .send(HarnessEvent::ExternalEvent {
-            source: body.source,
-            event_type: body.event_type,
-            data: body.data,
-            priority,
-        })
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let routed_to = match body.agent.as_deref() {
+        None | Some("root") => {
+            state.event_tx.send(event).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            "root".to_string()
+        }
+        Some(name) => match state.registry.send_to(name, event) {
+            Ok(true) => name.to_string(),
+            // Completed or unknown agent → fall back to root so events aren't silently dropped.
+            Ok(false) | Err(_) => {
+                let fallback = HarnessEvent::ExternalEvent {
+                    source: format!("routed-from:{}", name),
+                    event_type: "agent-not-found".to_string(),
+                    data: serde_json::json!({"original_target": name}),
+                    priority,
+                };
+                let _ = state.event_tx.send(fallback);
+                return Ok(Json(serde_json::json!({"status": "fallback", "target": name, "routed_to": "root"})));
+            }
+        },
+    };
 
-    Ok(Json(serde_json::json!({
-        "status": "queued",
-    })))
+    Ok(Json(serde_json::json!({"status": "queued", "routed_to": routed_to})))
 }
 
 // ---- SSE Handler ----
@@ -226,6 +244,7 @@ pub fn create_router(
     token_accumulator: Arc<Mutex<TokenAccumulator>>,
     config: Arc<Config>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    registry: Arc<AgentRegistry>,
 ) -> Router {
     let state = AppState {
         event_tx,
@@ -234,6 +253,7 @@ pub fn create_router(
         token_accumulator,
         config,
         shutdown_tx,
+        registry,
     };
 
     Router::new()

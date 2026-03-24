@@ -46,6 +46,9 @@ pub enum HarnessEvent {
         data: serde_json::Value,
         priority: u8,
     },
+    /// Sent by a parent via kill_child(). Receiving agent exits at the next
+    /// turn boundary with FinishReason::Killed.
+    KillSignal,
 }
 
 pub struct CoreLoop {
@@ -78,7 +81,7 @@ impl CoreLoop {
             can_compact: true,
             max_turns: None,        // unlimited for parent
             child_depth_remaining: 1, // parent can spawn children, children can't spawn grandchildren
-            agent_name: "root".to_string(),
+            agent_name: AgentName::Root,
             lineage: vec!["root".to_string()],
         };
 

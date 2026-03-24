@@ -185,8 +185,9 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
     // Create token accumulator
     let token_accumulator = Arc::new(Mutex::new(TokenAccumulator::default()));
 
-    // Create agent registry
+    // Create agent registry (shared with HTTP server for /event routing)
     let registry = Arc::new(types::AgentRegistry::new());
+    let registry_for_http = registry.clone();
 
     // Shutdown signal — watch channel so every select! can race against it.
     // Setting it cancels in-flight turns (API retries, sleeps) via future drop.
@@ -244,6 +245,7 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
         token_accumulator.clone(),
         config.clone(),
         shutdown_tx.clone(),
+        registry_for_http,
     );
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     println!("  HTTP server listening on {}", config.listen_addr);
