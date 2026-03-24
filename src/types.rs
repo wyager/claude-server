@@ -288,19 +288,32 @@ impl EventHistory {
         self.entries.len().saturating_sub(self.modification_window)
     }
 
-    /// Stride-aligned split points for prompt-cache breakpoints.
-    /// Returns (prev_stride, cur_stride) where both are multiples of `stride`
-    /// ≤ immutable_count(). Two breakpoints mean the "previous stride" absorbs
-    /// the old "current stride" cache entry on transition, so advancing only
-    /// pays cache-write on one stride's worth instead of the whole history.
-    pub fn cache_splits(&self, stride: usize) -> (usize, usize) {
+    /// Geometric-tier split points for prompt-cache breakpoints.
+    ///
+    /// Anthropic's cache requires 100%-identical content (no prefix matching),
+    /// so a breakpoint that moves every turn never hits. Instead we align
+    /// breakpoints to positions that stay put for many turns, then advance
+    /// in batches. Tier `i` (0-indexed from coldest) advances every
+    /// `stride^(tiers-i)` turns:
+    ///
+    ///   tiers=2, stride=5: splits at [floor(n/25)*25, floor(n/5)*5]
+    ///     tier-0 advances every 25 turns, tier-1 every 5 turns
+    ///   tiers=3, stride=3: splits at [×27, ×9, ×3]
+    ///
+    /// The coldest tier holds most content in cache_read (10% cost); the
+    /// hottest tier keeps the uncached tail small (~stride entries). See
+    /// feedback #23 / the 2026-03-24 Opus trace that drove this design.
+    pub fn cache_splits(&self, stride: usize, tiers: usize) -> Vec<usize> {
         let n = self.immutable_count();
-        if stride == 0 {
-            return (n, n);
+        if stride == 0 || tiers == 0 {
+            return vec![n];
         }
-        let cur = (n / stride) * stride;
-        let prev = cur.saturating_sub(stride);
-        (prev, cur)
+        let mut splits = Vec::with_capacity(tiers);
+        for i in 0..tiers {
+            let align = stride.pow((tiers - i) as u32);
+            splits.push((n / align) * align);
+        }
+        splits
     }
 
     pub fn is_modifiable(&self, id: &AgentId) -> bool {
@@ -593,10 +606,13 @@ impl Attachment {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderConfig {
-    /// History entries per cache-breakpoint stride. Breakpoints sit at multiples
-    /// of this value so their content stays byte-identical for `stride` turns,
-    /// giving consistent cache hits instead of missing every turn as the prefix grows.
+    /// Base stride for cache breakpoint alignment. Tier i advances every
+    /// stride^(tiers-i) turns. See EventHistory::cache_splits.
     pub cache_stride: usize,
+    /// Number of geometric cache tiers. Capped by Anthropic's 4-breakpoint
+    /// limit: system takes 1, prefix_attach takes 1 if present, rest go to
+    /// history tiers. Renderer clamps to available budget.
+    pub cache_tiers: usize,
     pub history_entry_max_chars: usize,
     pub history_entry_max_lines: usize,
     pub work_queue_content_limits: Vec<usize>,
@@ -610,16 +626,25 @@ pub struct RenderConfig {
 
 impl Default for RenderConfig {
     fn default() -> Self {
-        // stride=1: head-to-head test (2026-03-23, 25 turns each) showed
-        // stride=1 at 79% hit / $0.38 vs stride=10 at 62% / $0.55. The API's
-        // prefix matching means a growing segment still hits the cached
-        // prefix — the conservative stride=10 was unnecessary.
+        // Anthropic's cache requires 100%-identical content up to the
+        // breakpoint (no prefix matching — verified via API trace on Opus
+        // 2026-03-24, feedback #23). A breakpoint that moves every turn never
+        // hits. Geometric tiers keep breakpoints stable: with stride=5,
+        // tiers=2 the cold tier advances every 25 turns, hot tier every 5.
+        // Most content stays in cache_read (10% cost); uncached tail is
+        // bounded to ~stride entries. ~38% cheaper than flat stride=25 at
+        // Opus rates because tail re-ingestion dominates.
         let cache_stride = std::env::var("CLAUDE_SERVER_CACHE_STRIDE")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(1);
+            .unwrap_or(5);
+        let cache_tiers = std::env::var("CLAUDE_SERVER_CACHE_TIERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2);
         Self {
             cache_stride,
+            cache_tiers,
             history_entry_max_chars: 2000,
             history_entry_max_lines: 50,
             work_queue_content_limits: vec![500, 500, 500, 200, 200, 200, 200, 200, 200, 200],

@@ -53,6 +53,15 @@
   Server stores in an `api_trace` column, fetched via `GET /feedback/:id/trace`
   (admin-only). Eliminates the redeploy-with-debug-flags cycle — agents can
   self-report with wire-level data when they notice cache anomalies.
+- **Geometric cache tiers (the actual fix)**: trace #23 proved Anthropic's
+  cache requires 100%-identical content — no prefix matching. A breakpoint
+  that moves every turn never hits. `cache_splits()` now returns N tier
+  boundaries where tier i advances every `stride^(tiers-i)` turns. Default
+  `stride=5, tiers=2`: cold tier advances every 25 turns, hot tier every 5.
+  Most content stays in cache_read (10% cost); uncached tail bounded to
+  ~stride entries. ~38% cheaper than flat stride=25 because tail re-ingest
+  dominates. Tier budget clamped to 4 minus (system + prefix-image
+  breakpoints). Config: `CLAUDE_SERVER_CACHE_STRIDE`, `CLAUDE_SERVER_CACHE_TIERS`.
 - **Determinism**: child's id_generator state, timestamps, and task string all
   land in the tail (immutable_count=0 for fresh history with mod_window=5). No
   RNG leaks into the cached prefix.

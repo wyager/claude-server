@@ -84,61 +84,70 @@ pub fn render_context(
     // Anthropic's cache prefix-matches per-block, so a separate static block
     // followed by a growing seg1 means seg1 never hashes to a prior entry.
     // (Regression caught via feedback #22: root hit rate dropped from 46% to
-    // 17% after the unconditional split.) No images → merge head into seg1
-    // to restore one-growing-block semantics.
-    let (prev, cur) = state.event_history.cache_splits(config.cache_stride);
+    // 17% after the unconditional split.) No images → merge head into seg1.
+    //
+    // Tier budget: Anthropic allows 4 breakpoints. System takes 1; prefix
+    // image (if any) takes 1. The rest go to history tiers.
+    let tier_budget = if prefix_attachments.is_empty() { 3 } else { 2 };
+    let tiers = config.cache_tiers.min(tier_budget);
+    let splits = state.event_history.cache_splits(config.cache_stride, tiers);
     let total = state.event_history.entries().len();
 
-    let (prefix_text, mut seg1) = if prefix_attachments.is_empty() {
+    // Build segments: seg[0] = head + <event_history> + entries[0..splits[0]],
+    // seg[i] = entries[splits[i-1]..splits[i]]. Head goes into seg[0] unless
+    // prefix attachments force a split.
+    let mut segs: Vec<String> = Vec::with_capacity(splits.len());
+    let (prefix_text, mut first) = if prefix_attachments.is_empty() {
         let mut s = head;
         s.push_str("<event_history>\n");
         (String::new(), s)
     } else {
         (head, String::from("<event_history>\n"))
     };
-    render_history_range(&mut seg1, &state.event_history, config, 0..prev);
+    let mut prev_split = 0usize;
+    for (i, &split) in splits.iter().enumerate() {
+        let target = if i == 0 { &mut first } else {
+            segs.push(String::new());
+            segs.last_mut().unwrap()
+        };
+        render_history_range(target, &state.event_history, config, prev_split..split);
+        prev_split = split;
+    }
+    segs.insert(0, first);
 
-    let mut seg2 = String::new();
-    render_history_range(&mut seg2, &state.event_history, config, prev..cur);
-
-    // Volatile tail: post-stride history + modifiable window + state/meta/queue.
+    // Volatile tail: post-tier history + modifiable window + state/meta/queue.
     let mut tail = String::with_capacity(2048);
-    render_history_range(&mut tail, &state.event_history, config, cur..total);
+    render_history_range(&mut tail, &state.event_history, config, prev_split..total);
     tail.push_str("</event_history>\n");
     render_agent_state(&mut tail, state, config);
     render_context_metadata(&mut tail, state, compaction, compact_at, agent, pinned_summary, attachments.len());
     render_work_queue(&mut tail, &state.work_queue, config);
 
-    // Full text for dumps/char counts. Prefix attachments aren't text so
-    // aren't included here.
-    let mut text = String::with_capacity(prefix_text.len() + seg1.len() + seg2.len() + tail.len());
+    // Full text for dumps/char counts.
+    let seg_len: usize = segs.iter().map(String::len).sum();
+    let mut text = String::with_capacity(prefix_text.len() + seg_len + tail.len());
     text.push_str(&prefix_text);
-    text.push_str(&seg1);
-    text.push_str(&seg2);
+    for s in &segs { text.push_str(s); }
     text.push_str(&tail);
 
     // Anthropic ignores cache_control on segments under ~1024 tokens. Merge
-    // small segments forward so we don't waste a breakpoint. The threshold
-    // counts prefix_text too since it's part of the cached region up to
-    // seg1's breakpoint.
+    // small segments forward into the next so we don't waste a breakpoint.
+    // seg[0]'s threshold counts prefix content (shared breakpoint).
     const MIN_CACHE_CHARS: usize = 8192;
     let mut cached_segments: Vec<String> = Vec::new();
-    let prefix_boost = prefix_text.len() + prefix_attachments.len() * 4096; // rough image size
-    let mut acc = seg1;
-    // seg1's effective size for the threshold includes the prefix content
-    // that precedes it (they share the same cache_control breakpoint).
-    let mut acc_effective = acc.len() + prefix_boost;
-    for seg in [seg2] {
+    let prefix_boost = prefix_text.len() + prefix_attachments.len() * 4096;
+    let mut acc = String::new();
+    let mut acc_effective = prefix_boost;
+    for seg in segs {
+        acc.push_str(&seg);
+        acc_effective += seg.len();
         if acc_effective >= MIN_CACHE_CHARS {
             cached_segments.push(std::mem::take(&mut acc));
             acc_effective = 0;
         }
-        acc.push_str(&seg);
-        acc_effective += seg.len();
     }
-    if acc_effective >= MIN_CACHE_CHARS {
-        cached_segments.push(acc);
-    }
+    // Residual acc (didn't clear threshold) falls into tail via the
+    // text-slicing in api_client (tail = text[prefix+cached_len..]).
 
     RenderedContext { prefix_text, prefix_attachments, cached_segments, text, attachments }
 }
@@ -789,51 +798,43 @@ mod tests {
                 is_error: false,
             });
         }
-        let config = RenderConfig { cache_stride: 10, ..RenderConfig::default() };
+        // stride=5, tiers=2: cold tier advances every 25, hot tier every 5
+        let config = RenderConfig { cache_stride: 5, cache_tiers: 2, ..RenderConfig::default() };
 
-        // immutable_count = 30-5 = 25; cache_splits(10) = (10, 20)
-        let (prev, cur) = state.event_history.cache_splits(config.cache_stride);
-        assert_eq!((prev, cur), (10, 20));
+        // immutable = 30-5 = 25; splits = [floor(25/25)*25, floor(25/5)*5] = [25, 25]
+        let splits = state.event_history.cache_splits(5, 2);
+        assert_eq!(splits, vec![25, 25]);
 
         let r1 = render_context(&state, "", None, None, &config, 150_000, None, None);
-        // Two segments expected: seg1=entries[0..10], seg2=entries[10..20]
-        assert_eq!(r1.cached_segments.len(), 2, "expected 2 cached segments");
         // Concatenation invariant: text = prefix_text ++ cached_segments ++ tail
         let cached_len: usize = r1.cached_segments.iter().map(String::len).sum();
         let p = r1.prefix_text.len();
         assert_eq!(&r1.text[..p], r1.prefix_text);
         assert_eq!(&r1.text[p..p + cached_len], r1.cached_segments.concat());
 
-        // Add one more entry → immutable=26, splits stay (10,20) → segments byte-identical
-        state.event_history.push(HistoryEntry::Execution {
-            id: AgentId("001e".into()),
-            time: Utc.with_ymd_and_hms(2026, 1, 1, 0, 1, 0).unwrap(),
-            code: "# turn 30".into(),
-            output: big_output.clone(),
-            is_error: false,
-        });
-        let r2 = render_context(&state, "", None, None, &config, 150_000, None, None);
-        assert_eq!(r1.cached_segments, r2.cached_segments, "segments must be byte-identical between strides");
-
-        // Advance past next stride: push 9 more → total 40, immutable=35, splits=(20,30)
-        for i in 31..40 {
+        // Add 4 entries → immutable=29, splits=[25,25] still → segments byte-identical
+        for i in 30..34 {
             state.event_history.push(HistoryEntry::Execution {
                 id: AgentId(format!("{:04x}", i)),
-                time: Utc.with_ymd_and_hms(2026, 1, 1, 0, 2, i as u32).unwrap(),
-                code: format!("# turn {}", i),
-                output: big_output.clone(),
-                is_error: false,
+                time: Utc.with_ymd_and_hms(2026, 1, 1, 0, 1, i as u32).unwrap(),
+                code: format!("# turn {}", i), output: big_output.clone(), is_error: false,
             });
         }
-        let (prev2, cur2) = state.event_history.cache_splits(config.cache_stride);
-        assert_eq!((prev2, cur2), (20, 30));
+        let r2 = render_context(&state, "", None, None, &config, 150_000, None, None);
+        assert_eq!(r1.cached_segments, r2.cached_segments,
+            "segments must be byte-identical within a tier period (this is the cache-hit guarantee)");
+
+        // One more → immutable=30, hot tier advances: splits=[25,30]
+        state.event_history.push(HistoryEntry::Execution {
+            id: AgentId("0022".into()),
+            time: Utc.with_ymd_and_hms(2026, 1, 1, 0, 2, 0).unwrap(),
+            code: "# turn 34".into(), output: big_output.clone(), is_error: false,
+        });
+        assert_eq!(state.event_history.cache_splits(5, 2), vec![25, 30]);
         let r3 = render_context(&state, "", None, None, &config, 150_000, None, None);
-        // On stride advance: new seg1 = old (seg1+seg2), so its cache entry still hits
-        assert_eq!(
-            r3.cached_segments[0],
-            r1.cached_segments.concat(),
-            "new seg1 must equal old seg1+seg2 (transition hit)"
-        );
+        // Cold tier unchanged (still at 25), only hot tier moved
+        assert_eq!(r3.cached_segments[0], r1.cached_segments[0],
+            "cold tier must survive hot-tier advance unchanged");
     }
 
     #[test]
