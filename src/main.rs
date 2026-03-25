@@ -142,13 +142,20 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
     // Load or create state
     let state = match database.load_state()? {
         Some(mut s) => {
+            let stale_procs = s.process_manager.processes().len();
             println!(
-                "  Resumed state (queue: {}, history: {}, memory: {} keys, timers: {})",
+                "  Resumed state (queue: {}, history: {}, memory: {} keys, timers: {}, dropping {} stale process entries)",
                 s.work_queue.len(),
                 s.event_history.entries().len(),
                 s.memory.len(),
-                s.timer_manager.list().len()
+                s.timer_manager.list().len(),
+                stale_procs
             );
+            // Wipe process tracker: child processes from the previous harness
+            // instance are dead (SIGKILL'd on parent exit), but their tracker
+            // entries would otherwise deserialize as "running" ghosts. Agents
+            // re-spawn everything from memory on AgentStartup anyway.
+            s.process_manager = types::ProcessManager::new();
             // Inject startup item so the agent gets a turn to reconnect any
             // bridges/processes it tracked in memory before the restart.
             let id = s.id_generator.next();

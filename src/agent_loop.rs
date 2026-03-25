@@ -199,7 +199,21 @@ impl AgentLoop {
             // completions, timer fires). Agents exit explicitly via done().
             if self.state.work_queue.is_empty() {
                 if !idle {
-                    dimlog!("[{}] Idle, waiting for events...", self.name);
+                    let timers = self.state.timer_manager.list();
+                    if timers.is_empty() {
+                        dimlog!("[{}] Idle, waiting for events...", self.name);
+                    } else {
+                        let next_in = self.state.timer_manager.next_deadline()
+                            .map(|d| (d - Utc::now()).to_std().unwrap_or(Duration::ZERO))
+                            .unwrap_or(Duration::ZERO);
+                        dimlog!(
+                            "[{}] Idle, waiting for events... [{} timer{} active, next in {}]",
+                            self.name,
+                            timers.len(),
+                            if timers.len() == 1 { "" } else { "s" },
+                            format!("{:?}", next_in)
+                        );
+                    }
                     idle = true;
                     self.broadcast(BroadcastMsg::Status {
                         status: "idle".to_string(),
