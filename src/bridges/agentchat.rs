@@ -146,7 +146,11 @@ async fn connect_wss(url: &str) -> Result<tokio_tungstenite::WebSocketStream<tok
     for c in rustls_native_certs::load_native_certs().certs {
         let _ = roots.add(c);
     }
-    let cfg = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+    let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .context("TLS protocol versions")?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
     let connector = tokio_tungstenite::Connector::Rustls(Arc::new(cfg));
     let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(url, None, false, Some(connector))
         .await.context("wss connect")?;
