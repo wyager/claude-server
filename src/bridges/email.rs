@@ -73,7 +73,8 @@ async fn run_async(args: EmailArgs) -> Result<()> {
     let from = args.user.clone();
     let to = args.peer.clone();
 
-    super::relay_loop(&args.api.api_url, &chat_id, &args.peer, rx, move |content, attachments| {
+    super::relay_loop(&args.api.api_url, &chat_id, &args.peer, rx, move |out: super::Outbound| {
+        let (content, attachments) = (out.content, out.attachments);
         let mailer = mailer.clone();
         let from = from.clone();
         let to = to.clone();
@@ -152,7 +153,7 @@ async fn imap_loop(args: &EmailArgs, tx: &mpsc::UnboundedSender<Inbound>) -> Res
             let (body, attachments) = extract_parts(&parsed, &args.attach_dir, uid)?;
             eprintln!("[email bridge] mail from {}: {} chars, {} attachments",
                 args.peer, body.len(), attachments.len());
-            let _ = tx.send(Inbound { text: body, attachments });
+            let _ = tx.send(Inbound { text: body, attachments, message_ref: None });
         }
         drop(stream);
         last_seen = exists;

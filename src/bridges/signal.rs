@@ -119,7 +119,9 @@ async fn run_async(
                 if text.is_empty() && attachments.is_empty() {
                     continue;
                 }
-                if inbound_tx.send(super::Inbound { text, attachments }).is_err() {
+                // Signal's message timestamp is the reaction/reply target.
+                let message_ref = env["timestamp"].as_i64().map(|t| t.to_string());
+                if inbound_tx.send(super::Inbound { text, attachments, message_ref }).is_err() {
                     return;
                 }
             }
@@ -127,19 +129,33 @@ async fn run_async(
         eprintln!("[signal bridge] daemon stdout closed");
     });
 
-    // Writer: serialize send requests to daemon stdin
-    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<(String, Vec<String>)>();
+    // Writer: serialize send/sendReaction requests to daemon stdin
+    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<super::Outbound>();
     let req_id = Arc::new(AtomicU64::new(1));
     let write_peer = peer.clone();
     tokio::spawn(async move {
         let mut stdin = stdin;
-        while let Some((content, attachments)) = outbound_rx.recv().await {
+        while let Some(out) = outbound_rx.recv().await {
             let id = req_id.fetch_add(1, Ordering::Relaxed);
-            let mut params = json!({ "recipient": [write_peer.as_str()], "message": content });
-            if !attachments.is_empty() {
-                params["attachments"] = json!(attachments);
-            }
-            let req = json!({ "jsonrpc": "2.0", "id": id, "method": "send", "params": params });
+            let req = if let Some(ts) = out.react_to {
+                // react_to is the Signal message timestamp; content is the emoji.
+                // targetAuthor is the peer (we only react to their messages).
+                json!({
+                    "jsonrpc": "2.0", "id": id, "method": "sendReaction",
+                    "params": {
+                        "recipient": [write_peer.as_str()],
+                        "targetAuthor": write_peer.as_str(),
+                        "targetTimestamp": ts.parse::<i64>().unwrap_or(0),
+                        "emoji": out.content,
+                    }
+                })
+            } else {
+                let mut params = json!({ "recipient": [write_peer.as_str()], "message": out.content });
+                if !out.attachments.is_empty() {
+                    params["attachments"] = json!(out.attachments);
+                }
+                json!({ "jsonrpc": "2.0", "id": id, "method": "send", "params": params })
+            };
             let line = format!("{}\n", req);
             if let Err(e) = stdin.write_all(line.as_bytes()).await {
                 eprintln!("[signal bridge] write to daemon failed: {}", e);
@@ -149,10 +165,10 @@ async fn run_async(
     });
 
     // Relay loop: inbound → POST /message, SSE → outbound_tx
-    super::relay_loop(&api_url, &chat_id, &peer, inbound_rx, move |content, attachments| {
+    super::relay_loop(&api_url, &chat_id, &peer, inbound_rx, move |out| {
         let tx = outbound_tx.clone();
         async move {
-            tx.send((content, attachments)).context("outbound channel closed")?;
+            tx.send(out).context("outbound channel closed")?;
             Ok(())
         }
     })

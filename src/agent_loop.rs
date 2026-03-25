@@ -523,6 +523,7 @@ impl AgentLoop {
                 user,
                 content,
                 attachments,
+                message_ref,
             } => {
                 let id = self.state.id_generator.next();
                 dimlog!(
@@ -541,6 +542,7 @@ impl AgentLoop {
                         chat_id,
                         user,
                         content,
+                        message_ref,
                     },
                     attachments,
                 });
@@ -1061,6 +1063,7 @@ impl AgentLoop {
                         chat_id: "child-agent".to_string(),
                         user: self.permissions.agent_name.to_string(),
                         content: child_settings.task,
+                        message_ref: None,
                     },
                     attachments: child_settings.attach.clone(),
                 });
@@ -1214,6 +1217,7 @@ impl AgentLoop {
                 created_at: chrono::Utc::now()
                     .format("%Y-%m-%d %H:%M:%S")
                     .to_string(),
+                react_to: msg.react_to,
             });
         }
 

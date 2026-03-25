@@ -28,6 +28,9 @@ pub enum BroadcastMsg {
         attachments: Vec<String>,
         id: i64,
         created_at: String,
+        /// If set, bridges send this as a reaction to the referenced message
+        /// (content is the emoji) instead of a regular message.
+        react_to: Option<String>,
     },
     Status {
         status: String,
@@ -55,6 +58,8 @@ struct MessageRequest {
     content: String,
     #[serde(default)]
     attachments: Vec<String>,
+    #[serde(default)]
+    message_ref: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -86,6 +91,7 @@ async fn handle_message(
             user: body.user,
             content: body.content,
             attachments: body.attachments,
+            message_ref: body.message_ref,
         })
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -217,10 +223,12 @@ async fn handle_sse(
                     ref attachments,
                     id,
                     ref created_at,
+                    ref react_to,
                 }) if *msg_chat_id == chat_id => {
                     let data = serde_json::json!({
                         "id": id,
                         "content": content,
+                        "react_to": react_to,
                         "attachments": attachments,
                         "created_at": created_at,
                     });

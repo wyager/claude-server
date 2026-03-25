@@ -52,7 +52,8 @@ async fn run_async(api_url: String, token: String, channel: String) -> Result<()
     // Outbound: POST to channel
     let out_channel = channel.clone();
     let out_token = token.clone();
-    super::relay_loop(&api_url, &chat_id, &format!("discord:{}", channel), rx, move |content, attachments| {
+    super::relay_loop(&api_url, &chat_id, &format!("discord:{}", channel), rx, move |out: super::Outbound| {
+        let (content, attachments) = (out.content, out.attachments);
         let http = http.clone();
         let url = format!("https://discord.com/api/v10/channels/{}/messages", out_channel);
         let token = out_token.clone();

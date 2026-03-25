@@ -55,12 +55,24 @@ pub fn run(cmd: BridgeCmd) {
 pub struct Inbound {
     pub text: String,
     pub attachments: Vec<String>,
+    /// Bridge-native message ID (Signal timestamp, Discord snowflake, etc.)
+    /// for the agent to reference in reactions/replies.
+    pub message_ref: Option<String>,
 }
 
 impl From<String> for Inbound {
     fn from(text: String) -> Self {
-        Self { text, attachments: Vec::new() }
+        Self { text, attachments: Vec::new(), message_ref: None }
     }
+}
+
+/// Outbound message from agent to bridge. When `react_to` is set, the bridge
+/// sends a reaction (emoji in `content`) to the referenced message instead
+/// of a regular message.
+pub struct Outbound {
+    pub content: String,
+    pub attachments: Vec<String>,
+    pub react_to: Option<String>,
 }
 
 /// - `inbound_rx`: messages received from the external service
@@ -75,7 +87,7 @@ pub async fn relay_loop<F, Fut>(
     outbound: F,
 ) -> Result<()>
 where
-    F: Fn(String, Vec<String>) -> Fut,
+    F: Fn(Outbound) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
     let client = reqwest::Client::new();
@@ -111,6 +123,7 @@ where
                             "user": user,
                             "content": msg.text,
                             "attachments": msg.attachments,
+                            "message_ref": msg.message_ref,
                         });
                         match client.post(&msg_url).json(&body).send().await {
                             Ok(r) if r.status().is_success() => {}
@@ -147,7 +160,11 @@ where
                                             .and_then(|a| a.as_array())
                                             .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
                                             .unwrap_or_default();
-                                        if let Err(e) = outbound(content.to_string(), attachments).await {
+                                        let react_to = v.get("react_to")
+                                            .and_then(|r| r.as_str())
+                                            .map(String::from);
+                                        let out = Outbound { content: content.to_string(), attachments, react_to };
+                                        if let Err(e) = outbound(out).await {
                                             eprintln!("[bridge] outbound send failed: {}", e);
                                         }
                                     }

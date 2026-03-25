@@ -117,6 +117,9 @@ pub struct OutboundMessageRequest {
     pub chat_id: String,
     pub content: String,
     pub attachments: Vec<String>,
+    /// If set, bridge sends a reaction (content is the emoji) to the
+    /// referenced message instead of a regular message.
+    pub react_to: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -215,7 +218,10 @@ fn work_item_to_py(item: &WorkItem) -> PyWorkItem {
     let mut fields = serde_json::Map::new();
 
     let item_type = match &item.item_type {
-        WorkItemType::UserMessage { chat_id, user, content } => {
+        WorkItemType::UserMessage { chat_id, user, content, message_ref } => {
+            if let Some(r) = message_ref {
+                fields.insert("message_ref".into(), r.clone().into());
+            }
             fields.insert("chat_id".into(), chat_id.clone().into());
             fields.insert("user".into(), user.clone().into());
             fields.insert("content".into(), content.clone().into());
@@ -618,8 +624,8 @@ struct PyHarness {
 
 #[pymethods]
 impl PyHarness {
-    #[pyo3(signature = (chat_id, content, attach=vec![]))]
-    fn send_message(&self, chat_id: String, content: String, attach: Vec<String>) -> PyResult<()> {
+    #[pyo3(signature = (chat_id, content, attach=vec![], react_to=None))]
+    fn send_message(&self, chat_id: String, content: String, attach: Vec<String>, react_to: Option<String>) -> PyResult<()> {
         for p in &attach {
             if !std::path::Path::new(p).is_file() {
                 return Err(pyo3::exceptions::PyFileNotFoundError::new_err(
@@ -631,7 +637,7 @@ impl PyHarness {
             .lock()
             .unwrap()
             .messages
-            .push(OutboundMessageRequest { chat_id, content, attachments: attach });
+            .push(OutboundMessageRequest { chat_id, content, attachments: attach, react_to });
         Ok(())
     }
 
@@ -1390,6 +1396,7 @@ print(tid)
                 chat_id: "test".to_string(),
                 user: "user@test.com".to_string(),
                 content: "Hello!".to_string(),
+                message_ref: None,
             },
             attachments: Vec::new(),
         });

@@ -21,6 +21,7 @@ pub enum HarnessEvent {
         user: String,
         content: String,
         attachments: Vec<String>,
+        message_ref: Option<String>,
     },
     Process(ProcessEvent),
     ChildCompleted {

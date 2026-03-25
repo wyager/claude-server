@@ -50,7 +50,8 @@ async fn run_async(api_url: String, app_token: String, bot_token: String, channe
 
     // Outbound: chat.postMessage
     let out_channel = channel.clone();
-    super::relay_loop(&api_url, &chat_id, &format!("slack:{}", channel), rx, move |content, attachments| {
+    super::relay_loop(&api_url, &chat_id, &format!("slack:{}", channel), rx, move |out: super::Outbound| {
+        let (content, attachments) = (out.content, out.attachments);
         let http = http.clone();
         let bot_token = bot_token.clone();
         let channel = out_channel.clone();

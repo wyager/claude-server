@@ -75,6 +75,11 @@ pub enum WorkItemType {
         chat_id: String,
         user: String,
         content: String,
+        /// Bridge-native message identifier for reactions/replies. Signal:
+        /// timestamp (ms), Discord: snowflake, Slack: ts, Telegram: message_id.
+        /// Agent passes this back via send_message(react_to=...).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_ref: Option<String>,
     },
     TimerFired {
         timer_id: AgentId,

@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-03-25
+
+### Signal reactions + message_ref (feedback #24)
+- `UserMessage` work items carry `message_ref: Option<String>` — the
+  bridge-native message identifier (Signal timestamp, Discord snowflake,
+  Slack ts, Telegram message_id). Threaded through `Inbound`,
+  `MessageRequest`, `HarnessEvent::UserMessage`.
+- `send_message(chat_id, content, react_to=ref)` — when `react_to` is set,
+  bridges send a reaction (content is the emoji) instead of a regular message.
+  Threaded through `OutboundMessageRequest`, `BroadcastMsg::Message`, the SSE
+  stream, and `relay_loop`'s outbound closure (now takes `Outbound` struct).
+- Signal bridge: extracts `envelope.timestamp` for message_ref; outbound
+  branches to `sendReaction` jsonRpc method (targetAuthor=peer,
+  targetTimestamp=ref, emoji=content) when react_to is set.
+- Other bridges accept Outbound but ignore react_to for now (can wire up
+  per-protocol later).
+
+
 ## 2026-03-24
 
 ### Persistent children + event routing + kill_child

@@ -86,7 +86,8 @@ async fn run_async(api_url: String, token: String, peer: i64) -> Result<()> {
 
     // Outbound: sendMessage / sendDocument
     let send_base = base.clone();
-    super::relay_loop(&api_url, &chat_id, &format!("tg:{}", peer), rx, move |content, attachments| {
+    super::relay_loop(&api_url, &chat_id, &format!("tg:{}", peer), rx, move |out: super::Outbound| {
+        let (content, attachments) = (out.content, out.attachments);
         let client = client.clone();
         let base = send_base.clone();
         async move {

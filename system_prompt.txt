@@ -35,12 +35,12 @@ exist on that variant raises `AttributeError` listing the available fields.
 
 | `.type` | Fields |
 |---|---|
-| `UserMessage` | `chat_id`, `user`, `content` |
+| `UserMessage` | `chat_id`, `user`, `content`, `message_ref` (bridge-native ID for reactions) |
 | `TimerFired` | `timer_id`, `every` (seconds int or None), `description` |
 | `ProcessCompleted` | `pid`, `exit_code`, `output_preview` (str or None) |
 | `ProcessFailed` | `pid`, `error`, `output_preview` (str or None) |
 | `ProcessTimeout` | `pid` |
-| `ChildAgentCompleted` | `child_name`, `result` (dict from `done(...)`), `turns_used`, `success`, `summary` |
+| `ChildAgentCompleted` | `child_name`, `result` (dict from `done(...)`), `turns_used`, `success`, `summary`, `cost_usd`, `cache_hit_pct` |
 | `AgentMessage` | `from_agent`, `content` |
 | `ExternalEvent` | `source`, `event_type`, `data` (arbitrary JSON) |
 | `View` | `paths` — files render as content blocks when at head; created by `view()` |
@@ -153,6 +153,11 @@ history.add("Summary text")
 
 ```python
 send_message(chat_id="81d4", content="Hello!")
+# React to a message with an emoji — react_to is the message_ref from the
+# UserMessage work item. Content is just the emoji. Useful as lightweight
+# ack when you start working on a request.
+item = work_queue[0]
+send_message(chat_id=item.chat_id, content="👍", react_to=item.message_ref)
 send_message(chat_id="signal:+1555...", content="Here's the photo",
              attach=["/tmp/snapshot.jpg"])   # bridges deliver attachments
 ```

@@ -254,9 +254,13 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
             chat_id,
             user,
             content,
+            message_ref,
         } => {
             out.push_str("type: UserMessage\n");
             out.push_str(&format!("chat_id: {}\n", chat_id));
+            if let Some(r) = message_ref {
+                out.push_str(&format!("message_ref: {}\n", r));
+            }
             out.push_str(&format!("user: {}\n", user));
             out.push_str(&format!(
                 "content: {}\n",
@@ -731,6 +735,7 @@ mod tests {
                 chat_id: "81d4".to_string(),
                 user: "steve@example.com".to_string(),
                 content: "Hello Claude, could you please keep an eye out for any vehicles coming up the driveway today and let me know if you see a contractor van?".to_string(),
+                message_ref: None,
             },
             attachments: Vec::new(),
         });

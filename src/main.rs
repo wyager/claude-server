@@ -327,6 +327,7 @@ fn spawn_local_chat(
                     user: "local".to_string(),
                     content: line.to_string(),
                     attachments: Vec::new(),
+                    message_ref: None,
                 })
                 .is_err()
             {
