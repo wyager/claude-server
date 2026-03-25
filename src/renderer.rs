@@ -2,6 +2,17 @@ use chrono::{DateTime, Local, Utc};
 
 use crate::types::*;
 
+/// Byte-length truncation that snaps back to the nearest char boundary.
+/// Bare `&s[..n]` panics if n lands mid-UTF-8-codepoint (e.g. inside a
+/// 3-byte '→'). Found via a crash loop on a memory value containing
+/// arrow characters at exactly the truncation point.
+pub fn trunc(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes { return s; }
+    let mut cut = max_bytes;
+    while !s.is_char_boundary(cut) { cut -= 1; }
+    &s[..cut]
+}
+
 /// State tracked during compaction for rendering into the context block.
 pub struct CompactionState {
     pub current_usage: u64,
@@ -347,7 +358,7 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
                     let val_str = serde_json::to_string(&result[*key])
                         .unwrap_or_else(|_| "?".to_string());
                     let truncated = if val_str.len() > 80 {
-                        format!("{}...", &val_str[..80])
+                        format!("{}...", trunc(&val_str, 80))
                     } else {
                         val_str
                     };
@@ -453,10 +464,7 @@ fn render_agent_state(out: &mut String, state: &HarnessState, config: &RenderCon
             let prio = priorities.get(*key).copied().unwrap_or(5);
             let val_str = serde_json::to_string(value).unwrap_or_else(|_| "?".to_string());
             let truncated = if val_str.len() > config.agent_state_memory_value_max_chars {
-                format!(
-                    "{}...",
-                    &val_str[..config.agent_state_memory_value_max_chars]
-                )
+                format!("{}...", trunc(&val_str, config.agent_state_memory_value_max_chars))
             } else {
                 val_str
             };
@@ -692,11 +700,7 @@ fn indent_and_truncate(text: &str, indent: usize, config: &RenderConfig) -> Stri
             break;
         }
 
-        let line_to_add = if line.len() > remaining_chars {
-            &line[..remaining_chars]
-        } else {
-            line
-        };
+        let line_to_add = trunc(line, remaining_chars);
 
         result.push_str(&prefix);
         result.push_str(line_to_add);
@@ -1004,5 +1008,32 @@ mod tests {
 
         assert!(rendered.text.contains("Agent: root"));
         assert!(rendered.text.contains("Turns: 5 (no limit)"));
+    }
+
+    #[test]
+    fn test_trunc_multibyte_boundary() {
+        // Regression: crash loop on debian 2026-03-25. Memory value with '→'
+        // (3 bytes) at exactly the truncation point panicked with
+        // "byte index 120 is not a char boundary".
+        let s = "a".repeat(118) + "→bbb"; // '→' spans bytes 118..121
+        assert_eq!(trunc(&s, 120).len(), 118); // snaps back past the arrow
+        assert_eq!(trunc(&s, 119).len(), 118);
+        assert_eq!(trunc(&s, 118).len(), 118);
+        assert_eq!(trunc(&s, 121).len(), 121); // lands exactly after → : ok
+        assert_eq!(trunc("short", 100), "short"); // no-op when under
+        assert_eq!(trunc("", 0), "");
+
+        // End-to-end: memory render with multibyte at the cut point.
+        let mut state = HarnessState::new(200_000, 16384);
+        state.memory.insert(
+            "arch".into(),
+            serde_json::json!("Camera → MQTT → receiver → root"),
+        );
+        let config = RenderConfig {
+            agent_state_memory_value_max_chars: 10,
+            ..RenderConfig::default()
+        };
+        // Would previously panic on the byte slice.
+        let _ = render_context(&state, "", None, None, &config, 150_000, None, None);
     }
 }

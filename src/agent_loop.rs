@@ -544,7 +544,7 @@ impl AgentLoop {
                    "[{}] User message from {}: {} (id={}){}",
                     self.name,
                     user,
-                    &content[..content.len().min(50)],
+                    crate::renderer::trunc(&content, 50),
                     id,
                     if attachments.is_empty() { String::new() } else { format!(" [{} attachments]", attachments.len()) }
                 );
@@ -695,7 +695,7 @@ impl AgentLoop {
                    "[{}] Agent message from {}: {}",
                     self.name,
                     from,
-                    &content[..content.len().min(50)]
+                    crate::renderer::trunc(&content, 50)
                 );
                 self.state.work_queue.push(WorkItem {
                     id,
