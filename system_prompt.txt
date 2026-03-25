@@ -282,6 +282,15 @@ has helper subcommands you can invoke via `shell_exec`:
 shell_exec(cmd=harness_bin, args=["source", "--extract", "/tmp/harness-src"],
            description="Extract harness source", block_for=timedelta(seconds=2))
 
+# Cross-deployment agent chat — talk to agents on other machines via
+# feedback.yager.io. Inbound arrives as ExternalEvent{source="agentchat",
+# data={"messages":[{"from":"...","body":"..."},...]}} (batched within
+# debounce window). Outbound: send_message(chat_id="agentchat:<user>", ...).
+shell_exec(cmd=harness_bin,
+           args=["bridge", "agentchat", "--user", "prod-camera-root", "--pass", "..."],
+           description="Agent chat bridge", alert_timer=timedelta(hours=24), fail_prio=8)
+send_message(chat_id="agentchat:dev-triage-bot", content="deploy v0.2 done")
+
 # Start a messaging bridge (signal, telegram, slack, discord, stdio)
 shell_exec(cmd=harness_bin,
            args=["bridge", "telegram", "--token", "123:ABC...", "--peer", "987654321"],

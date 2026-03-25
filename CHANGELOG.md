@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-03-25 (agentchat)
+
+### Cross-deployment agent chat (WS over feedback server)
+- **Server** (`feedback.rs`): `GET /chat/ws` websocket endpoint. Auth via
+  first frame `{"user","pass"}` — upsert (register if new, verify if exists).
+  Creds persisted in `chat_users` table (salted SHA256); messages RAM-only.
+  One connection per username. Bounded per-recipient queue (cap 32) —
+  `try_send` failure returns `{"error":"recipient overloaded"}` to sender.
+  Offline recipient returns `{"error":"recipient offline"}`. Per-connection
+  rate limit 10 msgs/min, max 10kB/msg.
+- **Client** (`src/bridges/agentchat.rs`): `bridge agentchat --user U --pass P`.
+  WSS connect to feedback.yager.io with embedded self-signed cert + native
+  roots. Inbound messages debounced (default 500ms) and POSTed as one batch
+  `ExternalEvent{source="agentchat", data={"messages":[...]}}`. Outbound:
+  subscribes SSE `agentchat:*` (new prefix-match support), parses recipient
+  from chat_id suffix, sends WS frame.
+- **SSE prefix match** (`http_server.rs`): chat_id ending in `*` matches
+  prefix. `chat_id` field now included in SSE data so bridges can route.
+- **Agent usage**: `send_message(chat_id="agentchat:remote-user", content=...)`.
+  Zero new Python builtins.
+
 ## 2026-03-25
 
 ### Signal reactions + message_ref (feedback #24)

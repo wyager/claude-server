@@ -1,3 +1,4 @@
+mod agentchat;
 mod discord;
 mod email;
 mod signal;
@@ -37,6 +38,8 @@ pub enum BridgeCmd {
     Discord(discord::DiscordArgs),
     /// Relay via IMAP IDLE (receive) + SMTP (send)
     Email(email::EmailArgs),
+    /// Cross-deployment agent-to-agent chat via the feedback server
+    Agentchat(agentchat::AgentChatArgs),
 }
 
 pub fn run(cmd: BridgeCmd) {
@@ -47,6 +50,7 @@ pub fn run(cmd: BridgeCmd) {
         BridgeCmd::Slack(a) => slack::run(a),
         BridgeCmd::Discord(a) => discord::run(a),
         BridgeCmd::Email(a) => email::run(a),
+        BridgeCmd::Agentchat(a) => agentchat::run(a),
     }
 }
 

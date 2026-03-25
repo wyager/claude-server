@@ -214,6 +214,10 @@ async fn handle_sse(
     Path(chat_id): Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.broadcast_tx.subscribe();
+    // Trailing `*` enables prefix match — lets a bridge subscribe to all
+    // chat_ids under a namespace (e.g. `agentchat:*`) and parse the
+    // recipient from the suffix.
+    let prefix = chat_id.strip_suffix('*').map(str::to_owned);
     let stream = BroadcastStream::new(rx)
         .filter_map(move |msg| {
             match msg {
@@ -224,9 +228,10 @@ async fn handle_sse(
                     id,
                     ref created_at,
                     ref react_to,
-                }) if *msg_chat_id == chat_id => {
+                }) if prefix.as_ref().map_or(*msg_chat_id == chat_id, |p| msg_chat_id.starts_with(p)) => {
                     let data = serde_json::json!({
                         "id": id,
+                        "chat_id": msg_chat_id,
                         "content": content,
                         "react_to": react_to,
                         "attachments": attachments,

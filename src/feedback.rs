@@ -5,9 +5,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::connect_info::Connected;
+use axum::extract::ws::{Message as WsMsg, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{delete, post};
+use axum::routing::{delete, get, post};
+use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
 use axum::serve::{IncomingStream, Listener};
 use axum::{Json, Router};
 use clap::Args;
@@ -17,7 +20,7 @@ use serde_json::json;
 
 const DEFAULT_FEEDBACK_URL: &str = "https://feedback.yager.io:3001/feedback";
 
-const FEEDBACK_SERVER_CERT: &[u8] = b"-----BEGIN CERTIFICATE-----
+pub const FEEDBACK_SERVER_CERT: &[u8] = b"-----BEGIN CERTIFICATE-----
 MIIBqTCCAU6gAwIBAgIUZ0VsIgxcQoLptYwun/K5gCMtrL8wCgYIKoZIzj0EAwIw
 HDEaMBgGA1UEAwwRZmVlZGJhY2sueWFnZXIuaW8wHhcNMjYwMzIyMjExNjMyWhcN
 MzYwMzE5MjExNjMyWjAcMRowGAYDVQQDDBFmZWVkYmFjay55YWdlci5pbzBZMBMG
@@ -128,6 +131,156 @@ struct ServerState {
     db: Arc<Mutex<Connection>>,
     admin_token: Option<String>,
     rate_limiter: Arc<Mutex<HashMap<IpAddr, (Instant, u32)>>>,
+    /// username → bounded sender. try_send failing means recipient overloaded.
+    chat_connections: Arc<tokio::sync::Mutex<HashMap<String, mpsc::Sender<String>>>>,
+}
+
+// ---- Agent chat (cross-deployment coordination over WS) ----
+
+const CHAT_MAX_MSG_BYTES: usize = 10 * 1024;
+const CHAT_QUEUE_CAP: usize = 32;
+const CHAT_RATE_PER_MIN: u32 = 10;
+
+fn pwhash(salt: &str, pass: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(salt.as_bytes());
+    h.update(pass.as_bytes());
+    hex::encode(h.finalize())
+}
+
+/// Upsert auth: register if new, verify if existing. Returns Ok(()) on success.
+fn chat_auth(db: &Connection, user: &str, pass: &str) -> Result<(), &'static str> {
+    if user.is_empty() || user.len() > 64 || pass.is_empty() {
+        return Err("invalid credentials");
+    }
+    let row: Option<(String, String)> = db
+        .query_row(
+            "SELECT salt, pwhash FROM chat_users WHERE username = ?1",
+            [user],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    match row {
+        Some((salt, stored)) => {
+            if pwhash(&salt, pass) == stored { Ok(()) } else { Err("wrong password") }
+        }
+        None => {
+            let salt: String = {
+                use rand::Rng;
+                let mut rng = rand::thread_rng();
+                (0..16).map(|_| format!("{:02x}", rng.gen::<u8>())).collect()
+            };
+            let hash = pwhash(&salt, pass);
+            db.execute(
+                "INSERT INTO chat_users (username, salt, pwhash) VALUES (?1, ?2, ?3)",
+                rusqlite::params![user, salt, hash],
+            ).map_err(|_| "db error")?;
+            Ok(())
+        }
+    }
+}
+
+async fn handle_chat_ws(
+    State(state): State<ServerState>,
+    ws: WebSocketUpgrade,
+) -> axum::response::Response {
+    ws.on_upgrade(move |sock| chat_session(state, sock))
+}
+
+async fn chat_session(state: ServerState, mut sock: WebSocket) {
+    // First frame must be {"user":"...","pass":"..."}
+    let auth = match sock.recv().await {
+        Some(Ok(WsMsg::Text(t))) => serde_json::from_str::<serde_json::Value>(&t).ok(),
+        _ => None,
+    };
+    let (user, pass) = match auth
+        .as_ref()
+        .and_then(|v| Some((v["user"].as_str()?, v["pass"].as_str()?)))
+    {
+        Some((u, p)) => (u.to_string(), p.to_string()),
+        None => { let _ = sock.send(WsMsg::Text(r#"{"error":"expected auth frame"}"#.into())).await; return; }
+    };
+    let auth_err = {
+        let db = state.db.lock().unwrap();
+        chat_auth(&db, &user, &pass).err()
+    };
+    if let Some(e) = auth_err {
+        let _ = sock.send(WsMsg::Text(json!({"error": e}).to_string().into())).await;
+        return;
+    }
+
+    // Bounded channel — try_send failure signals overload to the sender.
+    let (tx, mut rx) = mpsc::channel::<String>(CHAT_QUEUE_CAP);
+    {
+        let mut conns = state.chat_connections.lock().await;
+        if conns.contains_key(&user) {
+            let _ = sock.send(WsMsg::Text(r#"{"error":"already connected elsewhere"}"#.into())).await;
+            return;
+        }
+        conns.insert(user.clone(), tx);
+    }
+    let _ = sock.send(WsMsg::Text(r#"{"ok":true}"#.into())).await;
+
+    let (mut sink, mut stream) = sock.split();
+    use futures::{SinkExt, StreamExt};
+    let mut rate_bucket = (Instant::now(), 0u32);
+
+    loop {
+        tokio::select! {
+            // Outbound: flush queued frames to this client
+            msg = rx.recv() => match msg {
+                Some(frame) => { if sink.send(WsMsg::Text(frame.into())).await.is_err() { break; } }
+                None => break,
+            },
+            // Inbound: route to recipient
+            inc = stream.next() => match inc {
+                Some(Ok(WsMsg::Text(t))) => {
+                    if t.len() > CHAT_MAX_MSG_BYTES {
+                        let _ = sink.send(WsMsg::Text(r#"{"error":"message too large"}"#.into())).await;
+                        continue;
+                    }
+                    // Rate limit
+                    let now = Instant::now();
+                    if now.duration_since(rate_bucket.0) > Duration::from_secs(60) {
+                        rate_bucket = (now, 0);
+                    }
+                    if rate_bucket.1 >= CHAT_RATE_PER_MIN {
+                        let _ = sink.send(WsMsg::Text(r#"{"error":"rate limited"}"#.into())).await;
+                        continue;
+                    }
+                    rate_bucket.1 += 1;
+
+                    let v: serde_json::Value = match serde_json::from_str(&t) {
+                        Ok(v) => v, Err(_) => continue,
+                    };
+                    let Some(to) = v["to"].as_str() else { continue };
+                    let Some(body) = v["body"].as_str() else { continue };
+                    let frame = json!({"from": user, "body": body}).to_string();
+
+                    let conns = state.chat_connections.lock().await;
+                    let err = match conns.get(to) {
+                        None => Some("recipient offline"),
+                        Some(tx) => match tx.try_send(frame) {
+                            Ok(()) => None,
+                            Err(_) => Some("recipient overloaded"),
+                        },
+                    };
+                    drop(conns);
+                    if let Some(e) = err {
+                        // Error replies also obey the recipient-queue discipline:
+                        // we try_send to ourselves via the sink directly (no queue),
+                        // but DON'T retry or spin. One attempt, then move on.
+                        let _ = sink.send(WsMsg::Text(json!({"error": e, "to": to}).to_string().into())).await;
+                    }
+                }
+                Some(Ok(WsMsg::Ping(p))) => { let _ = sink.send(WsMsg::Pong(p)).await; }
+                Some(Ok(WsMsg::Close(_))) | None => break,
+                _ => {}
+            }
+        }
+    }
+
+    state.chat_connections.lock().await.remove(&user);
 }
 
 #[derive(Deserialize)]
@@ -202,18 +355,27 @@ pub fn run_server(args: ServerArgs) {
     .expect("Failed to create feedback table");
     // Migration for existing DBs — ignore error if column already exists.
     let _ = conn.execute("ALTER TABLE feedback ADD COLUMN api_trace TEXT", []);
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS chat_users (
+            username TEXT PRIMARY KEY,
+            salt TEXT NOT NULL,
+            pwhash TEXT NOT NULL
+        );",
+    ).expect("Failed to create chat_users table");
 
     let has_admin = admin_token.is_some();
     let state = ServerState {
         db: Arc::new(Mutex::new(conn)),
         admin_token,
         rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+        chat_connections: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     };
 
     let app = Router::new()
         .route("/feedback", post(handle_post).get(handle_get))
         .route("/feedback/{id}", delete(handle_delete))
         .route("/feedback/{id}/trace", axum::routing::get(handle_get_trace))
+        .route("/chat/ws", get(handle_chat_ws))
         .with_state(state);
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
