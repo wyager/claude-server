@@ -131,8 +131,9 @@ struct ServerState {
     db: Arc<Mutex<Connection>>,
     admin_token: Option<String>,
     rate_limiter: Arc<Mutex<HashMap<IpAddr, (Instant, u32)>>>,
-    /// username → bounded sender. try_send failing means recipient overloaded.
-    chat_connections: Arc<tokio::sync::Mutex<HashMap<String, mpsc::Sender<String>>>>,
+    /// username → (session_id, bounded sender). Session ID lets a kicked
+    /// session know not to remove its replacement's entry during cleanup.
+    chat_connections: Arc<tokio::sync::Mutex<HashMap<String, (u64, mpsc::Sender<String>)>>>,
 }
 
 // ---- Agent chat (cross-deployment coordination over WS) ----
@@ -140,6 +141,9 @@ struct ServerState {
 const CHAT_MAX_MSG_BYTES: usize = 10 * 1024;
 const CHAT_QUEUE_CAP: usize = 32;
 const CHAT_RATE_PER_MIN: u32 = 10;
+const CHAT_PING_SECS: u64 = 30;
+
+static CHAT_SESSION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn pwhash(salt: &str, pass: &str) -> String {
     let mut h = Sha256::new();
@@ -210,23 +214,33 @@ async fn chat_session(state: ServerState, mut sock: WebSocket) {
     }
 
     // Bounded channel — try_send failure signals overload to the sender.
+    // Kick-on-reauth: inserting drops the old Sender, which closes the old
+    // session's rx → it breaks out and cleans up. Session ID prevents that
+    // cleanup from removing OUR entry (it only removes if the ID matches).
     let (tx, mut rx) = mpsc::channel::<String>(CHAT_QUEUE_CAP);
-    {
+    let my_session = CHAT_SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let kicked = {
         let mut conns = state.chat_connections.lock().await;
-        if conns.contains_key(&user) {
-            let _ = sock.send(WsMsg::Text(r#"{"error":"already connected elsewhere"}"#.into())).await;
-            return;
-        }
-        conns.insert(user.clone(), tx);
-    }
-    let _ = sock.send(WsMsg::Text(r#"{"ok":true}"#.into())).await;
+        conns.insert(user.clone(), (my_session, tx)).is_some()
+    };
+    let _ = sock.send(WsMsg::Text(
+        json!({"ok": true, "kicked_prior_session": kicked}).to_string().into()
+    )).await;
 
     let (mut sink, mut stream) = sock.split();
     use futures::{SinkExt, StreamExt};
     let mut rate_bucket = (Instant::now(), 0u32);
+    // Server-side ping: a SIGKILL'd client sends no FIN, so without this the
+    // OS won't notice for hours (default TCP keepalive). Periodic pings
+    // force a write, which fails with RST once the kernel gives up retrying.
+    let mut ping = tokio::time::interval(Duration::from_secs(CHAT_PING_SECS));
+    ping.tick().await;
 
     loop {
         tokio::select! {
+            _ = ping.tick() => {
+                if sink.send(WsMsg::Ping(vec![].into())).await.is_err() { break; }
+            }
             // Outbound: flush queued frames to this client
             msg = rx.recv() => match msg {
                 Some(frame) => { if sink.send(WsMsg::Text(frame.into())).await.is_err() { break; } }
@@ -260,7 +274,7 @@ async fn chat_session(state: ServerState, mut sock: WebSocket) {
                     let conns = state.chat_connections.lock().await;
                     let err = match conns.get(to) {
                         None => Some("recipient offline"),
-                        Some(tx) => match tx.try_send(frame) {
+                        Some((_, tx)) => match tx.try_send(frame) {
                             Ok(()) => None,
                             Err(_) => Some("recipient overloaded"),
                         },
@@ -280,7 +294,10 @@ async fn chat_session(state: ServerState, mut sock: WebSocket) {
         }
     }
 
-    state.chat_connections.lock().await.remove(&user);
+    let mut conns = state.chat_connections.lock().await;
+    if conns.get(&user).map(|(s, _)| *s) == Some(my_session) {
+        conns.remove(&user);
+    }
 }
 
 #[derive(Deserialize)]

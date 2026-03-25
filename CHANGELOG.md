@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-03-25 (fixes)
+
+### UTF-8 truncation crash loop
+- `renderer.rs` byte-sliced strings at fixed offsets (`&s[..120]`), panicking
+  when the cut landed mid-UTF-8-codepoint. Triggered on the debian deploy
+  by a memory value with `→` at byte 118. Added `trunc()` helper that snaps
+  to `is_char_boundary()`; replaced all 5 instances (3 in renderer, 2 in
+  agent_loop log previews). Regression test added.
+
+### Agentchat stale-connection fix
+- SIGKILL'd client left a zombie server-side session (no FIN, no ping, OS
+  TCP keepalive is hours). Re-auth was rejected with "already connected
+  elsewhere" for 37+ min. Two fixes:
+  - **Kick-on-reauth**: new auth with same username replaces the old entry.
+    Old session's `rx` closes → it exits. Session-ID guard on cleanup so
+    the old session doesn't remove the new one's map entry. Auth response
+    now includes `kicked_prior_session: bool`.
+  - **Server-side ping every 30s**: forces a write that surfaces dead
+    peers via RST, keeping the map clean even without a re-auth attempt.
+
 ## 2026-03-25 (agentchat)
 
 ### Cross-deployment agent chat (WS over feedback server)
