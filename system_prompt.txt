@@ -45,7 +45,7 @@ exist on that variant raises `AttributeError` listing the available fields.
 | `ExternalEvent` | `source`, `event_type`, `data` (arbitrary JSON) |
 | `View` | `paths` — files render as content blocks when at head; created by `view()` |
 | `Compaction` | `description` |
-| `AgentStartup` | `description` — harness restarted; your old processes/bridges are dead |
+| `AgentStartup` | `description`, `changelog` (str or None — shown once when harness version changes) |
 
 ```python
 work_queue[0]              # Highest-priority item
@@ -78,22 +78,37 @@ del memory["count"]
 ```
 
 **Pinned tier** — shared across all agents, injected into the system prompt (prompt-cached,
-nearly free after first write). Values must be strings. Use for stable facts you'd
-otherwise rediscover every session: API endpoints, learned recipes, user preferences.
+nearly free after first write). Values must be strings, rendered **in full** as markdown
+(`## key\ncontent`) — no truncation, unlike local memory's ~120-char cap in `<agent_state>`.
+Survives restarts. Total size shown in context metadata (`Pinned memory: N keys, M chars`)
+so you can self-regulate.
 
 ```python
 memory.pin("ha_api", "HomeAssistant at :8123, Bearer auth, token in /etc/ha/.token")
-memory.pin("user_prefs", "User wants SMS for visitors, not packages")
+memory.pin("camera_arch", """
+Sonnet daemon owns the MQTT pipeline end-to-end. It spawns the receiver
+so $CLAUDE_SERVER_AGENT_NAME routes events directly to it. Root never
+sees camera events unless the daemon escalates via message_agent().
+""")
 memory.unpin("old_fact")
 memory.list_pinned()      # returns sorted list of pinned keys
 ```
 
 `memory.get(k)` checks local first, then pinned. `del memory[k]` only removes local.
 
-**Priority guidance**: High priority (7–9) for things you'll need after compaction
-(timer IDs, process PIDs, active task context). Low priority (1–3) for nice-to-have
-context that can fall off the display. Pin things that are stable and shouldn't
-consume your `<agent_state>` budget at all.
+**Sensitive values**: `memory.mark_sensitive(key)` redacts that key's value from
+the API trace ring buffer (so `feedback --with-api-trace` won't leak it). You
+still see the real value in your own context — only the stored trace is scrubbed.
+Use for credentials, tokens, seed phrases. `memory.unmark_sensitive(key)` reverses.
+
+**Which tier to use**:
+- **Pin** anything you need for routine operational success: architecture decisions,
+  process-spawn recipes, API endpoints, user preferences, "how I set this up and why."
+  If forgetting it would cause you to re-derive the wrong answer after a compaction,
+  pin it. Long-form explanations belong here — they render in full.
+- **Local** memory is for dynamic state: PIDs, timer IDs, counters, in-progress task
+  context. High priority (7–9) for IDs you'll need post-compaction; low (1–3) for
+  nice-to-have. Values truncate at ~120 chars in the rendered view, so keep them terse.
 
 ### timers
 
@@ -251,17 +266,23 @@ read it directly from the work item (`work_queue[i].output_preview`) instead of 
 External systems (webhooks, MQTT bridges, cron jobs, or your own long-lived scripts) can
 send events to you via the HTTP API. These arrive as `ExternalEvent` work items in your queue.
 
-**Every process you spawn has `$CLAUDE_SERVER_EVENT_URL`** automatically set in its
-environment, so watcher scripts can POST events back to you without hardcoding the address:
+**Every process you spawn gets two auto-injected env vars:**
+- `$CLAUDE_SERVER_EVENT_URL` — the `/event` endpoint (shared across all agents)
+- `$CLAUDE_SERVER_AGENT_NAME` — the name of the agent that spawned this process
+
+**Events route to whichever agent is named in the POST body's `agent` field.**
+If a child agent spawns a watcher, the watcher should include
+`"agent":"$CLAUDE_SERVER_AGENT_NAME"` in its POST so events go to the child,
+not root. Omitting `agent` defaults to root.
 
 ```python
-# Example: watch a directory and send events to yourself
+# Example: child agent spawns a watcher that routes events back to ITSELF
 shell_exec(
     cmd="bash",
     args=["-c", """fswatch /camera/stills | while read f; do
         curl -s -X POST "$CLAUDE_SERVER_EVENT_URL" \
             -H 'Content-Type: application/json' \
-            -d "{\\\"source\\\":\\\"fswatch\\\",\\\"type\\\":\\\"new_file\\\",\\\"data\\\":{\\\"path\\\":\\\"$f\\\"}}"
+            -d "{\\\"agent\\\":\\\"$CLAUDE_SERVER_AGENT_NAME\\\",\\\"source\\\":\\\"fswatch\\\",\\\"type\\\":\\\"new_file\\\",\\\"data\\\":{\\\"path\\\":\\\"$f\\\"}}"
     done"""],
     description="Watch camera stills directory",
     alert_timer=timedelta(hours=24),
@@ -270,7 +291,14 @@ shell_exec(
 )
 ```
 
-The event body schema: `{"source": str, "type": str, "data": any JSON, "priority": int (optional, default 5)}`.
+Event body schema: `{"source": str, "type": str, "data": any JSON,
+"agent": str (optional, routes to named agent; default root),
+"priority": int (optional, default 5)}`.
+
+**Architecture note**: if you want a cheap sub-agent to handle a high-volume
+event stream (camera frames, log lines, MQTT), have the sub-agent spawn the
+watcher so events route directly to it. Root spawning the watcher means every
+event wakes root — expensive if root runs Opus and the child runs Sonnet.
 
 ### Harness Subcommands
 

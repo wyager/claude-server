@@ -63,6 +63,7 @@ pub struct SideEffectCollector {
     pub done_called: bool,
     pub done_result: HashMap<String, serde_json::Value>,
     pub memory_pins: Vec<(String, String)>,    // (key, content) — written to pinned_memory table, cached in system prompt
+    pub sensitive_marks: Vec<(String, bool)>,  // (key, is_sensitive) — toggles trace redaction
     pub memory_unpins: Vec<String>,            // keys to remove from pinned storage
 }
 
@@ -287,7 +288,10 @@ fn work_item_to_py(item: &WorkItem) -> PyWorkItem {
             fields.insert("description".into(), "You must compact your context.".into());
             "Compaction"
         }
-        WorkItemType::AgentStartup => {
+        WorkItemType::AgentStartup { changelog } => {
+            if let Some(c) = changelog {
+                fields.insert("changelog".into(), c.clone().into());
+            }
             fields.insert(
                 "description".into(),
                 "Harness restarted. Any processes/bridges you were managing are dead — inspect memory and reconnect as needed.".into(),
@@ -474,6 +478,20 @@ impl PyMemory {
         let mut keys: Vec<String> = self.pinned.keys().cloned().collect();
         keys.sort();
         keys
+    }
+
+    /// Mark a key's value as sensitive: it will be redacted from the API
+    /// trace ring buffer (and thus from `feedback --with-api-trace` uploads).
+    /// You still see the real value in your live context — only the stored
+    /// trace is scrubbed.
+    fn mark_sensitive(&mut self, key: String) -> PyResult<()> {
+        self.collector.lock().unwrap().sensitive_marks.push((key, true));
+        Ok(())
+    }
+
+    fn unmark_sensitive(&mut self, key: String) -> PyResult<()> {
+        self.collector.lock().unwrap().sensitive_marks.push((key, false));
+        Ok(())
     }
 
     fn __repr__(&self) -> String {

@@ -1,5 +1,33 @@
 # Changelog
 
+## 2026-03-26
+
+### Agent-facing changelog on version upgrade
+- `HarnessState.last_harness_version: Option<String>` tracked in persisted
+  state. On resume, if it differs from `CARGO_PKG_VERSION`, the `AgentStartup`
+  work item includes a `changelog` field with a terse, action-oriented summary
+  of new capabilities (from `AGENT_CHANGELOG` const in main.rs). Agent sees it
+  once, then the version is updated. Fresh state initializes to current version
+  (no changelog on first-ever run). Bumped to 0.2.0 so existing deploys trigger.
+
+### Sensitive memory redaction
+- `memory.mark_sensitive(key)` / `memory.unmark_sensitive(key)` — values of
+  marked keys are scrubbed from the API trace ring buffer at store time
+  (replaced with `<SENSITIVE, REDACTED>`). Agent's live context unchanged;
+  only the trace and thus `feedback --with-api-trace` uploads are scrubbed.
+  `HarnessState.sensitive_keys: HashSet<String>` persisted. Scrub replaces
+  both raw and JSON-escaped forms; skips values <8 chars (false-positive
+  guard). Driven by feedback #26 exposing a wallet seed in an API trace.
+
+### System prompt — memory & event routing docs
+- Pinned tier: explicit that values render **in full** (no 120-char truncation),
+  survive restarts, and show size in context metadata. New "which tier to use"
+  guidance: pin anything needed for routine operational success.
+- External events: documented `$CLAUDE_SERVER_AGENT_NAME` env var and the
+  `agent` field in POST /event body for per-agent routing. Example updated.
+  Fixes feedback #26's root cause — agent couldn't discover the routing
+  mechanism from docs, kept re-deriving the wrong (root-forwarding) architecture.
+
 ## 2026-03-25 (fixes)
 
 ### UTF-8 truncation crash loop

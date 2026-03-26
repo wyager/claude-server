@@ -363,8 +363,21 @@ impl AgentLoop {
             status: "thinking".to_string(),
         });
 
+        // Collect sensitive values for trace scrubbing. Check both local
+        // and pinned memory; extract string repr.
+        let sensitive_values: Vec<String> = self.state.sensitive_keys.iter()
+            .filter_map(|k| {
+                self.state.memory.get(k).map(|v| match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .or_else(|| pinned.iter().find(|(pk, _)| pk == k).map(|(_, v)| v.clone()))
+            })
+            .filter(|v| v.len() >= 8)  // skip trivially short values (false-positive risk)
+            .collect();
+
         // Call Claude API
-        let api_result = self.api_client.call(&rendered, &pinned, &self.name, self.turn_counter).await?;
+        let api_result = self.api_client.call(&rendered, &pinned, &self.name, self.turn_counter, &sensitive_values).await?;
 
         let turn_cost = (api_result.input_tokens as f64 * self.config.cost_per_m_input
             + api_result.output_tokens as f64 * self.config.cost_per_m_output
@@ -1244,6 +1257,13 @@ impl AgentLoop {
         for key in effects.memory_unpins {
             if let Err(e) = self.db.delete_pin(&key) {
                 eprintln!("[{}] Failed to unpin '{}': {}", self.name, key, e);
+            }
+        }
+        for (key, sensitive) in effects.sensitive_marks {
+            if sensitive {
+                self.state.sensitive_keys.insert(key);
+            } else {
+                self.state.sensitive_keys.remove(&key);
             }
         }
 

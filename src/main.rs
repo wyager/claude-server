@@ -27,6 +27,32 @@ use tokio::sync::{broadcast, mpsc};
 use http_server::BroadcastMsg;
 use types::TokenAccumulator;
 
+/// Agent-facing changelog. Shown once in the AgentStartup work item when the
+/// harness version changes. Keep this terse and action-oriented — what the
+/// agent should DO differently, not implementation details. Prune entries
+/// older than a few versions once deployments have caught up.
+const AGENT_CHANGELOG: &str = "\
+Recent harness changes you should act on:
+
+- `memory.mark_sensitive(key)` — redacts that key's value from feedback API
+  traces. Mark credentials, tokens, seed phrases NOW so future
+  `feedback --with-api-trace` doesn't leak them.
+
+- `memory.pin(key, content)` renders in FULL (markdown, no truncation).
+  Local memory truncates at ~120 chars in <agent_state>. Move long
+  architecture docs / operational recipes to pin.
+
+- External event routing: POST /event accepts `\"agent\":\"<name>\"` to route
+  to a specific agent. `$CLAUDE_SERVER_AGENT_NAME` env var (auto-injected
+  into every spawned process) holds the spawning agent's name. If a child
+  spawns a watcher, the watcher can route events straight to the child —
+  root never wakes. Include `\"agent\":\"$CLAUDE_SERVER_AGENT_NAME\"` in
+  watcher POST bodies.
+
+- `send_message(chat_id, content, react_to=message_ref)` — react with an
+  emoji instead of sending a message. UserMessage items carry `message_ref`.
+";
+
 const ENV_HELP: &str = "\
 Environment variables:
   ANTHROPIC_API_KEY                 API key (required for daemon)
@@ -156,6 +182,19 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
             // entries would otherwise deserialize as "running" ghosts. Agents
             // re-spawn everything from memory on AgentStartup anyway.
             s.process_manager = types::ProcessManager::new();
+
+            // Version check: if the harness upgraded, attach the agent-facing
+            // changelog so the agent learns new capabilities on its first turn.
+            let current = env!("CARGO_PKG_VERSION");
+            let prev = s.last_harness_version.take().unwrap_or_else(|| "unknown".into());
+            let changelog = if prev != current {
+                println!("  Harness upgraded: {} → {} (changelog will be shown to agent)", prev, current);
+                Some(format!("Harness upgraded from {} to {}.\n\n{}", prev, current, AGENT_CHANGELOG))
+            } else {
+                None
+            };
+            s.last_harness_version = Some(current.to_string());
+
             // Inject startup item so the agent gets a turn to reconnect any
             // bridges/processes it tracked in memory before the restart.
             let id = s.id_generator.next();
@@ -163,13 +202,14 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
                 id,
                 priority: 9,
                 time: chrono::Utc::now(),
-                item_type: types::WorkItemType::AgentStartup,
+                item_type: types::WorkItemType::AgentStartup { changelog },
                 attachments: Vec::new(),
             });
             s
         }
         None => {
-            let s = types::HarnessState::new(config.context_window, config.max_tokens);
+            let mut s = types::HarnessState::new(config.context_window, config.max_tokens);
+            s.last_harness_version = Some(env!("CARGO_PKG_VERSION").to_string());
             database.save_state(&s)?;
             println!("  Created fresh state");
             s

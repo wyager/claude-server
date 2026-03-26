@@ -127,7 +127,12 @@ pub enum WorkItemType {
         paths: Vec<String>,
     },
     Compaction,
-    AgentStartup,
+    AgentStartup {
+        /// Agent-facing changelog shown when the harness version changed
+        /// since the last run. None if version unchanged or first run.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        changelog: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -566,6 +571,16 @@ pub struct HarnessState {
     pub memory: Memory,
     #[serde(default)]
     pub memory_priorities: HashMap<String, u8>,
+    /// Keys whose values are scrubbed from the API trace ring buffer before
+    /// storage. The agent still sees real values in its live context; only
+    /// the trace (and thus `feedback --with-api-trace` uploads) is redacted.
+    #[serde(default)]
+    pub sensitive_keys: std::collections::HashSet<String>,
+    /// Harness version that last wrote this state. On mismatch at startup,
+    /// the AgentStartup item includes the agent-facing changelog so the
+    /// agent learns about new capabilities without operator intervention.
+    #[serde(default)]
+    pub last_harness_version: Option<String>,
     pub id_generator: IdGenerator,
     pub last_input_tokens: u64,
     pub context_window: u64,
@@ -581,6 +596,8 @@ impl HarnessState {
             process_manager: ProcessManager::new(),
             memory: HashMap::new(),
             memory_priorities: HashMap::new(),
+            sensitive_keys: std::collections::HashSet::new(),
+            last_harness_version: None,
             id_generator: IdGenerator::new(),
             last_input_tokens: 0,
             context_window,

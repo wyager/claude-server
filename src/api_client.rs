@@ -176,6 +176,7 @@ impl ApiClient {
         pinned_memory: &[(String, String)],
         agent_name: &str,
         turn: u32,
+        sensitive_values: &[String],
     ) -> Result<ApiTurnResult> {
         let request = self.build_request(rendered, pinned_memory);
         if let Ok(path) = std::env::var("CLAUDE_SERVER_DUMP_REQUEST") {
@@ -212,11 +213,35 @@ impl ApiClient {
                         .await
                         .context("Failed to parse API response")?;
                     if let Some(trace) = &self.trace {
+                        let (req, resp) = if sensitive_values.is_empty() {
+                            (serde_json::to_value(&request).unwrap_or_default(), raw.clone())
+                        } else {
+                            // Scrub at store time so the ring buffer never holds
+                            // the real values — feedback uploads are then safe.
+                            let scrub = |v: &serde_json::Value| {
+                                let mut s = serde_json::to_string(v).unwrap_or_default();
+                                for val in sensitive_values {
+                                    // Replace both the raw value and its
+                                    // JSON-escaped form (covers values
+                                    // embedded in text blocks vs. as JSON
+                                    // string literals).
+                                    s = s.replace(val, "<SENSITIVE, REDACTED>");
+                                    if let Ok(esc) = serde_json::to_string(val) {
+                                        let esc = esc.trim_matches('"');
+                                        if esc != val {
+                                            s = s.replace(esc, "<SENSITIVE, REDACTED>");
+                                        }
+                                    }
+                                }
+                                serde_json::from_str(&s).unwrap_or(serde_json::Value::Null)
+                            };
+                            (scrub(&serde_json::to_value(&request).unwrap_or_default()), scrub(&raw))
+                        };
                         trace.lock().unwrap().push(TraceEntry {
                             agent: agent_name.to_string(),
                             turn,
-                            request: serde_json::to_value(&request).unwrap_or_default(),
-                            response: raw.clone(),
+                            request: req,
+                            response: resp,
                         });
                     }
                     let api_response: ApiResponse = serde_json::from_value(raw)
