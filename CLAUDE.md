@@ -65,8 +65,8 @@ See `INTERPRETER.md` for details on the Python integration.
 | `chat.rs` | Chat UI subcommand: serves embedded HTML with API URL injection |
 | `chat.html` | Single-file HTML/CSS/JS chat interface (embedded via include_str!) |
 | `source_dump.rs` | `source` subcommand: dumps/extracts the embedded source tarball |
-| `bridges/` | `bridge` subcommand: messaging relay daemons (stdio, signal, telegram, slack, discord, email). Shared `relay_loop` in mod.rs with bidirectional attachment support. |
-| `feedback.rs` | `feedback` (client) and `feedback-server` subcommands. Agents POST bug reports to a central server (default feedback.yager.io). |
+| `bridges/` | `bridge` subcommand: messaging relay daemons (stdio, signal, telegram, slack, discord, email, agentchat). Shared `relay_loop` in mod.rs with bidirectional attachment support. |
+| `feedback.rs` | `feedback`/`feedback-server` subcommands. Agents POST bug reports to feedback.yager.io. Also hosts `/chat/ws` — cross-deployment agent chat (salted-SHA256 auth, bounded queues, kick-on-reauth, 30s server ping). |
 | `watchers/` | `watch` subcommand: one-directional event sources (fs, mqtt, imap). Shared `post_event` helper in mod.rs. |
 | `webhook_proxy.rs` | `webhook-proxy` subcommand: HMAC-validated public ingress (GitHub, Slack, generic bearer) that forwards to `/event`. |
 | `system_prompt.txt` | System prompt sent to Claude on every API call |
@@ -148,9 +148,18 @@ images) and the agent promotes paths via `view()`. `ChildSettings.attach`
 pushes a View item to the child's queue.
 
 **Auto-injected process env**: Every process spawned via `shell_exec()` gets
-`CLAUDE_SERVER_EVENT_URL` in its environment (computed from `Config.listen_addr`).
-Watcher scripts can `curl -X POST "$CLAUDE_SERVER_EVENT_URL" ...` to send events
-back to the agent without hardcoding the listen address.
+`CLAUDE_SERVER_EVENT_URL` (the `/event` endpoint) and `CLAUDE_SERVER_AGENT_NAME`
+(the spawning agent's name). POST `/event` with `"agent":"<name>"` in the body
+routes to that agent via the registry; omit it to route to root. Watchers spawned
+by a child should include `"agent":"$CLAUDE_SERVER_AGENT_NAME"` so events go
+straight to the child — root never wakes.
+
+**Message references + reactions**: `UserMessage` work items carry an optional
+`message_ref` (bridge-native ID: Signal timestamp, Discord snowflake, Slack ts).
+`send_message(chat_id, content, react_to=ref)` sends a reaction instead of a
+message. Threaded through `Inbound`/`Outbound` structs in bridges, `BroadcastMsg`,
+SSE. Signal bridge maps to `sendReaction` jsonRpc; other bridges can wire up
+their native reaction APIs.
 
 **Harness subcommands + `harness_bin`**: The binary bundles helper subcommands
 (`source`, `bridge`) that the agent invokes via `shell_exec(cmd=harness_bin, ...)`.
@@ -162,23 +171,42 @@ stdio, ...) to the existing `/message` + SSE endpoints — one `chat_id` per bri
 **Pinned memory (self-improving system prompt)**: `memory.pin(key, content)` writes
 to a shared SQLite tier (`pinned_memory` table) and injects into the system prompt
 (cached via `cache_control: ephemeral`). Shared across all agents and sessions.
-`memory.get(k)` checks local first, then pinned. `memory.unpin(k)`, `memory.list_pinned()`.
-Pinned entries are strings (render as markdown in the system prompt). Pinned size is
-shown in context metadata for self-regulation.
+Renders in full as markdown — unlike local memory's ~120-char truncation in
+`<agent_state>`. `memory.get(k)` checks local first, then pinned. Size shown in
+context metadata for self-regulation.
+
+**Sensitive memory redaction**: `memory.mark_sensitive(key)` adds the key to
+`HarnessState.sensitive_keys`. At API-trace store time, the value is string-replaced
+with `<SENSITIVE, REDACTED>` across request and response JSON (both raw and
+JSON-escaped forms; skips values <8 chars). Agent's live context unchanged — only
+the ring buffer, and thus `feedback --with-api-trace` uploads, are scrubbed.
+
+**Agent-facing changelog**: `HarnessState.last_harness_version` compared against
+`CARGO_PKG_VERSION` on resume. Mismatch → `AgentStartup { changelog: Some(...) }`
+with the `AGENT_CHANGELOG` const from `main.rs`. Lets deployed agents self-discover
+new capabilities (e.g. `mark_sensitive`) without operator intervention. Entries are
+action-oriented ("mark credentials NOW"), pruned once deployments catch up. Bump
+the Cargo version when shipping agent-facing features.
+
+**UTF-8-safe truncation**: `renderer::trunc(s, max_bytes)` snaps back to the
+nearest `is_char_boundary` before slicing. Bare `&s[..n]` panics mid-codepoint —
+found via a crash loop on a memory value with `→` at exactly the cut point.
 
 **Streaming responses (SSE)**: A `tokio::sync::broadcast` channel delivers
 messages in real time. The SSE endpoint (`GET /messages/:chat_id/stream`)
-pushes `message` and `status` events to connected clients. The chat UI uses
-`EventSource` instead of polling.
+pushes `message` and `status` events to connected clients. A chat_id ending in
+`*` matches by prefix (e.g. `agentchat:*` for bridge routing); the full
+chat_id is included in the SSE data.
 
 ## HTTP API
 
 ```
-POST /message                    { chat_id?, user, content } → { status, chat_id }
-POST /event                      { source, type, data, priority? } → { status }
+POST /message                    { chat_id?, user, content, attachments?, message_ref? } → { status, chat_id }
+POST /event                      { source, type, data, agent?, priority? } → { status }
 GET  /status                     → { status, model }
 GET  /messages/:chat_id          → { messages: [...] }
-GET  /messages/:chat_id/stream   SSE stream (message + status events)
+GET  /messages/:chat_id/stream   SSE stream (prefix match if chat_id ends in *)
+GET  /api-trace                  → last N request/response pairs (sensitive values pre-scrubbed)
 GET  /cost                       → { input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, estimated_cost_usd }
 POST /shutdown                   → { status }
 ```
@@ -203,3 +231,12 @@ All endpoints have CORS enabled (permissive). The chat UI uses these directly.
 | `CLAUDE_SERVER_COST_OUTPUT` | `15.0` | Output token cost per million tokens (USD) |
 | `CLAUDE_SERVER_COST_CACHE_READ` | `0.30` | Cache read token cost per million tokens (USD) |
 | `CLAUDE_SERVER_COST_CACHE_WRITE` | `3.75` | Cache write token cost per million tokens (USD) |
+| `CLAUDE_SERVER_CACHE_STRIDE` | `5` | Base stride for geometric cache-tier alignment |
+| `CLAUDE_SERVER_CACHE_TIERS` | `2` | Number of geometric cache tiers (capped by 4-breakpoint limit) |
+| `CLAUDE_SERVER_API_TRACE_SIZE` | `10` | Ring buffer size for /api-trace (0 disables) |
+| `CLAUDE_SERVER_FEEDBACK_URL` | `https://feedback.yager.io:3001/feedback` | Where `feedback` subcommand POSTs |
+| `CLAUDE_SERVER_FEEDBACK_ADMIN_TOKEN` | (none) | Bearer token for feedback-server GET/DELETE |
+
+Auto-injected into spawned process env (not daemon config):
+- `CLAUDE_SERVER_EVENT_URL` — the `/event` endpoint
+- `CLAUDE_SERVER_AGENT_NAME` — name of the agent that spawned the process
