@@ -450,6 +450,27 @@ pub fn build_tls_acceptor(cert_path: &str, key_path: &str) -> tokio_rustls::TlsA
     tokio_rustls::TlsAcceptor::from(Arc::new(config))
 }
 
+/// Pure-rustls client connect. Replaces async-native-tls so the binary has
+/// no OpenSSL linkage. async-imap's `runtime-tokio` feature accepts this
+/// directly (tokio::io traits, no futures-io compat wrapper needed).
+pub async fn rustls_connect(
+    host: &str,
+    tcp: tokio::net::TcpStream,
+) -> anyhow::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    let mut roots = rustls::RootCertStore::empty();
+    for c in rustls_native_certs::load_native_certs().certs {
+        let _ = roots.add(c);
+    }
+    let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+    let domain = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|_| anyhow::anyhow!("invalid hostname: {}", host))?;
+    Ok(connector.connect(domain, tcp).await?)
+}
+
 /// TLS listener that spawns handshakes into background tasks so a slow or
 /// stalled client can't block the accept loop.
 pub struct TlsListener {

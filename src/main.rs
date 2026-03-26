@@ -27,31 +27,55 @@ use tokio::sync::{broadcast, mpsc};
 use http_server::BroadcastMsg;
 use types::TokenAccumulator;
 
-/// Agent-facing changelog. Shown once in the AgentStartup work item when the
-/// harness version changes. Keep this terse and action-oriented — what the
-/// agent should DO differently, not implementation details. Prune entries
-/// older than a few versions once deployments have caught up.
-const AGENT_CHANGELOG: &str = "\
-Recent harness changes you should act on:
-
+/// Agent-facing changelog, keyed by the version that introduced each change.
+/// On upgrade, the agent sees all entries with version > its stored version.
+/// Keep entries terse and action-oriented — what the agent should DO
+/// differently, not implementation details. Safe to prune very old entries
+/// once no deployment could possibly still be on that version.
+const AGENT_CHANGELOG: &[(&str, &str)] = &[
+    ("0.2.0", "\
 - `memory.mark_sensitive(key)` — redacts that key's value from feedback API
   traces. Mark credentials, tokens, seed phrases NOW so future
   `feedback --with-api-trace` doesn't leak them.
-
 - `memory.pin(key, content)` renders in FULL (markdown, no truncation).
   Local memory truncates at ~120 chars in <agent_state>. Move long
   architecture docs / operational recipes to pin.
-
 - External event routing: POST /event accepts `\"agent\":\"<name>\"` to route
   to a specific agent. `$CLAUDE_SERVER_AGENT_NAME` env var (auto-injected
   into every spawned process) holds the spawning agent's name. If a child
   spawns a watcher, the watcher can route events straight to the child —
   root never wakes. Include `\"agent\":\"$CLAUDE_SERVER_AGENT_NAME\"` in
   watcher POST bodies.
-
 - `send_message(chat_id, content, react_to=message_ref)` — react with an
-  emoji instead of sending a message. UserMessage items carry `message_ref`.
-";
+  emoji instead of sending a message. UserMessage items carry `message_ref`."),
+    ("0.2.1", "\
+- `watch mqtt --payload=structured` — parse {attachments:[{name,base64}],data:{}}
+  from MQTT, decode to --attach-dir, send file paths. No more Python receiver
+  needed for camera pipelines. Also --payload=raw for unparsed binary."),
+];
+
+/// Parse "X.Y.Z" into a comparable tuple. Unparseable → (0,0,0) so it sorts
+/// first (agent sees everything, which is the safe default for "unknown").
+fn parse_ver(v: &str) -> (u32, u32, u32) {
+    let mut it = v.split('.').map(|p| p.parse().unwrap_or(0));
+    (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
+}
+
+/// Collect changelog entries for versions strictly after `prev`, up to and
+/// including `current`. Returns None if nothing applies.
+fn changelog_since(prev: &str, current: &str) -> Option<String> {
+    let prev_v = parse_ver(prev);
+    let cur_v = parse_ver(current);
+    let entries: Vec<_> = AGENT_CHANGELOG.iter()
+        .filter(|(v, _)| { let pv = parse_ver(v); pv > prev_v && pv <= cur_v })
+        .collect();
+    if entries.is_empty() { return None; }
+    let mut out = format!("Harness upgraded from {} to {}. Changes you should act on:\n\n", prev, current);
+    for (v, text) in entries {
+        out.push_str(&format!("## {}\n{}\n\n", v, text));
+    }
+    Some(out)
+}
 
 const ENV_HELP: &str = "\
 Environment variables:
@@ -185,14 +209,14 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
 
             // Version check: if the harness upgraded, attach the agent-facing
             // changelog so the agent learns new capabilities on its first turn.
+            // Per-version entries are range-selected so a 0.2→0.5 jump shows
+            // exactly the 0.3, 0.4, 0.5 entries — nothing missed, nothing extra.
             let current = env!("CARGO_PKG_VERSION");
             let prev = s.last_harness_version.take().unwrap_or_else(|| "unknown".into());
-            let changelog = if prev != current {
+            let changelog = changelog_since(&prev, current);
+            if changelog.is_some() {
                 println!("  Harness upgraded: {} → {} (changelog will be shown to agent)", prev, current);
-                Some(format!("Harness upgraded from {} to {}.\n\n{}", prev, current, AGENT_CHANGELOG))
-            } else {
-                None
-            };
+            }
             s.last_harness_version = Some(current.to_string());
 
             // Inject startup item so the agent gets a turn to reconnect any
@@ -390,4 +414,41 @@ fn prompt() {
     use std::io::Write;
     print!("\x1b[1;32m> \x1b[0m");
     std::io::stdout().flush().ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_ver() {
+        assert_eq!(parse_ver("0.2.1"), (0, 2, 1));
+        assert_eq!(parse_ver("1.10.0"), (1, 10, 0));
+        assert!(parse_ver("0.10.0") > parse_ver("0.2.0")); // numeric, not lexical
+        assert_eq!(parse_ver("unknown"), (0, 0, 0)); // unparseable → sorts first
+        assert_eq!(parse_ver(""), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_changelog_since() {
+        // Jump spanning both entries
+        let c = changelog_since("0.1.0", "0.2.1").unwrap();
+        assert!(c.contains("## 0.2.0"));
+        assert!(c.contains("## 0.2.1"));
+        assert!(c.contains("mark_sensitive"));
+        assert!(c.contains("watch mqtt"));
+
+        // Single-step upgrade
+        let c = changelog_since("0.2.0", "0.2.1").unwrap();
+        assert!(!c.contains("## 0.2.0"));
+        assert!(c.contains("## 0.2.1"));
+
+        // Same version → no changelog
+        assert!(changelog_since("0.2.1", "0.2.1").is_none());
+
+        // Unknown prev → shows everything (safe default for old DBs)
+        let c = changelog_since("unknown", "0.2.1").unwrap();
+        assert!(c.contains("## 0.2.0"));
+        assert!(c.contains("## 0.2.1"));
+    }
 }

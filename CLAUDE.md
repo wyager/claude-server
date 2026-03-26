@@ -182,11 +182,12 @@ JSON-escaped forms; skips values <8 chars). Agent's live context unchanged — o
 the ring buffer, and thus `feedback --with-api-trace` uploads, are scrubbed.
 
 **Agent-facing changelog**: `HarnessState.last_harness_version` compared against
-`CARGO_PKG_VERSION` on resume. Mismatch → `AgentStartup { changelog: Some(...) }`
-with the `AGENT_CHANGELOG` const from `main.rs`. Lets deployed agents self-discover
-new capabilities (e.g. `mark_sensitive`) without operator intervention. Entries are
-action-oriented ("mark credentials NOW"), pruned once deployments catch up. Bump
-the Cargo version when shipping agent-facing features.
+`CARGO_PKG_VERSION` on resume. `AGENT_CHANGELOG: &[(&str, &str)]` in `main.rs`
+keys entries by the version that introduced them; `changelog_since()` range-selects
+so a 0.2→0.5 jump shows exactly the 0.3/0.4/0.5 entries. Result goes into
+`AgentStartup { changelog: Some(...) }`. Lets deployed agents self-discover new
+capabilities without operator intervention. Entries are action-oriented; bump the
+Cargo version and add an entry when shipping agent-facing features.
 
 **UTF-8-safe truncation**: `renderer::trunc(s, max_bytes)` snaps back to the
 nearest `is_char_boundary` before slicing. Bare `&s[..n]` panics mid-codepoint —

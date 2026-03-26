@@ -432,13 +432,9 @@ impl ApiClient {
             .join("\n");
 
         bail!(
-            "No execute tool_use in response (stop_reason={}). Text: {}",
+            "No execute tool_use in response (stop_reason={}). Text: {}...",
             response.stop_reason,
-            if text.len() > 200 {
-                format!("{}...", &text[..200])
-            } else {
-                text
-            }
+            crate::renderer::trunc(&text, 200),
         );
     }
 }

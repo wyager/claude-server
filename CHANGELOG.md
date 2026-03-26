@@ -1,5 +1,42 @@
 # Changelog
 
+## 2026-03-26 (v0.2.1)
+
+### Per-version agent changelog
+- `AGENT_CHANGELOG` changed from flat `&str` to `&[(&str version, &str entry)]`.
+  `changelog_since(prev, current)` filters entries where `prev < v <= current`
+  using numeric tuple comparison (so `0.10.0 > 0.2.0` correctly). A 0.2→0.5
+  jump now shows exactly the 0.3/0.4/0.5 entries. Unparseable `prev` (e.g.
+  "unknown" from pre-tracking DBs) sorts as (0,0,0) → agent sees everything.
+  Tests: `test_parse_ver`, `test_changelog_since`.
+
+### `watch mqtt` payload modes (feedback #28 part 2)
+- `--payload=text` (default) — current behavior, inline as UTF-8
+- `--payload=raw` — write every payload to `--attach-dir/{random}/{topic-slug}.bin`,
+  send `{topic, attachments:[path], size}`
+- `--payload=structured` — parse `{"attachments":[{"name","base64"}],"data":{...}}`,
+  decode to `--attach-dir/{random}/{name}`, send `{topic, data, attachments:[paths]}`
+- Per-message random-named subdir prevents collisions across messages.
+  `--attach-retain=N` (default 50) deletes oldest subdirs when exceeded.
+  Publisher-supplied names sanitized (path separators, leading dots stripped)
+  so `name:"../../etc/passwd"` can't escape the per-message dir.
+- Camera pipeline no longer needs a Python MQTT receiver: publisher speaks
+  the structured schema, `watch mqtt --payload=structured` decodes, agent
+  `view()`s the paths.
+
+### OpenSSL removed (feedback #28)
+- `async-native-tls` (IMAP in email bridge + watcher) pulled in `native-tls`
+  → OpenSSL. Replaced with `feedback::rustls_connect()` using `tokio-rustls`
+  + `rustls-native-certs` for trust. async-imap's `runtime-tokio` feature
+  accepts tokio streams directly. Binary now has zero libssl linkage —
+  `cargo install` works on a fresh Linux box without `apt install libssl-dev`.
+
+### More UTF-8 truncation fixes (feedback #27)
+- `core_loop.rs::snip()` had the same byte-slice pattern — fixed to use
+  `trunc()` for the head and forward-snapping for the tail.
+- `api_client.rs:438` — error-message preview also used `&text[..200]`. Swept
+  the codebase for `&foo[..N]` on strings; these were the last two.
+
 ## 2026-03-26
 
 ### Agent-facing changelog on version upgrade

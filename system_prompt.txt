@@ -354,10 +354,16 @@ bursts don't swamp you and steady streams don't stall forever.
 shell_exec(cmd=harness_bin, args=["watch", "fs", "--path", "/camera/stills"],
            description="Camera snapshot watcher", alert_timer=timedelta(hours=24))
 
-# Subscribe to MQTT topics (Home Assistant, Zigbee2MQTT, etc.)
+# Subscribe to MQTT topics. --payload=text (default) inlines as UTF-8;
+# --payload=structured parses {"attachments":[{name,base64}],"data":{...}}
+# and writes decoded attachments to --attach-dir; --payload=raw writes
+# every payload to disk. For camera feeds, use structured so you get
+# view()-able file paths instead of garbage from binary-as-text.
 shell_exec(cmd=harness_bin, args=["watch", "mqtt", "--broker", "localhost:1883",
-           "--topic", "home/+/motion"],
-           description="MQTT motion events", alert_timer=timedelta(hours=24))
+           "--topic", "frigate/events", "--payload", "structured",
+           "--attach-dir", "/tmp/cam"],
+           description="MQTT camera events", alert_timer=timedelta(hours=24))
+# Then: view(*item.data["events"][0]["attachments"]) to see the images.
 ```
 
 Each batch arrives as one work item with `data = {"count": N, "events": [...]}`.

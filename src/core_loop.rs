@@ -132,8 +132,12 @@ fn quick_hash(s: &str) -> String {
 }
 
 fn snip(s: &str, n: usize) -> String {
+    use crate::renderer::trunc;
     if s.len() <= n * 2 { return s.replace('\n', "⏎") }
-    format!("{}…{}", &s[..n].replace('\n', "⏎"), &s[s.len()-n..].replace('\n', "⏎"))
+    // Tail slice needs the *start* index snapped forward to a char boundary.
+    let mut tail_start = s.len() - n;
+    while !s.is_char_boundary(tail_start) { tail_start += 1; }
+    format!("{}…{}", trunc(s, n).replace('\n', "⏎"), s[tail_start..].replace('\n', "⏎"))
 }
 
 pub fn write_turn_dump(

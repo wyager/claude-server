@@ -46,7 +46,7 @@ async fn idle_once(args: &ImapArgs, tx: &mpsc::UnboundedSender<serde_json::Value
     let tcp = TcpStream::connect((args.server.as_str(), args.port))
         .await
         .context("TCP connect")?;
-    let tls = async_native_tls::connect(&args.server, tcp)
+    let tls = crate::feedback::rustls_connect(&args.server, tcp)
         .await
         .context("TLS handshake")?;
     let client = async_imap::Client::new(tls);

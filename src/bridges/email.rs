@@ -110,7 +110,7 @@ async fn run_async(args: EmailArgs) -> Result<()> {
 async fn imap_loop(args: &EmailArgs, tx: &mpsc::UnboundedSender<Inbound>) -> Result<()> {
     let tcp = TcpStream::connect((args.imap_server.as_str(), args.imap_port)).await
         .context("IMAP TCP connect")?;
-    let tls = async_native_tls::connect(&args.imap_server, tcp).await
+    let tls = crate::feedback::rustls_connect(&args.imap_server, tcp).await
         .context("IMAP TLS")?;
     let client = async_imap::Client::new(tls);
     let mut session = client.login(&args.user, &args.password).await
