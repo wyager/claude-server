@@ -2,6 +2,15 @@
 
 ## 2026-03-26 (v0.2.1)
 
+### `docs recipe` subcommand (feedback #29)
+- `claude-server docs recipe [NAME]` — bundled deployment recipes embedded in
+  the binary. First recipe: `camera-monitor` (persistent Sonnet daemon owning
+  an MQTT watcher, Opus escalation only). Adapted from the debian agent's
+  feedback #29 writeup, updated for 0.2.1 (`watch mqtt --payload=structured`
+  instead of the Python receiver). Agents fetch on-demand via
+  `shell_exec(cmd=harness_bin, args=["docs", "recipe", NAME])` — keeps the
+  system prompt lean while making detailed patterns discoverable.
+
 ### Per-version agent changelog
 - `AGENT_CHANGELOG` changed from flat `&str` to `&[(&str version, &str entry)]`.
   `changelog_since(prev, current)` filters entries where `prev < v <= current`

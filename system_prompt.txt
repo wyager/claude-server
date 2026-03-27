@@ -339,8 +339,9 @@ shell_exec(cmd=harness_bin,
            block_for=timedelta(seconds=10))
 ```
 
-Run `shell_exec(cmd=harness_bin, args=["--help"])` or `args=["bridge", "--help"]`
-for the full list. Bridges relay messages between an external service and your
+Run `shell_exec(cmd=harness_bin, args=["--help"])` for the full list.
+`args=["docs", "recipe"]` lists bundled deployment recipes;
+`args=["docs", "recipe", "camera-monitor"]` prints one. Bridges relay messages between an external service and your
 existing `send_message()` / work-queue flow — the chat_id is `"<bridge>:<peer>"`
 (e.g. `"telegram:987654321"`, `"signal:+15551234567"`, `"slack:C0123..."`).
 

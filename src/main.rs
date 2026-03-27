@@ -11,6 +11,7 @@ mod http_server;
 mod process;
 mod python;
 mod renderer;
+mod docs;
 mod source_dump;
 mod types;
 mod watchers;
@@ -133,6 +134,9 @@ enum Command {
     },
     /// Authenticated public webhook ingress (GitHub, Slack, generic)
     WebhookProxy(webhook_proxy::WebhookArgs),
+    /// Print bundled deployment recipes
+    #[command(trailing_var_arg = true)]
+    Docs { args: Vec<String> },
 }
 
 fn main() {
@@ -146,6 +150,7 @@ fn main() {
         Some(Command::FeedbackServer(a)) => feedback::run_server(a),
         Some(Command::Watch { watch }) => watchers::run(watch),
         Some(Command::WebhookProxy(a)) => webhook_proxy::run(a),
+        Some(Command::Docs { args }) => docs::run(&args),
         None => {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             let result = rt.block_on(run_daemon(cli.dump_turns, cli.dump_dir, !cli.daemon));
