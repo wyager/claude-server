@@ -13,6 +13,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use rustpython::InterpreterBuilderExt;
 use rustpython_vm as vm;
 use vm::builtins::PyStrRef;
 use vm::{pymodule, PyPayload, PyResult, VirtualMachine};
@@ -29,12 +30,11 @@ struct Collector {
 fn main() {
     let collector = Arc::new(Mutex::new(Collector::default()));
 
-    // Using rustpython-vm directly (not the full rustpython crate) to dodge
-    // the libsqlite3-sys links conflict with rusqlite. This means no stdlib
-    // — see verdict for implications.
-    let interp = vm::Interpreter::with_init(Default::default(), |vm| {
-        vm.add_native_module("_harness".to_owned(), Box::new(harness::make_module));
-    });
+    // Full rustpython crate from git HEAD — sqlite is optional on main so
+    // no libsqlite3-sys conflict. Gets us stdlib (json, io, os).
+    let builder = rustpython::Interpreter::builder(Default::default());
+    let def = harness::module_def(&builder.ctx);
+    let interp = builder.init_stdlib().add_native_module(def).build();
 
     interp.enter(|vm| {
         // Inject the collector so harness functions can reach it. Same pattern
@@ -53,19 +53,29 @@ memory = _harness.Memory()
 "#;
         run(vm, &scope, preamble, "<preamble>").expect("preamble");
 
-        // The actual agent script. No `import json` here — stdlib is
-        // stripped in this spike due to the sqlite conflict. The core
-        // language features (f-strings, comprehensions, dicts) are
-        // builtins and still work.
+        // Agent script exercising stdlib: json, file I/O, os.path.
+        // These are what claude-server's agent actually uses.
         let script = r#"
-memory.set("user_prefs", '{"theme": "dark", "lang": "en"}')
-send_message("signal:+1555", "Hello from RustPython!")
+import json, os, tempfile
+
+prefs = {"theme": "dark", "lang": "en"}
+memory.set("user_prefs", json.dumps(prefs))
+assert json.loads(memory.get("user_prefs"))["theme"] == "dark"
+
+tmp = os.path.join(tempfile.gettempdir(), "rustpython_spike_test.txt")
+with open(tmp, "w") as f:
+    f.write("hello from rustpython stdlib")
+with open(tmp) as f:
+    content = f.read()
+assert content == "hello from rustpython stdlib"
+os.remove(tmp)
+
+send_message("signal:+1555", f"stdlib works: {content[:10]}...")
 pid = shell_exec("echo hi")
 
 xs = [x*x for x in range(5)]
-print(f"squares: {xs}")
-print(f"pid: {pid}")
-print(f"memory has user_prefs: {'user_prefs' in memory}")
+print(f"squares: {xs}, pid: {pid}")
+print("json, open(), os.path all work")
 "#;
 
         match run(vm, &scope, script, "<agent>") {
@@ -149,7 +159,7 @@ mod harness {
 
         #[pymethod]
         fn set(&self, key: String, value: PyStrRef) -> PyResult<()> {
-            let v = value.as_str().to_string();
+            let v = value.to_string();
             self.local.lock().unwrap().insert(key.clone(), v.clone());
             let parsed: serde_json::Value = serde_json::from_str(&v)
                 .unwrap_or(serde_json::Value::String(v));
@@ -157,39 +167,51 @@ mod harness {
             Ok(())
         }
 
-        #[pymethod(name = "__contains__")]
+        #[pymethod]
+        fn get(&self, key: String) -> Option<String> {
+            self.local.lock().unwrap().get(&key).cloned()
+        }
+
+        // __contains__ needs `impl AsSequence` on HEAD — skipped for the
+        // spike. The real port will implement it; not needed to prove stdlib.
+        #[pymethod]
         fn contains(&self, key: String) -> bool {
             self.local.lock().unwrap().contains_key(&key)
         }
     }
 }
 
-// --- Verdict (2026-03-26, spike run) ---
+// --- Verdict (2026-03-26, git HEAD with stdlib) ---
 //
 // WORKS:
-//   ✓ Interpreter init, fresh scope per run
-//   ✓ #[pyfunction] host functions (send_message, shell_exec)
-//   ✓ #[pyclass] with #[pymethod] (memory.set)
+//   ✓ Full stdlib: json.dumps/loads, open()/read()/write(), os.path,
+//     tempfile, os.remove — all verified via asserts + roundtrip
+//   ✓ Interpreter init, fresh scope per run, #[pyfunction], #[pyclass]
 //   ✓ Side-effect collection via thread-local Arc<Mutex>
-//   ✓ Error formatting with traceback (vm.write_exception)
-//   ✓ Core language: f-strings, comprehensions, dicts, range
-//   ✓ ZERO libpython linkage — only CoreFoundation/libiconv/libSystem
-//   ✓ Release binary: 14M (vs claude-server 17M — roughly a wash)
+//   ✓ ZERO libpython linkage
 //
-// NEEDS WORK (all solvable):
-//   - __contains__ via #[pymethod] not recognized — needs Contains slot/trait
-//   - stdlib: using rustpython-vm directly (no stdlib) because
-//     rustpython-stdlib pulls libsqlite3-sys 0.28, conflicts with our
-//     rusqlite's 0.30. Options: (a) downgrade rusqlite, (b) patch
-//     rustpython-stdlib to disable sqlite module, (c) bump rusqlite when
-//     rustpython updates. For the agent's actual usage (json, open, os.path),
-//     we NEED stdlib — this must be resolved before a real port.
-//   - stdout capture: not attempted. RustPython has sys.stdout reassignment
-//     like CPython; same approach as PyO3 should work.
-//   - Timeout/interrupt: RustPython has vm.set_interrupt() — analog of
-//     PyErr_SetInterrupt. Untested here.
+// DEPS PICKED UP (from stdlib, need feature-flagging off):
+//   - liblzma (Python's `lzma` module — agent doesn't use)
+//   - libffi (Python's `ctypes` module — agent doesn't use)
+//   Both are stdlib modules we can likely disable via rustpython features.
 //
-// MIGRATION ESTIMATE: python.rs is ~1400 LOC. #[pyclass]/#[pymethod]/
-// #[pyfunction] map nearly 1:1. Main work is (1) the stdlib/sqlite conflict,
-// (2) re-testing every host method, (3) verifying timeout/interrupt works.
-// Maybe 2-3 days once stdlib is unblocked.
+// BUILD NOTES:
+//   - Git HEAD requires rustc ≥1.93
+//   - Must `cargo update` after adding git dep (cascading lock conflicts)
+//   - Both `rustpython` AND `rustpython-vm` must be direct deps from the
+//     same git rev — proc macros expand to `::rustpython_vm::...` paths
+//   - sqlite is optional on main (`default = ["compiler", "host_env"]`),
+//     no conflict with rusqlite
+//   - Release binary: 41M with freeze-stdlib (vs 14M vm-only, 17M PyO3).
+//     The +27M is the frozen Python stdlib bytecode. Fully self-contained.
+//
+// REMAINING WORK FOR REAL PORT:
+//   - __contains__/__getitem__/etc: need `impl AsSequence`/`AsMapping`
+//     traits on HEAD, not #[pymethod]. Mechanical but touches every
+//     dunder method in python.rs.
+//   - stdout capture: not tested, same approach as PyO3 should work
+//   - Timeout/interrupt: vm.set_interrupt() exists, untested
+//   - Disable lzma/ctypes/ssl stdlib modules to drop liblzma/libffi
+//
+// MIGRATION ESTIMATE: unchanged — a focused session or two once the
+// dunder-method trait impls are sorted.
