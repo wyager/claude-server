@@ -1,205 +1,119 @@
 # Python Interpreter Integration
 
-How Claude Server embeds and runs Python via PyO3.
+How Claude Server embeds and runs Python via RustPython.
+
+## Why RustPython
+
+Prior to 0.3.0 we used PyO3 + CPython. That meant the binary linked against
+`libpythonX.Y.so` — build on Python 3.12, deploy to a box with 3.11, get
+"cannot open shared object file." RustPython is a pure-Rust Python 3
+implementation: the stdlib is frozen into the binary, zero libpython linkage,
+`cargo build` produces a self-contained executable.
+
+Tradeoffs: ~2-4× slower than CPython (irrelevant — scripts run microseconds),
+no C-extension modules (no numpy/requests; agent uses shell_exec for HTTP
+anyway), `import sqlite3` unavailable (we use rusqlite directly in Rust).
 
 ## Lifecycle
 
-**Startup**: `pyo3::prepare_freethreaded_python()` is called once in `main.rs`.
-This initializes the CPython interpreter process-wide. All subsequent
-`Python::with_gil()` calls share this single interpreter.
+**Startup**: `AgentLoop::new()` constructs an `Executor` which builds one
+`vm::Interpreter` with stdlib frozen in. No global singletons — the interpreter
+is a struct field, drops cleanly during normal shutdown.
 
-**Per turn**: Each turn creates a fresh `PyDict` for globals and locals.
-No state leaks between turns — the agent gets a clean namespace every time.
-(Module-level imports cached in `sys.modules` persist, but this is harmless.)
-
-**No sub-interpreters**: PyO3 does not support Python sub-interpreters.
-The fresh-namespace approach is the practical substitute.
+**Per turn**: `executor.execute()` enters the VM, creates a fresh scope,
+constructs new pyclass instances carrying this turn's data (memory snapshot,
+work items, collector), injects them into the scope, runs the script. No state
+leaks between turns.
 
 ## Execution Flow
 
 ```
 1. Clone IdGenerator from HarnessState into a SideEffectCollector
-2. Create Arc<Mutex<SideEffectCollector>> shared across all #[pyclass] objects
-3. Create fresh PyDict globals/locals
-4. Redirect sys.stdout and sys.stderr to a StdoutCapture object
-5. Inject objects into locals: work_queue, memory, timers, history, _harness
-6. Run preamble (creates convenience functions like send_message, shell_exec)
-7. If compaction mode: inject compaction_script variable and compact() function
-8. Run the agent's code via py.run()
-9. If compaction mode: read back compaction_script from locals
-10. Extract SideEffectCollector, return ExecutionResult
+2. Wrap collector in Arc<Mutex<>>
+3. interpreter.enter(|vm| { ... })
+4. vm.import("_harness", 0) — REQUIRED before into_ref() or type cells panic
+5. Construct PyMemory/PyWorkQueue/PyTimers/PyHistory/PyHarness with this
+   turn's data as fields. Each gets a collector.clone().
+6. Inject instances into scope as _memory, _work_queue, etc.
+7. Run PREAMBLE — wraps instances with Python classes providing __getitem__/
+   __setitem__/etc. dunders, aliases _harness methods as bare names
+   (send_message = _harness.send_message)
+8. If compaction mode: inject compaction_script variable
+9. Run the agent's code
+10. Extract collector, return ExecutionResult
 ```
 
-Step 8 is bounded by a configurable timeout (`CLAUDE_SERVER_PYTHON_TIMEOUT`,
-default 5 seconds). If the script blocks beyond this limit, `PyErr_SetInterrupt`
-is called to raise a `KeyboardInterrupt` in the Python thread. The timeout
-prevents a misbehaving script (e.g., `time.sleep(60)` or an infinite loop)
-from blocking the entire core loop.
+## SideEffectCollector
 
-On error at step 8 (including timeout interrupts), the Python traceback is
-formatted and returned. The `SideEffectCollector` is replaced with an empty
-default — all side effects are discarded. This makes execution transactional:
-either everything succeeds and all mutations apply, or nothing changes.
+Same pattern as before. All mutations (memory writes, timer creates, message
+sends, process spawns) accumulate in the collector during execution. If the
+script crashes, nothing applies. On success, `agent_loop::apply_side_effects()`
+applies them atomically.
 
-## Namespace
+Each pyclass instance holds `collector: Arc<Mutex<SideEffectCollector>>` as a
+field. Methods call `self.collector.lock().unwrap().field.push(...)`.
 
-The agent's Python code sees these objects:
+## Dunder Dispatch
 
-| Object | Type | Source |
-|--------|------|--------|
-| `work_queue` | `PyWorkQueue` | Snapshot of `state.work_queue` |
-| `memory` | `PyMemory` | Clone of `state.memory` + pinned snapshot (two-tier store) |
-| `timers` | `PyTimerManager` | Timer metadata from `state.timer_manager` |
-| `history` | `PyHistoryManager` | History entries from `state.event_history` |
-| `send_message(chat_id, content)` | function | From `_harness.send_message` |
-| `shell_exec(cmd, args, ...)` | function | From `_harness.shell_exec` |
-| `shell_status(pid)` | function | From `_harness.shell_status` |
-| `shell_output(pid)` | function | From `_harness.shell_output` |
-| `shell_kill(pid)` | function | From `_harness.shell_kill` |
-| `attach(path)` | function | Queue a file for next turn's context (image → vision) |
-| `fork([ChildSettings(...)])` | function | Spawn child agents |
-| `message_agent(name, content)` | function | Inter-agent messaging |
-| `done(**result)` | function | Exit, passing `result` dict to parent |
-| `agent_name`, `agent_lineage` | str | Identity strings |
-| `ChildSettings` | dataclass | `name`, `task`, `model`, `max_turns`, `can_compact`, `attach` |
-| `timedelta`, `datetime` | classes | From Python's `datetime` module |
+RustPython's `#[pymethod]` doesn't auto-wire `__getitem__` into the `obj[k]`
+operator — you'd need `impl AsMapping` trait boilerplate. Instead we expose
+plain-named methods from Rust (`_getitem`, `_setitem`, `_contains`) and the
+PREAMBLE wraps them with thin Python classes:
 
-In compaction mode, `compact()` and `compaction_script` are also available.
-
-### Memory: two tiers
-
-**Local tier** — per-agent, in `state.memory` + `state.memory_priorities`:
-
-- `memory[k] = v` / `memory.set(k, v, priority=N)` — any JSON type
-- `memory.set_priority(k, N)`, `memory.get_priority(k)`
-- Higher priority → rendered first in `<agent_state>`, survives truncation
-
-**Pinned tier** — shared across all agents, stored in SQLite (`pinned_memory` table),
-injected into the system prompt (cached via `cache_control: ephemeral`):
-
-- `memory.pin(k, v)` — `v` must be a string
-- `memory.unpin(k)`, `memory.list_pinned()`
-- `memory.get(k)` checks local first, then falls back to pinned
-- `k in memory` is true if in either tier
-
-Pins/unpins flow through `SideEffectCollector.memory_pins`/`memory_unpins` and
-`agent_loop.rs` writes them to SQLite via `db.save_pin()`/`db.delete_pin()`.
-
-### WorkItem field access
-
-`PyWorkItem` has fixed fields `id`, `priority`, `time`, `type`, plus a
-`fields: serde_json::Map` populated from the `WorkItemType` variant. `__getattr__`
-looks up in `fields` — field names match the Rust struct field names exactly.
-Wrong-field access raises `AttributeError` listing available fields. See
-`work_item_to_py()` in `python.rs` for the single source of truth.
-
-The convenience functions (`send_message`, `shell_exec`, etc.) are created
-by the preamble, which assigns `_harness.method_name` to top-level names.
-
-## Side Effect Collection
-
-Every `#[pyclass]` object holds an `Arc<Mutex<SideEffectCollector>>`. When the
-agent calls a mutating method (e.g., `work_queue.pop_front()`, `memory["x"] = "y"`,
-`timers.add(...)`, `send_message(...)`), the method records the operation in
-the shared collector rather than modifying harness state directly.
-
-```
-Agent calls memory["key"] = "value"
-  → PyMemory.__setitem__ records ("key", "value") in collector.memory_sets
-  → Also updates the local dict so subsequent reads see the new value
-
-Agent calls timers.add(every=30, ...)
-  → PyTimerManager.add calls collector.id_gen.next() to get a new ID
-  → Records a TimerAddRequest in collector.timer_adds
-  → Returns the ID string to the agent synchronously
+```python
+class _MemoryWrap:
+    def __getitem__(self, k): return self._m._getitem(k)
+    def __setitem__(self, k, v): self._m._setitem(k, v)
+    # ...
+memory = _MemoryWrap(_memory)
 ```
 
-After execution, `core_loop::apply_side_effects()` processes the collector:
-memory sets/deletes, queue removes, timer adds/cancels, filter changes,
-history modifications, process starts/kills, outbound messages, and compaction.
+Agent-visible behavior identical to standard Python. ~20 lines of PREAMBLE
+instead of ~100 lines of trait impls.
 
-## ID Assignment
+## Timeout
 
-The `IdGenerator` is cloned from `HarnessState` into the `SideEffectCollector`
-before execution. When the agent calls `timers.add()` or `shell_exec()`,
-the `#[pyclass]` method calls `id_gen.next()` on the collector's generator
-and returns the hex ID string synchronously. After execution, the updated
-`IdGenerator` (with its advanced counter) is moved back into `HarnessState`.
+`Executor` holds a `vm::signal::UserSignalSender` wired via `.init_hook()`.
+`execute_with_timeout()` spawns a watchdog thread that races
+`mpsc::recv_timeout(timeout)` against a cancel channel. On timeout, sends a
+closure that raises `KeyboardInterrupt`; the VM picks it up at the next
+bytecode boundary. Normal completion drops the cancel sender → watchdog exits
+immediately. No polling.
 
-This means IDs for agent-created objects are assigned during Python execution,
-not deferred. History entry IDs, however, are generated AFTER
-`apply_side_effects()` returns the updated `IdGenerator`. This prevents
-collisions between history entry IDs and IDs assigned to timers, processes,
-or child agents during the same turn.
+## stdout/stderr Capture
 
-## Stdout Capture
+A `StdoutCapture` pyclass with a `write()` method accumulates into a
+`Mutex<String>`. PREAMBLE does `sys.stdout = sys.stderr = _cap`. The captured
+output lands in `ExecutionResult.output`.
 
-`sys.stdout` and `sys.stderr` are both replaced with a `StdoutCapture` object
-that has `write(text)` and `flush()` methods. `write()` appends to a shared
-`Arc<Mutex<String>>` buffer. After execution, the buffer contents become the
-history entry's `output` field.
+## RustPython API Quirks (for future maintenance)
 
-Both stdout and stderr go to the same buffer — there is no separation at
-the Python level. (Process-level stderr from `shell_exec` is captured
-separately by the process supervisor.)
+- **`into_ref()` needs prior import**: Must `vm.import("_harness", 0)` before
+  any `PyPayload::into_ref()` or it panics "static type has not been
+  initialized". The module import populates the type cells.
+- **`#[pymethod]` kwargs**: Unlike `#[pyfunction]`, method parameter names
+  aren't exposed for kwarg binding. `message_agent(priority=9)` fails when
+  called directly on the Rust method. PREAMBLE provides Python `def` wrappers
+  that accept kwargs and forward positionally.
+- **OSError subtypes**: `FileNotFoundError` etc. can't be constructed via
+  `vm.new_exception_msg()`. Use `vm.new_os_subtype_error()` → downcast via
+  `PyObjectRef` to get `PyBaseExceptionRef`.
+- **`Vec<String>` return**: No blanket `IntoPyNativeFn` impl. Manually build
+  `vm.ctx.new_list(items.map(|s| vm.new_pyobj(s)).collect()).into()`.
 
-## Type Coercion
+## Build Requirements
 
-The `extract_seconds()` helper (used by `timers.add(every=...)` and
-`shell_exec(alert_timer=...)`) accepts both:
+- rustc ≥ 1.93 (RustPython git HEAD's MSRV)
+- `.cargo/config.toml` sets `RUST_MIN_STACK=16M` — freeze-stdlib's importlib
+  bootstrap recurses deeply; default 2MB stack SIGILLs during tests
+- Both `rustpython` and `rustpython-vm` as direct git deps (proc macros expand
+  to `::rustpython_vm::...` paths)
+- Pinned to rev `3f92c3a` — sqlite is optional on this rev (was unconditional
+  in 0.4.0 release, conflicted with rusqlite's libsqlite3-sys)
 
-- **Numbers**: `30`, `300.0` — interpreted as seconds
-- **timedelta objects**: `timedelta(seconds=30)`, `timedelta(minutes=5)` —
-  `.total_seconds()` is called to get the numeric value
+## Runtime Dependencies
 
-The `at=` parameter in `timers.add()` similarly accepts both:
-
-- **datetime objects**: `datetime(2026, 2, 1, 17, 0, 0)` — `.timestamp()`
-  is called to get epoch seconds
-- **Numbers**: treated as epoch seconds directly
-
-## Error Handling
-
-If `py.run()` raises a Python exception:
-
-1. The traceback is formatted via `e.traceback(py).format()`
-2. The exception string is appended: `format!("{}{}", traceback, e)`
-3. An `ExecutionResult` is returned with `is_error: true` and
-   `side_effects: SideEffectCollector::default()` (empty — no mutations applied)
-4. The core loop records the error in event history but skips `apply_side_effects()`
-
-The agent sees the error in its history on the next turn and can fix its code.
-
-## Compaction Mode
-
-When compaction is active, two extra items are injected:
-
-- `compaction_script = ""` — a mutable string the agent builds up with `+=`
-- `compact()` — sets a flag in the collector
-
-After execution, the value of `compaction_script` is read back from the
-Python locals dict and stored in the collector. The core loop then uses this
-script to manipulate history entries (removing old ones, adding summaries).
-
-## Process Completion Guarantees
-
-When a process spawned by `shell_exec()` finishes, the harness guarantees that
-all stdout/stderr is flushed to the DB before the `ProcessCompleted` event is
-sent. This is achieved by having the completion monitor task await the output
-reader task's `JoinHandle` after `child.wait()` returns.
-
-The `block_for` parameter on `shell_exec()` uses a `tokio::sync::oneshot` channel:
-the completion monitor signals the oneshot after the process exits and output is
-flushed. `apply_side_effects` awaits this oneshot with `tokio::time::timeout`,
-returning as soon as the process finishes or the timeout elapses — whichever
-comes first. The completion event then flows through the normal channel and is
-picked up by `drain_events()` on the next loop iteration.
-
-## Build Configuration
-
-The `build.rs` script queries `python3 -c "import sysconfig; ..."` to discover
-the Python library directory and bakes the rpath into the binary via
-`cargo:rustc-link-arg=-Wl,-rpath,<libdir>`. This means the binary finds
-`libpython` at runtime without needing `DYLD_LIBRARY_PATH` or `LD_LIBRARY_PATH`.
-
-To target a specific Python installation: `PYO3_PYTHON=/path/to/python3 cargo build`
+`otool -L` shows: libSystem, CoreFoundation, CoreServices, Security, libiconv,
+libffi. All ship with macOS/Linux base. **No libpython. No liblzma** (liblzma-sys
+forced to static bundled build). libffi is an unconditional RustPython vm-crate
+dep at this rev — upstream PR needed to feature-gate it.

@@ -1,5 +1,33 @@
 # Changelog
 
+## 2026-03-27 (v0.3.0)
+
+### PyO3 → RustPython
+- Python interpreter swapped from CPython (via PyO3) to RustPython (git HEAD
+  `3f92c3a`). **Zero libpython linkage** — binary is self-contained, deploy to
+  any Linux/macOS box without matching the build machine's Python version.
+- **Architecture**: `Executor` struct owns the `vm::Interpreter` as a field.
+  No globals, no thread-locals, no leak semantics. Each pyclass instance
+  carries its data as `Mutex<T>` fields; methods access `self.field`.
+  Standalone functions (`send_message`, `shell_exec`, `fork`) became
+  `PyHarness` methods. Instances constructed per-turn via
+  `PyPayload::into_ref()` and injected into scope.
+- **Dunders via PREAMBLE wrappers**: RustPython's `#[pymethod]` doesn't
+  auto-wire `__getitem__` → `obj[k]`. Exposed as plain methods (`_getitem`),
+  wrapped by thin Python classes in PREAMBLE. Agent-visible API unchanged.
+- **Timeout wired**: `execute_with_timeout()` uses `user_signal_channel()` +
+  watchdog thread racing `mpsc::recv_timeout` against a cancel channel.
+  Raises `KeyboardInterrupt` at bytecode boundaries. No polling.
+- **Callers**: `AgentLoop` gained `executor: python::Executor` field.
+  `compaction::estimate_post_compaction` takes `&Executor`.
+  `main.rs` dropped `initialize_python()`.
+- **Deps**: pyo3 removed. `liblzma-sys` forced static (drops homebrew dylib).
+  `libffi` remains (unconditional RustPython vm dep at this rev; ships with
+  OS). `.cargo/config.toml` sets `RUST_MIN_STACK=16M` for freeze-stdlib
+  bootstrap. rustc ≥1.93 required.
+- **Tests**: 49/49 pass (all ported from PyO3 test module + new coverage).
+- See `INTERPRETER.md` for full details and RustPython API quirks.
+
 ## 2026-03-26 (v0.2.1)
 
 ### `docs recipe` subcommand (feedback #29)

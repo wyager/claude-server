@@ -26,8 +26,10 @@ Tests require single-threaded execution due to Python GIL contention:
 cargo test -- --test-threads=1
 ```
 
-The `build.rs` bakes the Python dylib rpath into the binary, so no `DYLD_LIBRARY_PATH` is needed.
-To target a specific Python: `PYO3_PYTHON=/path/to/python3 cargo build`.
+Python is embedded via RustPython (pure Rust, no libpython). The stdlib is
+frozen into the binary — `cargo build` produces a self-contained executable.
+rustc ≥1.93 required. `.cargo/config.toml` bumps `RUST_MIN_STACK` to 16M for
+the freeze-stdlib importlib bootstrap (default 2M overflows during tests).
 
 ## Architecture
 
@@ -35,7 +37,7 @@ The system is a Rust daemon that drives Claude through a work-queue loop. Each t
 1. Render state (history + work queue + metadata) into text
 2. Call Claude API with that text as a single user message
 3. Claude responds with Python code via a `tool_use` block
-4. Execute the Python in a fresh namespace (PyO3, not a subprocess)
+4. Execute the Python in a fresh scope (RustPython, embedded, not a subprocess)
 5. Collect side effects atomically, apply to state, persist to SQLite
 
 External events (user messages, process completions) arrive via tokio mpsc
@@ -54,7 +56,7 @@ See `INTERPRETER.md` for details on the Python integration.
 | `config.rs` | Config from env vars (`ANTHROPIC_API_KEY`, model, ports, paths) |
 | `types.rs` | Core types: WorkQueue, EventHistory, TimerManager, ProcessManager, Memory, HarnessState, API request/response types |
 | `core_loop.rs` | Thin wrapper: creates an `AgentLoop` with parent permissions and runs it |
-| `python.rs` | PyO3 executor: #[pyclass] wrappers for work_queue, memory, timers, history, harness functions. SideEffectCollector pattern. |
+| `python.rs` | RustPython executor: `Executor` struct, pyclass wrappers for work_queue/memory/timers/history, PyHarness methods. SideEffectCollector pattern. |
 | `renderer.rs` | Serialize HarnessState into XML-formatted context text for the API call |
 | `api_client.rs` | Claude Messages API client (reqwest, retry logic, tool_use extraction) |
 | `db.rs` | SQLite persistence (state as JSON blob, process output, outbound messages) |
@@ -70,8 +72,8 @@ See `INTERPRETER.md` for details on the Python integration.
 | `watchers/` | `watch` subcommand: one-directional event sources (fs, mqtt, imap). Shared `post_event` helper in mod.rs. |
 | `webhook_proxy.rs` | `webhook-proxy` subcommand: HMAC-validated public ingress (GitHub, Slack, generic bearer) that forwards to `/event`. |
 | `system_prompt.txt` | System prompt sent to Claude on every API call |
-| `build.rs` | Discovers Python LIBDIR at build time, bakes rpath into binary |
-| `INTERPRETER.md` | How the Python interpreter integration works (PyO3, side effects, etc.) |
+| `build.rs` | Embeds source tarball via `git archive HEAD` |
+| `INTERPRETER.md` | How the RustPython integration works (Executor, side effects, dunder dispatch, quirks) |
 
 ## Key Design Patterns
 
@@ -96,9 +98,11 @@ After execution, the updated generator is moved back into HarnessState.
 one user message containing the full rendered context. No multi-turn replay.
 The system prompt is cached via `cache_control: { type: "ephemeral" }`.
 
-**Fresh Python namespace per turn**: PyO3 initializes the interpreter once at
-startup. Each turn creates a fresh `PyDict` as globals/locals — no state leaks
-between turns. Module imports (`sys.modules`) persist but are harmless.
+**Fresh Python scope per turn**: `Executor::new()` builds the RustPython
+interpreter once (struct field on `AgentLoop`). Each turn constructs fresh
+pyclass instances carrying that turn's data (memory snapshot, work items,
+collector) via `into_ref()`, injected into a new scope. No state leaks
+between turns. No globals, no thread-locals.
 
 **Process output guarantees**: The completion monitor awaits the output reader's
 JoinHandle before sending events, so output is always fully flushed when the

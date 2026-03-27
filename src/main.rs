@@ -53,6 +53,14 @@ const AGENT_CHANGELOG: &[(&str, &str)] = &[
 - `watch mqtt --payload=structured` — parse {attachments:[{name,base64}],data:{}}
   from MQTT, decode to --attach-dir, send file paths. No more Python receiver
   needed for camera pipelines. Also --payload=raw for unparsed binary."),
+    ("0.3.0", "\
+- Python interpreter swapped from CPython (PyO3) to RustPython. Your scripts
+  should behave identically — same stdlib (json, os, open, tempfile), same
+  dict/list syntax, same f-strings. If you hit ANY script-execution oddity
+  (ImportError, syntax that worked before, weird type errors), file feedback
+  with the exact script. This is the first field deployment of the new
+  interpreter. Known difference: `import sqlite3` is unavailable (you never
+  used it, but noting for completeness)."),
 ];
 
 /// Parse "X.Y.Z" into a comparable tuple. Unparseable → (0,0,0) so it sorts
