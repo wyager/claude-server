@@ -103,6 +103,8 @@ pub struct AgentLoop {
     /// Explicit return values from done(**kwargs). Populated on the turn that
     /// calls done(); read by run_child_agent_loop after run() returns.
     done_result: HashMap<String, serde_json::Value>,
+    /// Python executor. Owns the RustPython interpreter; one per agent loop.
+    executor: python::Executor,
 }
 
 impl AgentLoop {
@@ -157,6 +159,7 @@ impl AgentLoop {
             killed: false,
             shutdown,
             done_result: HashMap::new(),
+            executor: python::Executor::new(),
         }
     }
 
@@ -309,6 +312,7 @@ impl AgentLoop {
                 .compaction
                 .compaction_state(self.state.last_input_tokens);
             cs.estimated_post_compaction = self.compaction.estimate_post_compaction(
+                &self.executor,
                 &self.state,
                 &self.deployment_context,
                 &self.config.render_config,
@@ -433,7 +437,7 @@ impl AgentLoop {
 
         // Execute Python
         let lineage_str = format_lineage(&self.permissions.lineage);
-        let exec_result = python::execute_with_timeout(
+        let exec_result = self.executor.execute_with_timeout(
             &self.state,
             &api_result.code,
             self.compaction.active,
@@ -1283,7 +1287,7 @@ impl AgentLoop {
         }
         if effects.compact_called && self.compaction.active {
             dimlog!("[{}] Compaction executed", self.name);
-            let compact_result = python::execute_with_timeout(
+            let compact_result = self.executor.execute_with_timeout(
                 &self.state,
                 &self.compaction.script,
                 true,

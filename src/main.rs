@@ -180,10 +180,6 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
         println!("  Dump dir: {:?}", dir);
     }
 
-    // Initialize Python
-    python::initialize_python();
-    println!("  Python initialized");
-
     // Open database
     let database = Arc::new(db::Database::open(&config.db_path)?);
     println!("  Database opened");

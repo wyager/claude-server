@@ -3,35 +3,42 @@
 //! Zero libpython linkage — stdlib is frozen into the binary via the
 //! `freeze-stdlib` feature. Replaces the previous PyO3 implementation.
 //!
-//! Key design notes:
+//! Architecture:
 //!
-//! - RustPython's #[pymodule] is static: classes/functions are registered at
-//!   module-def time, not instantiated per-turn. Per-turn state (work items,
-//!   memory snapshot, collector) lives in a thread-local `ExecContext` that
-//!   the #[pyclass] methods read from.
+//! - `Executor` owns the `vm::Interpreter` directly (wrapped in `ManuallyDrop`
+//!   to avoid RustPython's Drop-panic on the PyObjectRef graph at teardown).
+//!   No global singleton, no thread-locals.
 //!
-//! - Dunder methods (__getitem__, __contains__, etc.) need AsMapping/AsSequence
-//!   trait impls on RustPython HEAD — these require static fn tables with
-//!   downcasts. To sidestep that, Rust classes expose plain-named methods
-//!   (_getitem, _len, ...) and the Python PREAMBLE wraps them with thin
-//!   Python classes that provide the dunders. Behavior is identical from
-//!   the agent's perspective.
+//! - Each `#[pyclass]` carries its per-turn state as `Mutex<T>` fields. At
+//!   the top of `execute()` the pyclass instances are built with the turn's
+//!   data and injected into the Python scope as `_memory`, `_work_queue`, etc.
+//!   The PREAMBLE wraps them with thin Python classes that provide dunders.
 //!
-//! - Interpreter is built once via OnceLock. Each turn gets a fresh scope
-//!   (same as the old fresh-PyDict-per-turn pattern).
+//! - All top-level "functions" are `#[pymethod]`s on `PyHarness`. Since
+//!   RustPython's `#[pymethod]` macro doesn't expose parameter names for
+//!   kwargs dispatch (unlike `#[pyfunction]`), the PREAMBLE wraps each
+//!   method with a named-parameter Python `def`.
+//!
+//! - Timeout uses RustPython's `vm::signal::user_signal_channel()`. The
+//!   receiver is wired into the VM via `.init_hook()`; the sender is stored
+//!   in `Executor.signal_tx`. A watchdog thread races a cancel channel against
+//!   the timeout; on timeout it sends a closure that raises KeyboardInterrupt.
+//!
+//! - libffi cannot be dropped: rustpython-stdlib at rev 3f92c3a has an
+//!   unconditional `libffi` dep. Dropping it would require forking RustPython.
 
 #![allow(dead_code)]
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::mem::ManuallyDrop;
+use std::sync::{mpsc, Arc, Mutex};
 
 use rustpython::InterpreterBuilderExt;
 use rustpython_vm as vm;
-use vm::builtins::{PyDict, PyList, PyStrRef};
-use vm::function::{FuncArgs, KwArgs, OptionalArg, PosArgs};
+use vm::builtins::{PyBaseExceptionRef, PyDict, PyList, PyStrRef};
+use vm::function::{ArgIntoFloat, FuncArgs, KwArgs, OptionalArg, PosArgs};
 use vm::{
-    pymodule, PyObjectRef, PyPayload, PyResult, TryFromObject, VirtualMachine,
+    pymodule, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject, VirtualMachine,
 };
 
 use crate::types::*;
@@ -135,11 +142,7 @@ pub struct ExecutionResult {
     pub side_effects: SideEffectCollector,
 }
 
-// ---- Per-turn execution context (thread-local) ----
-//
-// RustPython's #[pymodule] is static — we can't inject per-turn objects into
-// it. Instead the module's classes/functions read from this thread-local,
-// which is set fresh at the top of each execute_inner() call.
+// ---- Per-turn data carried by pyclass instances ----
 
 #[derive(Debug, Clone)]
 struct WorkItemData {
@@ -158,14 +161,15 @@ struct HistoryEntryData {
     time: String,
 }
 
-struct ExecContext {
-    collector: Arc<Mutex<SideEffectCollector>>,
-    work_items: Vec<WorkItemData>,
-    memory_data: HashMap<String, serde_json::Value>,
-    memory_priorities: HashMap<String, u8>,
-    pinned_memory: HashMap<String, String>,
-    timers_info: Vec<(String, String, u8)>,
-    history_entries: HashMap<String, HistoryEntryData>,
+#[derive(Debug, Default)]
+struct MemoryState {
+    data: HashMap<String, serde_json::Value>,
+    priorities: HashMap<String, u8>,
+    pinned: HashMap<String, String>,
+}
+
+#[derive(Debug, Default)]
+struct HarnessInfo {
     process_outputs: HashMap<String, String>,
     process_statuses: HashMap<String, String>,
     process_info: Vec<(String, String, String, String)>,
@@ -174,35 +178,12 @@ struct ExecContext {
     agent_lineage: String,
     harness_bin: String,
     is_compaction: bool,
-    stdout_buf: Arc<Mutex<String>>,
-}
-
-thread_local! {
-    static EXEC_CTX: RefCell<Option<ExecContext>> = const { RefCell::new(None) };
-}
-
-fn with_ctx<R>(f: impl FnOnce(&mut ExecContext) -> R) -> R {
-    EXEC_CTX.with(|cell| {
-        let mut borrow = cell.borrow_mut();
-        let ctx = borrow.as_mut().expect("ExecContext not set — called outside execute()");
-        f(ctx)
-    })
-}
-
-fn with_collector<R>(f: impl FnOnce(&mut SideEffectCollector) -> R) -> R {
-    with_ctx(|ctx| {
-        let mut guard = ctx.collector.lock().unwrap();
-        f(&mut guard)
-    })
 }
 
 // ---- Helpers ----
 
 /// Extract a duration in seconds from a number (int/float) or datetime.timedelta.
-/// RustPython's `f64: TryFromObject` only accepts PyFloat, so we use
-/// ArgIntoFloat which coerces ints via __float__.
 fn extract_seconds(vm: &VirtualMachine, val: &PyObjectRef) -> PyResult<f64> {
-    use vm::function::ArgIntoFloat;
     if let Ok(f) = ArgIntoFloat::try_from_object(vm, val.clone()) {
         return Ok(f.into_float());
     }
@@ -236,6 +217,19 @@ fn extract_str_list(vm: &VirtualMachine, obj: &PyObjectRef) -> PyResult<Vec<Stri
         return Ok(Vec::new());
     }
     vm.extract_elements_with(obj, |o| String::try_from_object(vm, o))
+}
+
+/// Raise FileNotFoundError. OSError subtypes carry extra payload, so
+/// `vm.new_exception_msg()` panics on them; go through the OSError helper
+/// and downcast to the base exception ref.
+fn file_not_found(vm: &VirtualMachine, msg: String) -> PyBaseExceptionRef {
+    let os_err = vm.new_os_subtype_error(
+        vm.ctx.exceptions.file_not_found_error.to_owned(),
+        None,
+        msg,
+    );
+    let obj: PyObjectRef = os_err.into();
+    obj.downcast().expect("PyOSError is a PyBaseException")
 }
 
 // ---- WorkItem → data conversion (pure Rust) ----
@@ -338,12 +332,14 @@ fn work_item_to_data(item: &WorkItem) -> WorkItemData {
 }
 
 // ---- #[pymodule] ----
+//
+// Types are registered statically; instances carry per-turn state in Mutex
+// fields and are built fresh each turn via `PyPayload::into_ref()`.
 
 #[pymodule(name = "_harness")]
 mod harness {
     use super::*;
-    use rustpython_vm::builtins::PyType;
-    use rustpython_vm::{pyclass, PyObjectRef, PyRef};
+    use rustpython_vm::pyclass;
 
     // ------ PyWorkItem ------
 
@@ -351,7 +347,7 @@ mod harness {
     #[pyclass(module = "_harness", name = "WorkItem")]
     #[derive(Debug, PyPayload, Default)]
     pub struct PyWorkItem {
-        data: Mutex<Option<WorkItemData>>,
+        pub data: Mutex<Option<WorkItemData>>,
     }
 
     #[pyclass]
@@ -367,7 +363,6 @@ mod harness {
         #[pygetset]
         fn time(&self) -> String { self.d().time }
 
-        /// Dynamic field access. Called from Python wrapper's __getattr__.
         #[pymethod]
         fn _field(&self, name: PyStrRef, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
             let d = self.d();
@@ -392,68 +387,64 @@ mod harness {
         }
     }
 
-    pub fn make_work_item(vm: &VirtualMachine, data: WorkItemData) -> PyObjectRef {
-        PyWorkItem { data: Mutex::new(Some(data)) }.into_pyobject(vm)
-    }
-
     // ------ PyWorkQueue ------
 
     #[pyattr]
     #[pyclass(module = "_harness", name = "WorkQueue")]
     #[derive(Debug, PyPayload, Default)]
-    pub struct PyWorkQueue;
+    pub struct PyWorkQueue {
+        pub items: Mutex<Vec<WorkItemData>>,
+        pub collector: Mutex<Option<Arc<Mutex<SideEffectCollector>>>>,
+    }
+
+    impl PyWorkQueue {
+        fn col(&self) -> Arc<Mutex<SideEffectCollector>> {
+            self.collector.lock().unwrap().clone().expect("collector not set")
+        }
+    }
 
     #[pyclass]
     impl PyWorkQueue {
-        #[pyslot]
-        fn slot_new(cls: PyRef<PyType>, _args: FuncArgs, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
-            Self.into_ref_with_type(vm, cls).map(Into::into)
-        }
-
         #[pymethod]
         fn _getitem(&self, index: usize, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
-            with_ctx(|ctx| {
-                ctx.work_items.get(index)
-                    .map(|d| make_work_item(vm, d.clone()))
-                    .ok_or_else(|| vm.new_index_error("work queue index out of range"))
-            })
+            let items = self.items.lock().unwrap();
+            items.get(index)
+                .map(|d| PyWorkItem { data: Mutex::new(Some(d.clone())) }.into_pyobject(vm))
+                .ok_or_else(|| vm.new_index_error("work queue index out of range"))
         }
 
         #[pymethod]
         fn _len(&self) -> usize {
-            with_ctx(|ctx| ctx.work_items.len())
+            self.items.lock().unwrap().len()
         }
 
         #[pymethod]
         fn pop_front(&self, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
-            with_ctx(|ctx| {
-                if ctx.work_items.is_empty() {
-                    return Ok(vm.ctx.none());
-                }
-                let item = ctx.work_items.remove(0);
-                ctx.collector.lock().unwrap().queue_removes.push(item.id.clone());
-                Ok(make_work_item(vm, item))
-            })
+            let mut items = self.items.lock().unwrap();
+            if items.is_empty() {
+                return Ok(vm.ctx.none());
+            }
+            let item = items.remove(0);
+            self.col().lock().unwrap().queue_removes.push(item.id.clone());
+            Ok(PyWorkItem { data: Mutex::new(Some(item)) }.into_pyobject(vm))
         }
 
         #[pymethod]
         fn remove(&self, id: String) -> PyResult<()> {
-            with_ctx(|ctx| {
-                ctx.work_items.retain(|i| i.id != id);
-                ctx.collector.lock().unwrap().queue_removes.push(id);
-            });
+            self.items.lock().unwrap().retain(|i| i.id != id);
+            self.col().lock().unwrap().queue_removes.push(id);
             Ok(())
         }
 
         #[pymethod]
         fn add_filter(&self, name: String, regex: String) -> PyResult<()> {
-            with_collector(|c| c.filter_adds.push(QueueFilter { name, regex }));
+            self.col().lock().unwrap().filter_adds.push(QueueFilter { name, regex });
             Ok(())
         }
 
         #[pymethod]
         fn remove_filter(&self, name: String) -> PyResult<()> {
-            with_collector(|c| c.filter_removes.push(name));
+            self.col().lock().unwrap().filter_removes.push(name);
             Ok(())
         }
     }
@@ -463,142 +454,136 @@ mod harness {
     #[pyattr]
     #[pyclass(module = "_harness", name = "Memory")]
     #[derive(Debug, PyPayload, Default)]
-    pub struct PyMemory;
+    pub struct PyMemory {
+        pub state: Mutex<MemoryState>,
+        pub collector: Mutex<Option<Arc<Mutex<SideEffectCollector>>>>,
+    }
+
+    impl PyMemory {
+        fn col(&self) -> Arc<Mutex<SideEffectCollector>> {
+            self.collector.lock().unwrap().clone().expect("collector not set")
+        }
+    }
 
     #[pyclass]
     impl PyMemory {
-        #[pyslot]
-        fn slot_new(cls: PyRef<PyType>, _args: FuncArgs, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
-            Self.into_ref_with_type(vm, cls).map(Into::into)
-        }
-
         #[pymethod]
         fn _getitem(&self, key: PyStrRef, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
             let key: &str = key.as_ref();
-            with_ctx(|ctx| {
-                match ctx.memory_data.get(key) {
-                    Some(val) => json_to_py(vm, val),
-                    None => Err(vm.new_key_error(vm.ctx.new_str(key.to_owned()).into())),
-                }
-            })
+            let state = self.state.lock().unwrap();
+            match state.data.get(key) {
+                Some(val) => json_to_py(vm, val),
+                None => Err(vm.new_key_error(vm.ctx.new_str(key.to_owned()).into())),
+            }
         }
 
         #[pymethod]
         fn _setitem(&self, key: String, value: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
             let serde_val = py_to_json(vm, &value)?;
-            with_ctx(|ctx| {
-                ctx.memory_data.insert(key.clone(), serde_val.clone());
-                let mut col = ctx.collector.lock().unwrap();
-                col.memory_sets.push((key.clone(), serde_val));
-                if !ctx.memory_priorities.contains_key(&key) {
-                    ctx.memory_priorities.insert(key.clone(), 5);
-                    col.memory_priority_sets.push((key, 5));
-                }
-            });
+            let mut state = self.state.lock().unwrap();
+            state.data.insert(key.clone(), serde_val.clone());
+            let col = self.col();
+            let mut c = col.lock().unwrap();
+            c.memory_sets.push((key.clone(), serde_val));
+            if !state.priorities.contains_key(&key) {
+                state.priorities.insert(key.clone(), 5);
+                c.memory_priority_sets.push((key, 5));
+            }
             Ok(())
         }
 
         #[pymethod]
         fn _delitem(&self, key: String) -> PyResult<()> {
-            with_ctx(|ctx| {
-                ctx.memory_data.remove(&key);
-                ctx.collector.lock().unwrap().memory_deletes.push(key);
-            });
+            self.state.lock().unwrap().data.remove(&key);
+            self.col().lock().unwrap().memory_deletes.push(key);
             Ok(())
         }
 
         #[pymethod]
         fn _contains(&self, key: PyStrRef) -> bool {
             let key: &str = key.as_ref();
-            with_ctx(|ctx| ctx.memory_data.contains_key(key) || ctx.pinned_memory.contains_key(key))
+            let state = self.state.lock().unwrap();
+            state.data.contains_key(key) || state.pinned.contains_key(key)
         }
 
         #[pymethod]
         fn get(&self, key: PyStrRef, default: OptionalArg<PyObjectRef>, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
             let key: &str = key.as_ref();
-            with_ctx(|ctx| {
-                if let Some(val) = ctx.memory_data.get(key) {
-                    return json_to_py(vm, val);
-                }
-                if let Some(s) = ctx.pinned_memory.get(key) {
-                    return Ok(vm.ctx.new_str(s.clone()).into());
-                }
-                Ok(default.unwrap_or_else(|| vm.ctx.none()))
-            })
+            let state = self.state.lock().unwrap();
+            if let Some(val) = state.data.get(key) {
+                return json_to_py(vm, val);
+            }
+            if let Some(s) = state.pinned.get(key) {
+                return Ok(vm.ctx.new_str(s.clone()).into());
+            }
+            Ok(default.unwrap_or_else(|| vm.ctx.none()))
         }
 
         #[pymethod]
         fn set(&self, key: String, value: PyObjectRef, priority: OptionalArg<u8>, vm: &VirtualMachine) -> PyResult<()> {
             let priority = priority.unwrap_or(5);
             let serde_val = py_to_json(vm, &value)?;
-            with_ctx(|ctx| {
-                ctx.memory_data.insert(key.clone(), serde_val.clone());
-                ctx.memory_priorities.insert(key.clone(), priority);
-                let mut col = ctx.collector.lock().unwrap();
-                col.memory_sets.push((key.clone(), serde_val));
-                col.memory_priority_sets.push((key, priority));
-            });
+            let mut state = self.state.lock().unwrap();
+            state.data.insert(key.clone(), serde_val.clone());
+            state.priorities.insert(key.clone(), priority);
+            let col = self.col();
+            let mut c = col.lock().unwrap();
+            c.memory_sets.push((key.clone(), serde_val));
+            c.memory_priority_sets.push((key, priority));
             Ok(())
         }
 
         #[pymethod]
         fn set_priority(&self, key: String, priority: u8) -> PyResult<()> {
-            with_ctx(|ctx| {
-                ctx.memory_priorities.insert(key.clone(), priority);
-                ctx.collector.lock().unwrap().memory_priority_sets.push((key, priority));
-            });
+            self.state.lock().unwrap().priorities.insert(key.clone(), priority);
+            self.col().lock().unwrap().memory_priority_sets.push((key, priority));
             Ok(())
         }
 
         #[pymethod]
         fn get_priority(&self, key: PyStrRef) -> u8 {
             let key: &str = key.as_ref();
-            with_ctx(|ctx| ctx.memory_priorities.get(key).copied().unwrap_or(5))
+            self.state.lock().unwrap().priorities.get(key).copied().unwrap_or(5)
         }
 
         #[pymethod]
         fn pin(&self, key: String, value: String) -> PyResult<()> {
-            with_ctx(|ctx| {
-                ctx.pinned_memory.insert(key.clone(), value.clone());
-                ctx.collector.lock().unwrap().memory_pins.push((key, value));
-            });
+            self.state.lock().unwrap().pinned.insert(key.clone(), value.clone());
+            self.col().lock().unwrap().memory_pins.push((key, value));
             Ok(())
         }
 
         #[pymethod]
         fn unpin(&self, key: String) -> PyResult<()> {
-            with_ctx(|ctx| {
-                ctx.pinned_memory.remove(&key);
-                ctx.collector.lock().unwrap().memory_unpins.push(key);
-            });
+            self.state.lock().unwrap().pinned.remove(&key);
+            self.col().lock().unwrap().memory_unpins.push(key);
             Ok(())
         }
 
         #[pymethod]
         fn list_pinned(&self, vm: &VirtualMachine) -> PyObjectRef {
-            let keys: Vec<PyObjectRef> = with_ctx(|ctx| {
-                let mut keys: Vec<String> = ctx.pinned_memory.keys().cloned().collect();
-                keys.sort();
-                keys.into_iter().map(|k| vm.ctx.new_str(k).into()).collect()
-            });
-            vm.ctx.new_list(keys).into()
+            let mut keys: Vec<String> = self.state.lock().unwrap().pinned.keys().cloned().collect();
+            keys.sort();
+            let objs: Vec<PyObjectRef> = keys.into_iter().map(|k| vm.ctx.new_str(k).into()).collect();
+            vm.ctx.new_list(objs).into()
         }
 
         #[pymethod]
         fn mark_sensitive(&self, key: String) -> PyResult<()> {
-            with_collector(|c| c.sensitive_marks.push((key, true)));
+            self.col().lock().unwrap().sensitive_marks.push((key, true));
             Ok(())
         }
 
         #[pymethod]
         fn unmark_sensitive(&self, key: String) -> PyResult<()> {
-            with_collector(|c| c.sensitive_marks.push((key, false)));
+            self.col().lock().unwrap().sensitive_marks.push((key, false));
             Ok(())
         }
 
         #[pymethod]
         fn _repr(&self) -> String {
-            with_ctx(|ctx| format!("Memory({} keys, {} pinned)", ctx.memory_data.len(), ctx.pinned_memory.len()))
+            let state = self.state.lock().unwrap();
+            format!("Memory({} keys, {} pinned)", state.data.len(), state.pinned.len())
         }
     }
 
@@ -607,15 +592,19 @@ mod harness {
     #[pyattr]
     #[pyclass(module = "_harness", name = "TimerManager")]
     #[derive(Debug, PyPayload, Default)]
-    pub struct PyTimerManager;
+    pub struct PyTimerManager {
+        pub timers_info: Mutex<Vec<(String, String, u8)>>,
+        pub collector: Mutex<Option<Arc<Mutex<SideEffectCollector>>>>,
+    }
+
+    impl PyTimerManager {
+        fn col(&self) -> Arc<Mutex<SideEffectCollector>> {
+            self.collector.lock().unwrap().clone().expect("collector not set")
+        }
+    }
 
     #[pyclass]
     impl PyTimerManager {
-        #[pyslot]
-        fn slot_new(cls: PyRef<PyType>, _args: FuncArgs, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
-            Self.into_ref_with_type(vm, cls).map(Into::into)
-        }
-
         #[pymethod]
         fn add(&self, args: FuncArgs, vm: &VirtualMachine) -> PyResult<String> {
             let mut args = args;
@@ -634,7 +623,6 @@ mod harness {
             };
             let at_epoch = match at {
                 Some(val) if !vm.is_none(&val) => {
-                    use vm::function::ArgIntoFloat;
                     if let Ok(ts) = vm.call_method(&val, "timestamp", ()) {
                         Some(ArgIntoFloat::try_from_object(vm, ts)?.into_float())
                     } else if let Ok(f) = ArgIntoFloat::try_from_object(vm, val.clone()) {
@@ -646,31 +634,30 @@ mod harness {
                 _ => None,
             };
 
-            with_collector(|c| {
-                let id = c.id_gen.next();
-                let id_str = id.0.clone();
-                c.timer_adds.push(TimerAddRequest { id, every_secs, at_epoch, priority, description });
-                id_str
-            }).pipe(Ok)
+            let col = self.col();
+            let mut c = col.lock().unwrap();
+            let id = c.id_gen.next();
+            let id_str = id.0.clone();
+            c.timer_adds.push(TimerAddRequest { id, every_secs, at_epoch, priority, description });
+            Ok(id_str)
         }
 
         #[pymethod]
         fn cancel(&self, timer_id: String) -> PyResult<()> {
-            with_collector(|c| c.timer_cancels.push(timer_id));
+            self.col().lock().unwrap().timer_cancels.push(timer_id);
             Ok(())
         }
 
         #[pymethod]
         fn list(&self, vm: &VirtualMachine) -> PyObjectRef {
-            let items: Vec<PyObjectRef> = with_ctx(|ctx| {
-                ctx.timers_info.iter().map(|(id, desc, prio)| {
+            let items: Vec<PyObjectRef> = self.timers_info.lock().unwrap().iter()
+                .map(|(id, desc, prio)| {
                     vm.ctx.new_tuple(vec![
                         vm.ctx.new_str(id.clone()).into(),
                         vm.ctx.new_str(desc.clone()).into(),
                         vm.ctx.new_int(*prio).into(),
                     ]).into()
-                }).collect()
-            });
+                }).collect();
             vm.ctx.new_list(items).into()
         }
     }
@@ -681,7 +668,7 @@ mod harness {
     #[pyclass(module = "_harness", name = "HistoryEntry")]
     #[derive(Debug, PyPayload, Default)]
     pub struct PyHistoryEntry {
-        data: Mutex<Option<HistoryEntryData>>,
+        pub data: Mutex<Option<HistoryEntryData>>,
     }
 
     #[pyclass]
@@ -704,305 +691,319 @@ mod harness {
     #[pyattr]
     #[pyclass(module = "_harness", name = "HistoryManager")]
     #[derive(Debug, PyPayload, Default)]
-    pub struct PyHistoryManager;
+    pub struct PyHistoryManager {
+        pub entries: Mutex<HashMap<String, HistoryEntryData>>,
+        pub is_compaction: Mutex<bool>,
+        pub collector: Mutex<Option<Arc<Mutex<SideEffectCollector>>>>,
+    }
+
+    impl PyHistoryManager {
+        fn col(&self) -> Arc<Mutex<SideEffectCollector>> {
+            self.collector.lock().unwrap().clone().expect("collector not set")
+        }
+    }
 
     #[pyclass]
     impl PyHistoryManager {
-        #[pyslot]
-        fn slot_new(cls: PyRef<PyType>, _args: FuncArgs, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
-            Self.into_ref_with_type(vm, cls).map(Into::into)
-        }
-
         #[pymethod]
         fn _getitem(&self, id: PyStrRef, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
             let id: &str = id.as_ref();
-            with_ctx(|ctx| {
-                ctx.history_entries.get(id)
-                    .map(|d| PyHistoryEntry { data: Mutex::new(Some(d.clone())) }.into_pyobject(vm))
-                    .ok_or_else(|| vm.new_key_error(
-                        vm.ctx.new_str(format!("No history entry with id {}", id)).into()
-                    ))
-            })
+            let entries = self.entries.lock().unwrap();
+            entries.get(id)
+                .map(|d| PyHistoryEntry { data: Mutex::new(Some(d.clone())) }.into_pyobject(vm))
+                .ok_or_else(|| vm.new_key_error(
+                    vm.ctx.new_str(format!("No history entry with id {}", id)).into()
+                ))
         }
 
         #[pymethod]
         fn replace_with_description(&self, id: String, description: String) -> PyResult<()> {
-            with_collector(|c| c.history_replaces.push((id, description)));
+            self.col().lock().unwrap().history_replaces.push((id, description));
             Ok(())
         }
 
         #[pymethod]
         fn remove(&self, id: String) -> PyResult<()> {
-            with_collector(|c| c.history_removes.push(id));
+            self.col().lock().unwrap().history_removes.push(id);
             Ok(())
         }
 
         #[pymethod]
         fn add(&self, text: String, vm: &VirtualMachine) -> PyResult<()> {
-            let is_compaction = with_ctx(|ctx| ctx.is_compaction);
-            if !is_compaction {
+            if !*self.is_compaction.lock().unwrap() {
                 return Err(vm.new_runtime_error("history.add() can only be used during compaction"));
             }
-            with_collector(|c| c.history_adds.push(text));
+            self.col().lock().unwrap().history_adds.push(text);
             Ok(())
         }
     }
 
-    // ------ PyHarness (top-level functions) ------
+    // ------ PyHarness (top-level functions, exposed as methods) ------
 
-    #[pyfunction]
-    fn send_message(
-        chat_id: String,
-        content: String,
-        attach: OptionalArg<PyObjectRef>,
-        react_to: OptionalArg<Option<String>>,
-        vm: &VirtualMachine,
-    ) -> PyResult<()> {
-        let attach: Vec<String> = match attach {
-            OptionalArg::Present(o) => extract_str_list(vm, &o)?,
-            OptionalArg::Missing => Vec::new(),
-        };
-        for p in &attach {
-            if !std::path::Path::new(p).is_file() {
-                return Err(vm.new_exception_msg(
-                    vm.ctx.exceptions.file_not_found_error.to_owned(),
-                    format!("send_message: attachment not found: {}", p).into(),
-                ));
-            }
-        }
-        let react_to = react_to.flatten();
-        with_collector(|c| c.messages.push(OutboundMessageRequest { chat_id, content, attachments: attach, react_to }));
-        Ok(())
+    #[pyattr]
+    #[pyclass(module = "_harness", name = "Harness")]
+    #[derive(Debug, PyPayload, Default)]
+    pub struct PyHarness {
+        pub info: Mutex<HarnessInfo>,
+        pub collector: Mutex<Option<Arc<Mutex<SideEffectCollector>>>>,
     }
 
-    #[pyfunction]
-    fn shell_exec(args: FuncArgs, vm: &VirtualMachine) -> PyResult<String> {
-        let mut args = args;
-        let cmd: String = args.take_positional_keyword("cmd")
-            .map(|o| String::try_from_object(vm, o))
-            .transpose()?
-            .ok_or_else(|| vm.new_type_error("shell_exec() missing required argument: 'cmd'"))?;
-        let proc_args: Vec<String> = args.take_keyword("args")
-            .map(|o| extract_str_list(vm, &o))
-            .transpose()?.unwrap_or_default();
-        let env: HashMap<String, String> = match args.take_keyword("env") {
-            Some(o) if !vm.is_none(&o) => {
-                let dict: PyRef<PyDict> = o.try_into_value(vm)?;
-                let mut m = HashMap::new();
-                for (k, v) in dict {
-                    m.insert(String::try_from_object(vm, k)?, String::try_from_object(vm, v)?);
-                }
-                m
-            }
-            _ => HashMap::new(),
-        };
-        let description: String = args.take_keyword("description")
-            .map(|o| String::try_from_object(vm, o))
-            .transpose()?.unwrap_or_default();
-        let alert_secs = match args.take_keyword("alert_timer") {
-            Some(o) if !vm.is_none(&o) => extract_seconds(vm, &o)? as u64,
-            _ => 300,
-        };
-        let success_prio: u8 = args.take_keyword("success_prio")
-            .map(|o| u8::try_from_object(vm, o))
-            .transpose()?.unwrap_or(7);
-        let fail_prio: u8 = args.take_keyword("fail_prio")
-            .map(|o| u8::try_from_object(vm, o))
-            .transpose()?.unwrap_or(8);
-        let block_for_ms = match args.take_keyword("block_for") {
-            Some(o) if !vm.is_none(&o) => Some((extract_seconds(vm, &o)? * 1000.0) as u64),
-            _ => None,
-        };
-        let interactive: bool = args.take_keyword("interactive")
-            .map(|o| bool::try_from_object(vm, o))
-            .transpose()?.unwrap_or(false);
+    impl PyHarness {
+        fn col(&self) -> Arc<Mutex<SideEffectCollector>> {
+            self.collector.lock().unwrap().clone().expect("collector not set")
+        }
+    }
 
-        with_collector(|c| {
+    #[pyclass]
+    impl PyHarness {
+        #[pymethod]
+        fn send_message(
+            &self,
+            chat_id: String,
+            content: String,
+            attach: OptionalArg<PyObjectRef>,
+            react_to: OptionalArg<Option<String>>,
+            vm: &VirtualMachine,
+        ) -> PyResult<()> {
+            let attach: Vec<String> = match attach {
+                OptionalArg::Present(o) => extract_str_list(vm, &o)?,
+                OptionalArg::Missing => Vec::new(),
+            };
+            for p in &attach {
+                if !std::path::Path::new(p).is_file() {
+                    return Err(file_not_found(vm, format!("send_message: attachment not found: {}", p)));
+                }
+            }
+            let react_to = react_to.flatten();
+            self.col().lock().unwrap().messages.push(OutboundMessageRequest { chat_id, content, attachments: attach, react_to });
+            Ok(())
+        }
+
+        #[pymethod]
+        fn shell_exec(&self, args: FuncArgs, vm: &VirtualMachine) -> PyResult<String> {
+            let mut args = args;
+            let cmd: String = args.take_positional_keyword("cmd")
+                .map(|o| String::try_from_object(vm, o))
+                .transpose()?
+                .ok_or_else(|| vm.new_type_error("shell_exec() missing required argument: 'cmd'"))?;
+            let proc_args: Vec<String> = args.take_positional_keyword("args")
+                .map(|o| extract_str_list(vm, &o))
+                .transpose()?.unwrap_or_default();
+            let env: HashMap<String, String> = match args.take_keyword("env") {
+                Some(o) if !vm.is_none(&o) => {
+                    let dict: PyRef<PyDict> = o.try_into_value(vm)?;
+                    let mut m = HashMap::new();
+                    for (k, v) in dict {
+                        m.insert(String::try_from_object(vm, k)?, String::try_from_object(vm, v)?);
+                    }
+                    m
+                }
+                _ => HashMap::new(),
+            };
+            let description: String = args.take_keyword("description")
+                .map(|o| String::try_from_object(vm, o))
+                .transpose()?.unwrap_or_default();
+            let alert_secs = match args.take_keyword("alert_timer") {
+                Some(o) if !vm.is_none(&o) => extract_seconds(vm, &o)? as u64,
+                _ => 300,
+            };
+            let success_prio: u8 = args.take_keyword("success_prio")
+                .map(|o| u8::try_from_object(vm, o))
+                .transpose()?.unwrap_or(7);
+            let fail_prio: u8 = args.take_keyword("fail_prio")
+                .map(|o| u8::try_from_object(vm, o))
+                .transpose()?.unwrap_or(8);
+            let block_for_ms = match args.take_keyword("block_for") {
+                Some(o) if !vm.is_none(&o) => Some((extract_seconds(vm, &o)? * 1000.0) as u64),
+                _ => None,
+            };
+            let interactive: bool = args.take_keyword("interactive")
+                .map(|o| bool::try_from_object(vm, o))
+                .transpose()?.unwrap_or(false);
+
+            let col = self.col();
+            let mut c = col.lock().unwrap();
             let id = c.id_gen.next();
             let id_str = id.0.clone();
             c.process_starts.push(ProcessStartRequest {
                 id, cmd, args: proc_args, env, description,
                 alert_timer_secs: alert_secs, success_prio, fail_prio, block_for_ms, interactive,
             });
-            id_str
-        }).pipe(Ok)
-    }
-
-    #[pyfunction]
-    fn shell_input(pid: String, data: String) -> PyResult<()> {
-        with_collector(|c| c.stdin_writes.push((pid, data.into_bytes())));
-        Ok(())
-    }
-
-    #[pyfunction]
-    fn shell_close_stdin(pid: String) -> PyResult<()> {
-        with_collector(|c| c.stdin_closes.push(pid));
-        Ok(())
-    }
-
-    #[pyfunction]
-    fn kill_child(name: String) -> PyResult<()> {
-        with_collector(|c| c.child_kills.push(name));
-        Ok(())
-    }
-
-    #[pyfunction]
-    fn shell_status(pid: String) -> String {
-        with_ctx(|ctx| ctx.process_statuses.get(&pid).cloned().unwrap_or_else(|| "unknown".to_string()))
-    }
-
-    #[pyfunction]
-    fn shell_output(pid: String, lines: OptionalArg<usize>) -> String {
-        let full = with_ctx(|ctx| ctx.process_outputs.get(&pid).cloned().unwrap_or_default());
-        match lines {
-            OptionalArg::Present(n) => {
-                let all: Vec<&str> = full.lines().collect();
-                all[all.len().saturating_sub(n)..].join("\n")
-            }
-            OptionalArg::Missing => full,
+            Ok(id_str)
         }
-    }
 
-    #[pyfunction]
-    fn shell_kill(pid: String) -> PyResult<()> {
-        with_collector(|c| c.process_kills.push(pid));
-        Ok(())
-    }
+        #[pymethod]
+        fn shell_input(&self, pid: String, data: String) -> PyResult<()> {
+            self.col().lock().unwrap().stdin_writes.push((pid, data.into_bytes()));
+            Ok(())
+        }
 
-    #[pyfunction]
-    fn processes_list(vm: &VirtualMachine) -> PyObjectRef {
-        let items: Vec<PyObjectRef> = with_ctx(|ctx| {
-            ctx.process_info.iter().map(|(pid, cmd, desc, status)| {
-                vm.ctx.new_tuple(vec![
-                    vm.ctx.new_str(pid.clone()).into(),
-                    vm.ctx.new_str(cmd.clone()).into(),
-                    vm.ctx.new_str(desc.clone()).into(),
-                    vm.ctx.new_str(status.clone()).into(),
-                ]).into()
-            }).collect()
-        });
-        vm.ctx.new_list(items).into()
-    }
+        #[pymethod]
+        fn shell_close_stdin(&self, pid: String) -> PyResult<()> {
+            self.col().lock().unwrap().stdin_closes.push(pid);
+            Ok(())
+        }
 
-    #[pyfunction]
-    fn view(paths: PosArgs<String>, vm: &VirtualMachine) -> PyResult<()> {
-        let paths: Vec<String> = paths.into_vec();
-        for p in &paths {
-            if !std::path::Path::new(p).is_file() {
-                return Err(vm.new_exception_msg(
-                    vm.ctx.exceptions.file_not_found_error.to_owned(),
-                    format!("view: file not found or not a regular file: {}", p).into(),
-                ));
+        #[pymethod]
+        fn kill_child(&self, name: String) -> PyResult<()> {
+            self.col().lock().unwrap().child_kills.push(name);
+            Ok(())
+        }
+
+        #[pymethod]
+        fn shell_status(&self, pid: String) -> String {
+            self.info.lock().unwrap().process_statuses.get(&pid).cloned().unwrap_or_else(|| "unknown".to_string())
+        }
+
+        #[pymethod]
+        fn shell_output(&self, pid: String, lines: OptionalArg<usize>) -> String {
+            let full = self.info.lock().unwrap().process_outputs.get(&pid).cloned().unwrap_or_default();
+            match lines {
+                OptionalArg::Present(n) => {
+                    let all: Vec<&str> = full.lines().collect();
+                    all[all.len().saturating_sub(n)..].join("\n")
+                }
+                OptionalArg::Missing => full,
             }
         }
-        with_collector(|c| c.view_paths.extend(paths));
-        Ok(())
-    }
 
-    #[pyfunction]
-    fn acknowledge_timer(timer_id: String) -> PyResult<()> {
-        with_collector(|c| c.timer_acks.push(timer_id));
-        Ok(())
-    }
-
-    #[pyfunction]
-    fn compact() -> PyResult<()> {
-        with_collector(|c| c.compact_called = true);
-        Ok(())
-    }
-
-    #[pyfunction]
-    fn request_compaction() -> PyResult<()> {
-        with_collector(|c| c.compaction_requested = true);
-        Ok(())
-    }
-
-    #[pyfunction]
-    fn fork(children: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
-        let depth = with_ctx(|ctx| ctx.child_depth_remaining);
-        if depth == 0 {
-            return Err(vm.new_runtime_error("Cannot fork sub-agents at this depth"));
+        #[pymethod]
+        fn shell_kill(&self, pid: String) -> PyResult<()> {
+            self.col().lock().unwrap().process_kills.push(pid);
+            Ok(())
         }
 
-        let list: PyRef<PyList> = children.try_into_value(vm)
-            .map_err(|_| vm.new_type_error("fork() requires a list of ChildSettings"))?;
-        let elems = list.borrow_vec().to_vec();
-        if elems.is_empty() {
-            return Err(vm.new_value_error("fork() requires at least one child"));
+        #[pymethod]
+        fn processes_list(&self, vm: &VirtualMachine) -> PyObjectRef {
+            let items: Vec<PyObjectRef> = self.info.lock().unwrap().process_info.iter()
+                .map(|(pid, cmd, desc, status)| {
+                    vm.ctx.new_tuple(vec![
+                        vm.ctx.new_str(pid.clone()).into(),
+                        vm.ctx.new_str(cmd.clone()).into(),
+                        vm.ctx.new_str(desc.clone()).into(),
+                        vm.ctx.new_str(status.clone()).into(),
+                    ]).into()
+                }).collect();
+            vm.ctx.new_list(items).into()
         }
 
-        let mut child_settings = Vec::new();
-        let mut names = Vec::new();
-
-        for item in elems {
-            let name: String = item.get_attr("name", vm)?.try_into_value(vm)?;
-            if let Err(e) = crate::types::AgentName::new_child(&name) {
-                return Err(vm.new_value_error(format!("ChildSettings.name invalid: {}", e)));
+        #[pymethod]
+        fn view(&self, paths: PosArgs<String>, vm: &VirtualMachine) -> PyResult<()> {
+            let paths: Vec<String> = paths.into_vec();
+            for p in &paths {
+                if !std::path::Path::new(p).is_file() {
+                    return Err(file_not_found(vm, format!("view: file not found or not a regular file: {}", p)));
+                }
             }
-            let task: String = item.get_attr("task", vm)?.try_into_value(vm)?;
-            let model: Option<String> = item.get_attr("model", vm)?.try_into_value(vm)?;
-
-            let max_turns_obj = item.get_attr("max_turns", vm)?;
-            let max_turns: Option<u32> = if vm.is_none(&max_turns_obj) {
-                None
-            } else {
-                Some(u32::try_from_object(vm, max_turns_obj)?.min(50))
-            };
-
-            let can_compact: bool = item.get_attr("can_compact", vm)?.try_into_value(vm)?;
-            let inherit_history: bool = item.get_attr("inherit_history", vm)?.try_into_value(vm)?;
-
-            let attach = extract_str_list(vm, &item.get_attr("attach", vm)?)?;
-            let prefix_context: Option<String> = item.get_attr("prefix_context", vm)?.try_into_value(vm)?;
-            let prefix_attach = extract_str_list(vm, &item.get_attr("prefix_attach", vm)?)?;
-
-            names.push(name.clone());
-            child_settings.push(ForkChildSettings {
-                name, task, model, max_turns, can_compact, inherit_history,
-                attach, prefix_context, prefix_attach,
-            });
+            self.col().lock().unwrap().view_paths.extend(paths);
+            Ok(())
         }
 
-        with_collector(|c| c.fork_requests.push(ForkRequest { children: child_settings }));
-        let name_objs: Vec<PyObjectRef> = names.into_iter().map(|n| vm.ctx.new_str(n).into()).collect();
-        Ok(vm.ctx.new_list(name_objs).into())
-    }
-
-    #[pyfunction]
-    fn message_agent(name: String, content: String, priority: OptionalArg<u8>) -> PyResult<()> {
-        let priority = priority.unwrap_or(6);
-        with_collector(|c| c.agent_messages.push(AgentMessageRequest { recipient: name, content, priority }));
-        Ok(())
-    }
-
-    #[pyfunction]
-    fn done(kwargs: KwArgs, vm: &VirtualMachine) -> PyResult<()> {
-        let mut result = HashMap::new();
-        for (key, val) in kwargs {
-            let serde_val = py_to_json(vm, &val)
-                .map_err(|_| vm.new_value_error(format!("done() kwargs must be JSON-serializable (key: {})", key)))?;
-            result.insert(key, serde_val);
+        #[pymethod]
+        fn acknowledge_timer(&self, timer_id: String) -> PyResult<()> {
+            self.col().lock().unwrap().timer_acks.push(timer_id);
+            Ok(())
         }
-        with_collector(|c| {
+
+        #[pymethod]
+        fn compact(&self) -> PyResult<()> {
+            self.col().lock().unwrap().compact_called = true;
+            Ok(())
+        }
+
+        #[pymethod]
+        fn request_compaction(&self) -> PyResult<()> {
+            self.col().lock().unwrap().compaction_requested = true;
+            Ok(())
+        }
+
+        #[pymethod]
+        fn fork(&self, children: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
+            let depth = self.info.lock().unwrap().child_depth_remaining;
+            if depth == 0 {
+                return Err(vm.new_runtime_error("Cannot fork sub-agents at this depth"));
+            }
+
+            let list: PyRef<PyList> = children.try_into_value(vm)
+                .map_err(|_| vm.new_type_error("fork() requires a list of ChildSettings"))?;
+            let elems = list.borrow_vec().to_vec();
+            if elems.is_empty() {
+                return Err(vm.new_value_error("fork() requires at least one child"));
+            }
+
+            let mut child_settings = Vec::new();
+            let mut names = Vec::new();
+
+            for item in elems {
+                let name: String = item.get_attr("name", vm)?.try_into_value(vm)?;
+                if let Err(e) = crate::types::AgentName::new_child(&name) {
+                    return Err(vm.new_value_error(format!("ChildSettings.name invalid: {}", e)));
+                }
+                let task: String = item.get_attr("task", vm)?.try_into_value(vm)?;
+                let model: Option<String> = item.get_attr("model", vm)?.try_into_value(vm)?;
+
+                let max_turns_obj = item.get_attr("max_turns", vm)?;
+                let max_turns: Option<u32> = if vm.is_none(&max_turns_obj) {
+                    None
+                } else {
+                    Some(u32::try_from_object(vm, max_turns_obj)?.min(50))
+                };
+
+                let can_compact: bool = item.get_attr("can_compact", vm)?.try_into_value(vm)?;
+                let inherit_history: bool = item.get_attr("inherit_history", vm)?.try_into_value(vm)?;
+
+                let attach = extract_str_list(vm, &item.get_attr("attach", vm)?)?;
+                let prefix_context: Option<String> = item.get_attr("prefix_context", vm)?.try_into_value(vm)?;
+                let prefix_attach = extract_str_list(vm, &item.get_attr("prefix_attach", vm)?)?;
+
+                names.push(name.clone());
+                child_settings.push(ForkChildSettings {
+                    name, task, model, max_turns, can_compact, inherit_history,
+                    attach, prefix_context, prefix_attach,
+                });
+            }
+
+            self.col().lock().unwrap().fork_requests.push(ForkRequest { children: child_settings });
+            let name_objs: Vec<PyObjectRef> = names.into_iter().map(|n| vm.ctx.new_str(n).into()).collect();
+            Ok(vm.ctx.new_list(name_objs).into())
+        }
+
+        #[pymethod]
+        fn message_agent(&self, name: String, content: String, priority: OptionalArg<u8>) -> PyResult<()> {
+            let priority = priority.unwrap_or(6);
+            self.col().lock().unwrap().agent_messages.push(AgentMessageRequest { recipient: name, content, priority });
+            Ok(())
+        }
+
+        #[pymethod]
+        fn done(&self, kwargs: KwArgs, vm: &VirtualMachine) -> PyResult<()> {
+            let mut result = HashMap::new();
+            for (key, val) in kwargs {
+                let serde_val = py_to_json(vm, &val)
+                    .map_err(|_| vm.new_value_error(format!("done() kwargs must be JSON-serializable (key: {})", key)))?;
+                result.insert(key, serde_val);
+            }
+            let col = self.col();
+            let mut c = col.lock().unwrap();
             c.done_called = true;
             c.done_result = result;
-        });
-        Ok(())
-    }
+            Ok(())
+        }
 
-    #[pyfunction]
-    fn agent_name() -> String {
-        with_ctx(|ctx| ctx.agent_name.clone())
-    }
+        #[pymethod]
+        fn agent_name(&self) -> String {
+            self.info.lock().unwrap().agent_name.clone()
+        }
 
-    #[pyfunction]
-    fn agent_lineage() -> String {
-        with_ctx(|ctx| ctx.agent_lineage.clone())
-    }
+        #[pymethod]
+        fn agent_lineage(&self) -> String {
+            self.info.lock().unwrap().agent_lineage.clone()
+        }
 
-    #[pyfunction]
-    fn harness_bin() -> String {
-        with_ctx(|ctx| ctx.harness_bin.clone())
+        #[pymethod]
+        fn harness_bin(&self) -> String {
+            self.info.lock().unwrap().harness_bin.clone()
+        }
     }
 
     // ------ StdoutCapture ------
@@ -1010,19 +1011,16 @@ mod harness {
     #[pyattr]
     #[pyclass(module = "_harness", name = "StdoutCapture")]
     #[derive(Debug, PyPayload, Default)]
-    pub struct StdoutCapture;
+    pub struct StdoutCapture {
+        pub buf: Mutex<String>,
+    }
 
     #[pyclass]
     impl StdoutCapture {
-        #[pyslot]
-        fn slot_new(cls: PyRef<PyType>, _args: FuncArgs, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
-            Self.into_ref_with_type(vm, cls).map(Into::into)
-        }
-
         #[pymethod]
         fn write(&self, text: PyStrRef) -> usize {
             let s: &str = text.as_ref();
-            with_ctx(|ctx| ctx.stdout_buf.lock().unwrap().push_str(s));
+            self.buf.lock().unwrap().push_str(s);
             s.len()
         }
 
@@ -1033,20 +1031,15 @@ mod harness {
     }
 }
 
-// Helper trait for pipe-style chaining (avoids temp bindings).
-trait Pipe: Sized {
-    fn pipe<R>(self, f: impl FnOnce(Self) -> R) -> R { f(self) }
-}
-impl<T> Pipe for T {}
-
 // ---- Python Preamble ----
 //
-// Wraps Rust classes with thin Python classes that provide dunder methods.
-// This sidesteps RustPython's AsMapping/AsSequence trait requirement for
-// operator dispatch.
+// Wraps Rust instances (injected as _memory, _work_queue, _timers, _history,
+// _harness, _stdout_capture) with thin Python classes that provide dunder
+// methods. Also wraps PyHarness methods with named-parameter Python `def`s,
+// since RustPython's #[pymethod] macro doesn't expose parameter names for
+// kwargs dispatch.
 
 const PREAMBLE: &str = r#"
-import _harness
 import sys
 from datetime import timedelta, datetime
 from dataclasses import dataclass
@@ -1112,33 +1105,46 @@ class _HistoryWrap:
     def remove(self, id): return self._h.remove(id)
     def add(self, text): return self._h.add(text)
 
+class _TimerWrap:
+    def __init__(self, t): self._t = t
+    def add(self, every=None, at=None, priority=5, description=""):
+        return self._t.add(every=every, at=at, priority=priority, description=description)
+    def cancel(self, timer_id): return self._t.cancel(timer_id)
+    def list(self): return self._t.list()
+
 # Capture stdout/stderr
-_cap = _harness.StdoutCapture()
-sys.stdout = _cap
-sys.stderr = _cap
+sys.stdout = _stdout_capture
+sys.stderr = _stdout_capture
 
-# Instantiate harness state objects
-work_queue = _WorkQueueWrap(_harness.WorkQueue())
-memory = _MemoryWrap(_harness.Memory())
-timers = _harness.TimerManager()
-history = _HistoryWrap(_harness.HistoryManager())
+# Wrap injected Rust instances
+work_queue = _WorkQueueWrap(_work_queue)
+memory = _MemoryWrap(_memory)
+timers = _TimerWrap(_timers)
+history = _HistoryWrap(_history)
 
-# Top-level functions
-send_message = _harness.send_message
-shell_exec = _harness.shell_exec
-shell_status = _harness.shell_status
-shell_output = _harness.shell_output
-shell_input = _harness.shell_input
-shell_close_stdin = _harness.shell_close_stdin
-shell_kill = _harness.shell_kill
-processes_list = _harness.processes_list
-acknowledge_timer = _harness.acknowledge_timer
-request_compaction = _harness.request_compaction
-view = _harness.view
-fork = _harness.fork
-kill_child = _harness.kill_child
-message_agent = _harness.message_agent
-done = _harness.done
+# Top-level functions — wrap _harness methods with named-parameter defs so
+# kwargs work (RustPython #[pymethod] doesn't expose param names to the parser).
+def send_message(chat_id, content, attach=None, react_to=None):
+    return _harness.send_message(chat_id, content, attach, react_to)
+def shell_exec(cmd, args=None, env=None, description="", alert_timer=None,
+               success_prio=7, fail_prio=8, block_for=None, interactive=False):
+    return _harness.shell_exec(cmd, args=args or [], env=env, description=description,
+                               alert_timer=alert_timer, success_prio=success_prio,
+                               fail_prio=fail_prio, block_for=block_for, interactive=interactive)
+def shell_status(pid): return _harness.shell_status(pid)
+def shell_output(pid, lines=None):
+    return _harness.shell_output(pid) if lines is None else _harness.shell_output(pid, lines)
+def shell_input(pid, data): return _harness.shell_input(pid, data)
+def shell_close_stdin(pid): return _harness.shell_close_stdin(pid)
+def shell_kill(pid): return _harness.shell_kill(pid)
+def processes_list(): return _harness.processes_list()
+def acknowledge_timer(timer_id): return _harness.acknowledge_timer(timer_id)
+def request_compaction(): return _harness.request_compaction()
+def view(*paths): return _harness.view(*paths)
+def fork(children): return _harness.fork(children)
+def kill_child(name): return _harness.kill_child(name)
+def message_agent(name, content, priority=6): return _harness.message_agent(name, content, priority)
+def done(**kwargs): return _harness.done(**kwargs)
 agent_name = _harness.agent_name()
 agent_lineage = _harness.agent_lineage()
 harness_bin = _harness.harness_bin()
@@ -1158,69 +1164,277 @@ def http(method, url, headers=None, body=None, block_for=None, **kw):
 "#;
 
 const COMPACTION_PREAMBLE: &str = r#"
-compact = _harness.compact
+def compact(): return _harness.compact()
 compaction_script = ""
 "#;
 
 // ---- Executor ----
 
-// RustPython's Interpreter is !Sync (holds RefCells), so it can't go in a
-// OnceLock. Thread-local is fine: the agent loop is single-threaded, and
-// each turn's execute() runs on that same thread.
-//
-// The Interpreter is leaked (Box::leak) because RustPython's Drop impl
-// touches the VM's PyObjectRef graph during thread-local destructor cleanup,
-// which panics. We only ever build one interpreter per process, so leaking
-// is correct — the OS reclaims it at exit.
-thread_local! {
-    static INTERPRETER: std::cell::OnceCell<&'static vm::Interpreter> = const { std::cell::OnceCell::new() };
+pub struct Executor {
+    /// ManuallyDrop: RustPython's Drop impl walks the PyObjectRef graph during
+    /// teardown, which panics inside thread-local destructors. Leaking is
+    /// correct — the OS reclaims at process exit.
+    interpreter: ManuallyDrop<vm::Interpreter>,
+    /// For sending a KeyboardInterrupt into the VM from a watchdog thread.
+    signal_tx: vm::signal::UserSignalSender,
 }
 
-fn with_interpreter<R>(f: impl FnOnce(&vm::Interpreter) -> R) -> R {
-    INTERPRETER.with(|cell| {
-        let interp = cell.get_or_init(|| {
-            let builder = rustpython::Interpreter::builder(Default::default());
-            let def = harness::module_def(&builder.ctx);
-            let interp = builder.init_stdlib().add_native_module(def).build();
-            Box::leak(Box::new(interp))
+impl Executor {
+    pub fn new() -> Self {
+        let (signal_tx, signal_rx) = vm::signal::user_signal_channel();
+        let builder = rustpython::Interpreter::builder(Default::default());
+        let def = harness::module_def(&builder.ctx);
+        let interpreter = builder
+            .init_stdlib()
+            .add_native_module(def)
+            .init_hook(move |vm| vm.set_user_signal_channel(signal_rx))
+            .build();
+        Self {
+            interpreter: ManuallyDrop::new(interpreter),
+            signal_tx,
+        }
+    }
+
+    pub fn execute(
+        &self,
+        state: &HarnessState,
+        code: &str,
+        is_compaction: bool,
+        process_outputs: &HashMap<String, String>,
+    ) -> ExecutionResult {
+        self.execute_with_timeout(state, code, is_compaction, process_outputs, 0, 1, "root", "root", &HashMap::new())
+    }
+
+    pub fn execute_with_timeout(
+        &self,
+        state: &HarnessState,
+        code: &str,
+        is_compaction: bool,
+        process_outputs: &HashMap<String, String>,
+        timeout_secs: u64,
+        child_depth_remaining: u32,
+        agent_name: &str,
+        agent_lineage: &str,
+        pinned_memory: &HashMap<String, String>,
+    ) -> ExecutionResult {
+        // Watchdog: race a cancel channel against the timeout. Dropping
+        // cancel_tx on normal return makes recv_timeout return Err(Disconnected)
+        // immediately, so the watchdog exits without polling.
+        let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
+        let _watchdog = if timeout_secs > 0 {
+            let sig = self.signal_tx.clone();
+            Some(std::thread::spawn(move || {
+                match cancel_rx.recv_timeout(std::time::Duration::from_secs(timeout_secs)) {
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let _ = sig.send(Box::new(|vm| {
+                            Err(vm.new_exception_msg(
+                                vm.ctx.exceptions.keyboard_interrupt.to_owned(),
+                                "Python script execution timed out".into(),
+                            ))
+                        }));
+                    }
+                    _ => {} // cancelled or disconnected — do nothing
+                }
+            }))
+        } else {
+            None
+        };
+
+        let result = self.execute_inner(
+            state, code, is_compaction, process_outputs, child_depth_remaining,
+            agent_name, agent_lineage, pinned_memory,
+        );
+
+        drop(cancel_tx); // signal watchdog to exit
+        result
+    }
+
+    fn execute_inner(
+        &self,
+        state: &HarnessState,
+        code: &str,
+        is_compaction: bool,
+        process_outputs: &HashMap<String, String>,
+        child_depth_remaining: u32,
+        agent_name: &str,
+        agent_lineage: &str,
+        pinned_memory: &HashMap<String, String>,
+    ) -> ExecutionResult {
+        let collector = Arc::new(Mutex::new(SideEffectCollector {
+            id_gen: state.id_generator.clone(),
+            ..Default::default()
+        }));
+
+        // Build per-turn data from HarnessState.
+        let work_items: Vec<WorkItemData> = state.work_queue.items()
+            .iter().map(work_item_to_data).collect();
+
+        let timers_info: Vec<(String, String, u8)> = state.timer_manager.list()
+            .iter().map(|t| (t.id.0.clone(), t.description.clone(), t.priority)).collect();
+
+        let mut history_entries = HashMap::new();
+        for entry in state.event_history.entries() {
+            let (code_str, output_str, time_str) = match entry {
+                HistoryEntry::Execution { code, output, time, .. } => (
+                    code.clone(), output.clone(),
+                    time.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                ),
+                HistoryEntry::Summary { description, time, .. } => (
+                    String::new(), description.clone(),
+                    time.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                ),
+                HistoryEntry::SystemAlert { message, time, .. } => (
+                    String::new(), message.clone(),
+                    time.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                ),
+            };
+            history_entries.insert(entry.id().0.clone(), HistoryEntryData {
+                code: code_str, output: output_str.clone(),
+                full_output: output_str, time: time_str,
+            });
+        }
+
+        let process_statuses: HashMap<String, String> = state.process_manager.processes()
+            .iter().map(|p| {
+                let status = match &p.status {
+                    ProcessStatus::Running => "running",
+                    ProcessStatus::Completed { .. } => "completed",
+                    ProcessStatus::Failed { .. } => "failed",
+                };
+                (p.id.0.clone(), status.to_string())
+            }).collect();
+
+        let process_info: Vec<(String, String, String, String)> = state.process_manager.processes()
+            .iter().map(|p| {
+                let status = match &p.status {
+                    ProcessStatus::Running => "running".to_string(),
+                    ProcessStatus::Completed { exit_code } => format!("completed (exit {})", exit_code),
+                    ProcessStatus::Failed { error } => format!("failed: {}", error),
+                };
+                (p.id.0.clone(), p.cmd.clone(), p.description.clone(), status)
+            }).collect();
+
+        let harness_info = HarnessInfo {
+            process_outputs: process_outputs.clone(),
+            process_statuses,
+            process_info,
+            child_depth_remaining,
+            agent_name: agent_name.to_string(),
+            agent_lineage: agent_lineage.to_string(),
+            harness_bin: std::env::current_exe()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "claude-server".into()),
+            is_compaction,
+        };
+
+        let memory_state = MemoryState {
+            data: state.memory.clone(),
+            priorities: state.memory_priorities.clone(),
+            pinned: pinned_memory.clone(),
+        };
+
+        let (result, stdout) = self.interpreter.enter(|vm| {
+            // Must import _harness before into_ref() or the static type cells
+            // remain uninitialized and into_ref() panics with
+            // "static type has not been initialized".
+            if let Err(e) = vm.import("_harness", 0) {
+                let mut s = String::new();
+                vm.write_exception(&mut s, &e).ok();
+                return (Err(s), String::new());
+            }
+
+            // Build pyclass instances carrying this turn's data.
+            let wq = harness::PyWorkQueue {
+                items: Mutex::new(work_items),
+                collector: Mutex::new(Some(collector.clone())),
+            }.into_ref(&vm.ctx);
+            let mem = harness::PyMemory {
+                state: Mutex::new(memory_state),
+                collector: Mutex::new(Some(collector.clone())),
+            }.into_ref(&vm.ctx);
+            let tim = harness::PyTimerManager {
+                timers_info: Mutex::new(timers_info),
+                collector: Mutex::new(Some(collector.clone())),
+            }.into_ref(&vm.ctx);
+            let hist = harness::PyHistoryManager {
+                entries: Mutex::new(history_entries),
+                is_compaction: Mutex::new(is_compaction),
+                collector: Mutex::new(Some(collector.clone())),
+            }.into_ref(&vm.ctx);
+            let har = harness::PyHarness {
+                info: Mutex::new(harness_info),
+                collector: Mutex::new(Some(collector.clone())),
+            }.into_ref(&vm.ctx);
+            let cap = harness::StdoutCapture {
+                buf: Mutex::new(String::new()),
+            }.into_ref(&vm.ctx);
+
+            let scope = vm.new_scope_with_builtins();
+            let g = &scope.globals;
+            g.set_item("_work_queue", wq.into(), vm).ok();
+            g.set_item("_memory", mem.into(), vm).ok();
+            g.set_item("_timers", tim.into(), vm).ok();
+            g.set_item("_history", hist.into(), vm).ok();
+            g.set_item("_harness", har.into(), vm).ok();
+            g.set_item("_stdout_capture", cap.clone().into(), vm).ok();
+
+            let run = |src: &str, name: &str| -> Result<(), String> {
+                run_code(vm, &scope, src, name).map_err(|e| {
+                    let mut s = String::new();
+                    vm.write_exception(&mut s, &e).ok();
+                    s
+                })
+            };
+
+            let res = (|| -> Result<(), String> {
+                run(PREAMBLE, "<preamble>")?;
+                if is_compaction {
+                    run(COMPACTION_PREAMBLE, "<compaction_preamble>")?;
+                }
+                run(code, "<agent>")?;
+
+                if is_compaction {
+                    if let Ok(Some(script_val)) = scope.globals.get_item_opt("compaction_script", vm) {
+                        if let Ok(script) = String::try_from_object(vm, script_val) {
+                            if !script.is_empty() {
+                                collector.lock().unwrap().compaction_script_appends.push(script);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })();
+
+            let stdout = cap.buf.lock().unwrap().clone();
+            (res, stdout)
         });
-        f(interp)
-    })
+
+        let side_effects = match Arc::try_unwrap(collector) {
+            Ok(mutex) => mutex.into_inner().unwrap(),
+            Err(arc) => std::mem::take(&mut *arc.lock().unwrap()),
+        };
+
+        match result {
+            Ok(()) => ExecutionResult {
+                stdout,
+                is_error: false,
+                error_text: String::new(),
+                side_effects,
+            },
+            Err(error_text) => ExecutionResult {
+                stdout,
+                is_error: true,
+                error_text,
+                side_effects: SideEffectCollector::default(),
+            },
+        }
+    }
 }
 
-pub fn initialize_python() {
-    with_interpreter(|_| ());
-}
-
-pub fn execute(
-    state: &HarnessState,
-    code: &str,
-    is_compaction: bool,
-    process_outputs: &HashMap<String, String>,
-) -> ExecutionResult {
-    execute_with_timeout(state, code, is_compaction, process_outputs, 5, 1, "root", "root", &HashMap::new())
-}
-
-pub fn execute_with_timeout(
-    state: &HarnessState,
-    code: &str,
-    is_compaction: bool,
-    process_outputs: &HashMap<String, String>,
-    timeout_secs: u64,
-    child_depth_remaining: u32,
-    agent_name: &str,
-    agent_lineage: &str,
-    pinned_memory: &HashMap<String, String>,
-) -> ExecutionResult {
-    // TODO: timeout/interrupt. RustPython has vm.set_interrupt() — needs a
-    // thread-based wrapper similar to python.rs's. For now, run synchronously
-    // and ignore timeout_secs.
-    let _ = timeout_secs;
-
-    execute_inner(
-        state, code, is_compaction, process_outputs, child_depth_remaining,
-        agent_name, agent_lineage, pinned_memory,
-    )
+impl Default for Executor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn run_code(vm: &VirtualMachine, scope: &vm::scope::Scope, source: &str, name: &str) -> PyResult<()> {
@@ -1231,160 +1445,34 @@ fn run_code(vm: &VirtualMachine, scope: &vm::scope::Scope, source: &str, name: &
     Ok(())
 }
 
-fn execute_inner(
-    state: &HarnessState,
-    code: &str,
-    is_compaction: bool,
-    process_outputs: &HashMap<String, String>,
-    child_depth_remaining: u32,
-    agent_name: &str,
-    agent_lineage: &str,
-    pinned_memory: &HashMap<String, String>,
-) -> ExecutionResult {
-    let collector = Arc::new(Mutex::new(SideEffectCollector {
-        id_gen: state.id_generator.clone(),
-        ..Default::default()
-    }));
-    let stdout_buf = Arc::new(Mutex::new(String::new()));
-
-    // Build per-turn context from HarnessState.
-    let work_items: Vec<WorkItemData> = state.work_queue.items()
-        .iter().map(work_item_to_data).collect();
-
-    let timers_info: Vec<(String, String, u8)> = state.timer_manager.list()
-        .iter().map(|t| (t.id.0.clone(), t.description.clone(), t.priority)).collect();
-
-    let mut history_entries = HashMap::new();
-    for entry in state.event_history.entries() {
-        let (code_str, output_str, time_str) = match entry {
-            HistoryEntry::Execution { code, output, time, .. } => (
-                code.clone(), output.clone(),
-                time.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
-            ),
-            HistoryEntry::Summary { description, time, .. } => (
-                String::new(), description.clone(),
-                time.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
-            ),
-            HistoryEntry::SystemAlert { message, time, .. } => (
-                String::new(), message.clone(),
-                time.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
-            ),
-        };
-        history_entries.insert(entry.id().0.clone(), HistoryEntryData {
-            code: code_str, output: output_str.clone(),
-            full_output: output_str, time: time_str,
-        });
-    }
-
-    let process_statuses: HashMap<String, String> = state.process_manager.processes()
-        .iter().map(|p| {
-            let status = match &p.status {
-                ProcessStatus::Running => "running",
-                ProcessStatus::Completed { .. } => "completed",
-                ProcessStatus::Failed { .. } => "failed",
-            };
-            (p.id.0.clone(), status.to_string())
-        }).collect();
-
-    let process_info: Vec<(String, String, String, String)> = state.process_manager.processes()
-        .iter().map(|p| {
-            let status = match &p.status {
-                ProcessStatus::Running => "running".to_string(),
-                ProcessStatus::Completed { exit_code } => format!("completed (exit {})", exit_code),
-                ProcessStatus::Failed { error } => format!("failed: {}", error),
-            };
-            (p.id.0.clone(), p.cmd.clone(), p.description.clone(), status)
-        }).collect();
-
-    let ctx = ExecContext {
-        collector: collector.clone(),
-        work_items,
-        memory_data: state.memory.clone(),
-        memory_priorities: state.memory_priorities.clone(),
-        pinned_memory: pinned_memory.clone(),
-        timers_info,
-        history_entries,
-        process_outputs: process_outputs.clone(),
-        process_statuses,
-        process_info,
-        child_depth_remaining,
-        agent_name: agent_name.to_string(),
-        agent_lineage: agent_lineage.to_string(),
-        harness_bin: std::env::current_exe()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "claude-server".into()),
-        is_compaction,
-        stdout_buf: stdout_buf.clone(),
-    };
-
-    // Install context, run, then tear down.
-    EXEC_CTX.with(|cell| *cell.borrow_mut() = Some(ctx));
-
-    let result: Result<(), String> = with_interpreter(|interp| interp.enter(|vm| {
-        let scope = vm.new_scope_with_builtins();
-
-        let run = |src: &str, name: &str| -> Result<(), String> {
-            run_code(vm, &scope, src, name).map_err(|e| {
-                let mut s = String::new();
-                vm.write_exception(&mut s, &e).ok();
-                s
-            })
-        };
-
-        run(PREAMBLE, "<preamble>")?;
-        if is_compaction {
-            run(COMPACTION_PREAMBLE, "<compaction_preamble>")?;
-        }
-        run(code, "<agent>")?;
-
-        // Read back compaction_script if set.
-        if is_compaction {
-            if let Ok(Some(script_val)) = scope.globals.get_item_opt("compaction_script", vm) {
-                if let Ok(script) = String::try_from_object(vm, script_val) {
-                    if !script.is_empty() {
-                        collector.lock().unwrap().compaction_script_appends.push(script);
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }));
-
-    EXEC_CTX.with(|cell| *cell.borrow_mut() = None);
-
-    let stdout = stdout_buf.lock().unwrap().clone();
-    let side_effects = match Arc::try_unwrap(collector) {
-        Ok(mutex) => mutex.into_inner().unwrap(),
-        Err(arc) => std::mem::take(&mut *arc.lock().unwrap()),
-    };
-
-    match result {
-        Ok(()) => ExecutionResult {
-            stdout,
-            is_error: false,
-            error_text: String::new(),
-            side_effects,
-        },
-        Err(error_text) => ExecutionResult {
-            stdout,
-            is_error: true,
-            error_text,
-            side_effects: SideEffectCollector::default(),
-        },
-    }
-}
-
 // ---- Tests ----
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn exec(state: &HarnessState, code: &str) -> ExecutionResult {
+        Executor::new().execute(state, code, false, &HashMap::new())
+    }
+
+    fn exec_full(
+        state: &HarnessState,
+        code: &str,
+        timeout: u64,
+        depth: u32,
+        name: &str,
+        lineage: &str,
+        pinned: &HashMap<String, String>,
+    ) -> ExecutionResult {
+        Executor::new().execute_with_timeout(
+            state, code, false, &HashMap::new(), timeout, depth, name, lineage, pinned,
+        )
+    }
+
     #[test]
     fn test_basic_print() {
         let state = HarnessState::new(200_000, 16384);
-        let result = execute(&state, "print('hello world')", false, &HashMap::new());
+        let result = exec(&state, "print('hello world')");
         assert!(!result.is_error, "Error: {}", result.error_text);
         assert_eq!(result.stdout.trim(), "hello world");
     }
@@ -1394,17 +1482,12 @@ mod tests {
         let mut state = HarnessState::new(200_000, 16384);
         state.memory.insert("key1".to_string(), serde_json::json!("val1"));
 
-        let result = execute(
-            &state,
-            r#"
+        let result = exec(&state, r#"
 assert memory["key1"] == "val1"
 memory["key2"] = "val2"
 assert "key1" in memory
 print("ok")
-"#,
-            false,
-            &HashMap::new(),
-        );
+"#);
         assert!(!result.is_error, "Error: {}", result.error_text);
         assert_eq!(result.stdout.trim(), "ok");
         assert_eq!(result.side_effects.memory_sets.len(), 1);
@@ -1413,76 +1496,449 @@ print("ok")
     }
 
     #[test]
-    fn test_send_message() {
+    fn test_memory_structured_values() {
         let state = HarnessState::new(200_000, 16384);
-        let result = execute(&state, r#"send_message("chat1", "hello")"#, false, &HashMap::new());
+        let result = exec(&state, r#"
+memory["s"] = "hello"
+memory["n"] = 42
+memory["d"] = {"pid": "abc", "chat_id": "xyz"}
+memory["l"] = ["a", "b", "c"]
+memory["b"] = True
+
+assert memory["s"] == "hello"
+assert memory["n"] == 42
+assert memory["d"]["pid"] == "abc"
+assert memory["l"][1] == "b"
+assert memory["b"] == True
+
+assert memory.get("s") == "hello"
+assert memory.get("missing") is None
+assert memory.get("missing", "fallback") == "fallback"
+
+print("all passed")
+"#);
         assert!(!result.is_error, "Error: {}", result.error_text);
-        assert_eq!(result.side_effects.messages.len(), 1);
-        assert_eq!(result.side_effects.messages[0].chat_id, "chat1");
-        assert_eq!(result.side_effects.messages[0].content, "hello");
+        assert_eq!(result.stdout.trim(), "all passed");
+        assert_eq!(result.side_effects.memory_sets.len(), 5);
     }
 
     #[test]
-    fn test_shell_exec() {
+    fn test_timer_add_returns_id() {
         let state = HarnessState::new(200_000, 16384);
-        let result = execute(
-            &state,
-            r#"pid = shell_exec("echo", args=["hi"], description="test")
-print(pid)"#,
-            false,
-            &HashMap::new(),
+        let result = exec(&state, r#"
+tid = timers.add(every=30, priority=6, description="test timer")
+print(tid)
+"#);
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert!(!result.stdout.trim().is_empty());
+        assert_eq!(result.side_effects.timer_adds.len(), 1);
+    }
+
+    #[test]
+    fn test_work_queue_pop() {
+        let mut state = HarnessState::new(200_000, 16384);
+        let mut id_gen = IdGenerator::new();
+        state.work_queue.push(WorkItem {
+            id: id_gen.next(),
+            priority: 9,
+            time: chrono::Utc::now(),
+            item_type: WorkItemType::UserMessage {
+                chat_id: "test".to_string(),
+                user: "user@test.com".to_string(),
+                content: "Hello!".to_string(),
+                message_ref: None,
+            },
+            attachments: Vec::new(),
+        });
+
+        let result = exec(&state, r#"
+item = work_queue[0]
+print(item.content)
+work_queue.pop_front()
+"#);
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert_eq!(result.stdout.trim(), "Hello!");
+        assert_eq!(result.side_effects.queue_removes.len(), 1);
+    }
+
+    #[test]
+    fn test_error_handling() {
+        let state = HarnessState::new(200_000, 16384);
+        let result = exec(&state, "undefined_variable");
+        assert!(result.is_error);
+        assert!(
+            result.error_text.contains("NameError"),
+            "Expected NameError in: '{}'",
+            result.error_text,
         );
+    }
+
+    #[test]
+    fn test_shell_exec_returns_id() {
+        let state = HarnessState::new(200_000, 16384);
+        let result = exec(&state, r#"
+pid = shell_exec("echo", ["hello"])
+print(pid)
+memory["my_pid"] = pid
+"#);
         assert!(!result.is_error, "Error: {}", result.error_text);
         assert_eq!(result.side_effects.process_starts.len(), 1);
-        assert_eq!(result.side_effects.process_starts[0].cmd, "echo");
-        assert_eq!(result.side_effects.process_starts[0].args, vec!["hi"]);
+        assert_eq!(result.side_effects.memory_sets.len(), 1);
+    }
+
+    #[test]
+    fn test_send_message() {
+        let state = HarnessState::new(200_000, 16384);
+        let result = exec(&state, r#"send_message("chat1", "Hello from Claude!")"#);
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert_eq!(result.side_effects.messages.len(), 1);
+        assert_eq!(result.side_effects.messages[0].chat_id, "chat1");
+    }
+
+    #[test]
+    fn test_one_shot_timer_with_datetime() {
+        let state = HarnessState::new(200_000, 16384);
+        let result = exec(&state, r#"
+tid = timers.add(at=datetime(2026, 2, 1, 17, 0, 0), priority=8, description="dinner reminder")
+print(tid)
+"#);
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert_eq!(result.side_effects.timer_adds.len(), 1);
+        assert!(result.side_effects.timer_adds[0].at_epoch.is_some());
+        assert!(result.side_effects.timer_adds[0].every_secs.is_none());
+        let epoch = result.side_effects.timer_adds[0].at_epoch.unwrap();
+        assert!(epoch > 1_700_000_000.0, "epoch {} too small", epoch);
+    }
+
+    #[test]
+    fn test_memory_priority() {
+        let state = HarnessState::new(200_000, 16384);
+        let result = exec_full(&state, r#"
+memory["key1"] = "value1"
+assert memory.get_priority("key1") == 5
+
+memory.set("key2", "value2", priority=8)
+assert memory.get_priority("key2") == 8
+
+memory.set_priority("key1", 3)
+assert memory.get_priority("key1") == 3
+
+print("all passed")
+"#, 0, 1, "root", "root", &HashMap::new());
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert_eq!(result.stdout.trim(), "all passed");
+        assert_eq!(result.side_effects.memory_sets.len(), 2);
+        assert_eq!(result.side_effects.memory_priority_sets.len(), 3);
+        assert_eq!(result.side_effects.memory_priority_sets[0], ("key1".to_string(), 5));
+        assert_eq!(result.side_effects.memory_priority_sets[1], ("key2".to_string(), 8));
+        assert_eq!(result.side_effects.memory_priority_sets[2], ("key1".to_string(), 3));
+    }
+
+    #[test]
+    fn test_execution_timeout() {
+        let state = HarnessState::new(200_000, 16384);
+        let start = std::time::Instant::now();
+        let result = exec_full(&state, "while True: pass", 2, 1, "root", "root", &HashMap::new());
+        let elapsed = start.elapsed();
+        assert!(result.is_error, "Should have timed out");
+        assert!(
+            result.error_text.contains("timed out") || result.error_text.contains("KeyboardInterrupt"),
+            "Error should mention timeout or KeyboardInterrupt, got: {}",
+            result.error_text
+        );
+        assert!(elapsed.as_secs() <= 5, "Took too long: {:?}", elapsed);
+    }
+
+    #[test]
+    fn test_fork() {
+        let state = HarnessState::new(200_000, 16384);
+        let result = exec_full(&state, r#"
+fork([
+    ChildSettings(
+        name="test-runner",
+        task="Write tests",
+        model="claude-sonnet-4-5-20250929",
+        max_turns=10,
+    ),
+    ChildSettings(
+        name="linter",
+        task="Run linting",
+    ),
+])
+print("forked")
+"#, 0, 1, "root", "root", &HashMap::new());
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert_eq!(result.stdout.trim(), "forked");
+        assert_eq!(result.side_effects.fork_requests.len(), 1);
+        let req = &result.side_effects.fork_requests[0];
+        assert_eq!(req.children.len(), 2);
+        assert_eq!(req.children[0].name, "test-runner");
+        assert_eq!(req.children[0].task, "Write tests");
+        assert_eq!(req.children[0].model, Some("claude-sonnet-4-5-20250929".to_string()));
+        assert_eq!(req.children[0].max_turns, Some(10));
+        assert_eq!(req.children[1].name, "linter");
+        assert_eq!(req.children[1].task, "Run linting");
+        assert_eq!(req.children[1].model, None);
+        assert_eq!(req.children[1].max_turns, Some(20));
+        assert!(req.children[1].can_compact);
+        assert!(req.children[0].attach.is_empty());
+    }
+
+    #[test]
+    fn test_fork_rejects_root_name() {
+        let state = HarnessState::new(200_000, 16384);
+        let result = exec(&state, r#"fork([ChildSettings(name="root", task="impersonate")])"#);
+        assert!(result.is_error, "fork with name='root' should fail");
+        assert!(
+            result.error_text.contains("reserved"),
+            "Error should mention reserved name: {}",
+            result.error_text
+        );
+    }
+
+    #[test]
+    fn test_view() {
+        let state = HarnessState::new(200_000, 16384);
+        let tmp = std::env::temp_dir().join("claude-server-test-attachment.txt");
+        std::fs::write(&tmp, "test content").unwrap();
+
+        let code = format!(r#"
+view({path:?})
+print("ok")
+"#, path = tmp.to_str().unwrap());
+        let result = exec(&state, &code);
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert_eq!(result.stdout.trim(), "ok");
+        assert_eq!(result.side_effects.view_paths.len(), 1);
+        assert_eq!(result.side_effects.view_paths[0], tmp.to_str().unwrap());
+
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_view_file_not_found() {
+        let state = HarnessState::new(200_000, 16384);
+        let result = exec(&state, r#"view("/nonexistent/path/xyz.jpg")"#);
+        assert!(result.is_error, "Should fail on nonexistent file");
+        assert!(
+            result.error_text.contains("FileNotFoundError")
+                || result.error_text.contains("file not found"),
+            "Error: {}",
+            result.error_text
+        );
+    }
+
+    #[test]
+    fn test_fork_with_attach() {
+        let state = HarnessState::new(200_000, 16384);
+        let result = exec_full(&state, r#"
+fork([
+    ChildSettings(
+        name="investigator",
+        task="Look at this image",
+        attach=["/tmp/snapshot.jpg", "/tmp/metadata.json"],
+    ),
+])
+"#, 0, 1, "root", "root", &HashMap::new());
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        let req = &result.side_effects.fork_requests[0];
+        assert_eq!(req.children.len(), 1);
+        assert_eq!(req.children[0].attach.len(), 2);
+        assert_eq!(req.children[0].attach[0], "/tmp/snapshot.jpg");
+        assert_eq!(req.children[0].attach[1], "/tmp/metadata.json");
+    }
+
+    #[test]
+    fn test_timedelta_in_timer_and_shell_exec() {
+        let state = HarnessState::new(200_000, 16384);
+        let result = exec(&state, r#"
+tid = timers.add(every=timedelta(seconds=30), priority=6, description="test")
+print(tid)
+
+pid = shell_exec("echo", ["hi"], alert_timer=timedelta(minutes=5))
+print(pid)
+
+tid2 = timers.add(every=60, priority=5, description="numeric")
+pid2 = shell_exec("echo", ["hi"], alert_timer=300)
+"#);
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert_eq!(result.side_effects.timer_adds.len(), 2);
+        assert_eq!(result.side_effects.timer_adds[0].every_secs, Some(30));
+        assert_eq!(result.side_effects.timer_adds[1].every_secs, Some(60));
+        assert_eq!(result.side_effects.process_starts.len(), 2);
+        assert_eq!(result.side_effects.process_starts[0].alert_timer_secs, 300);
+        assert_eq!(result.side_effects.process_starts[1].alert_timer_secs, 300);
+    }
+
+    #[test]
+    fn test_message_agent() {
+        let state = HarnessState::new(200_000, 16384);
+        let result = exec(&state, r#"
+message_agent("sibling-a", "check the API status")
+message_agent("sibling-b", "done with my part", priority=9)
+print(agent_name)
+print(agent_lineage)
+"#);
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert_eq!(result.side_effects.agent_messages.len(), 2);
+        assert_eq!(result.side_effects.agent_messages[0].recipient, "sibling-a");
+        assert_eq!(result.side_effects.agent_messages[0].content, "check the API status");
+        assert_eq!(result.side_effects.agent_messages[0].priority, 6);
+        assert_eq!(result.side_effects.agent_messages[1].recipient, "sibling-b");
+        assert_eq!(result.side_effects.agent_messages[1].priority, 9);
+        assert_eq!(result.stdout.trim(), "root\nroot");
+    }
+
+    #[test]
+    fn test_agent_identity_in_child() {
+        let state = HarnessState::new(200_000, 16384);
+        let result = exec_full(&state, r#"
+print(agent_name)
+print(agent_lineage)
+"#, 0, 1, "api-checker", "api-checker, child of plan-builder, child of root", &HashMap::new());
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        let lines: Vec<&str> = result.stdout.trim().lines().collect();
+        assert_eq!(lines[0], "api-checker");
+        assert_eq!(lines[1], "api-checker, child of plan-builder, child of root");
+    }
+
+    #[test]
+    fn test_harness_bin() {
+        let state = HarnessState::new(200_000, 16384);
+        let result = exec(&state, r#"
+print(harness_bin)
+assert isinstance(harness_bin, str) and len(harness_bin) > 0
+"#);
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert!(!result.stdout.trim().is_empty());
+    }
+
+    #[test]
+    fn test_request_compaction() {
+        let state = HarnessState::new(200_000, 16384);
+        let result = exec(&state, "request_compaction()");
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert!(result.side_effects.compaction_requested);
+    }
+
+    #[test]
+    fn test_memory_pin() {
+        let state = HarnessState::new(200_000, 16384);
+        let mut pinned = HashMap::new();
+        pinned.insert("existing".to_string(), "old value".to_string());
+        let result = exec_full(&state, r#"
+print(f"pinned: {memory.list_pinned()}")
+print(f"existing: {memory.get('existing')}")
+print(f"missing: {memory.get('missing')}")
+print(f"contains: {'existing' in memory}")
+
+memory.pin("api_info", "HA API at :8123")
+memory.pin("user_prefs", "Prefers SMS alerts")
+
+memory.unpin("existing")
+"#, 0, 1, "root", "root", &pinned);
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert!(result.stdout.contains("pinned: ['existing']"));
+        assert!(result.stdout.contains("existing: old value"));
+        assert!(result.stdout.contains("missing: None"));
+        assert!(result.stdout.contains("contains: True"));
+        assert_eq!(result.side_effects.memory_pins.len(), 2);
+        assert_eq!(result.side_effects.memory_pins[0].0, "api_info");
+        assert_eq!(result.side_effects.memory_pins[0].1, "HA API at :8123");
+        assert_eq!(result.side_effects.memory_pins[1].0, "user_prefs");
+        assert_eq!(result.side_effects.memory_unpins.len(), 1);
+        assert_eq!(result.side_effects.memory_unpins[0], "existing");
+    }
+
+    #[test]
+    fn test_done_with_result() {
+        let state = HarnessState::new(200_000, 16384);
+        let result = exec(&state, r#"
+done(verdict="all clear", confidence=0.95, details={"camera": "front", "count": 5})
+"#);
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert!(result.side_effects.done_called);
+        assert_eq!(result.side_effects.done_result.len(), 3);
+        assert_eq!(result.side_effects.done_result["verdict"], serde_json::json!("all clear"));
+        assert_eq!(result.side_effects.done_result["confidence"], serde_json::json!(0.95));
+        assert_eq!(result.side_effects.done_result["details"], serde_json::json!({"camera": "front", "count": 5}));
+    }
+
+    #[test]
+    fn test_done_no_args() {
+        let state = HarnessState::new(200_000, 16384);
+        let result = exec(&state, "done()");
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert!(result.side_effects.done_called);
+        assert!(result.side_effects.done_result.is_empty());
+    }
+
+    #[test]
+    fn test_work_item_field_access() {
+        let mut state = HarnessState::new(200_000, 16384);
+        let mut id_gen = IdGenerator::new();
+
+        let mut result_map = HashMap::new();
+        result_map.insert("verdict".to_string(), serde_json::json!("safe"));
+        state.work_queue.push(WorkItem {
+            id: id_gen.next(),
+            priority: 7,
+            time: chrono::Utc::now(),
+            item_type: WorkItemType::ChildAgentCompleted {
+                child_name: "investigator".to_string(),
+                result: result_map,
+                turns_used: 2,
+                success: true,
+                summary: "done".to_string(),
+                cost_usd: 0.0123,
+                cache_hit_pct: 85,
+            },
+            attachments: Vec::new(),
+        });
+
+        let result = exec(&state, r#"
+item = work_queue[0]
+print(item.type)
+print(item.child_name)
+print(item.turns_used)
+print(item.success)
+print(item.result["verdict"])
+try:
+    _ = item.chat_id
+    print("FAIL: should have raised")
+except AttributeError as e:
+    print(f"attr error: {e}")
+"#);
+        assert!(!result.is_error, "Error: {}", result.error_text);
+        assert!(result.stdout.contains("ChildAgentCompleted"));
+        assert!(result.stdout.contains("investigator"));
+        assert!(result.stdout.contains("2"));
+        assert!(result.stdout.contains("True"));
+        assert!(result.stdout.contains("safe"));
+        assert!(result.stdout.contains("has no field 'chat_id'"));
+        assert!(result.stdout.contains("Available fields"));
     }
 
     #[test]
     fn test_error_rolls_back_side_effects() {
         let state = HarnessState::new(200_000, 16384);
-        let result = execute(
-            &state,
-            r#"
+        let result = exec(&state, r#"
 send_message("chat1", "hello")
 raise RuntimeError("boom")
-"#,
-            false,
-            &HashMap::new(),
-        );
+"#);
         assert!(result.is_error);
         assert!(result.error_text.contains("boom"));
         assert_eq!(result.side_effects.messages.len(), 0);
     }
 
     #[test]
-    fn test_timer_add() {
+    fn test_shell_exec_kwargs() {
         let state = HarnessState::new(200_000, 16384);
-        let result = execute(
-            &state,
-            r#"tid = timers.add(every=60, description="ping")
-print(tid)"#,
-            false,
-            &HashMap::new(),
-        );
+        let result = exec(&state, r#"pid = shell_exec("echo", args=["hi"], description="test")
+print(pid)"#);
         assert!(!result.is_error, "Error: {}", result.error_text);
-        assert_eq!(result.side_effects.timer_adds.len(), 1);
-        assert_eq!(result.side_effects.timer_adds[0].every_secs, Some(60));
-        assert_eq!(result.side_effects.timer_adds[0].description, "ping");
-    }
-
-    #[test]
-    fn test_done_with_kwargs() {
-        let state = HarnessState::new(200_000, 16384);
-        let result = execute(
-            &state,
-            r#"done(status="ok", count=42)"#,
-            false,
-            &HashMap::new(),
-        );
-        assert!(!result.is_error, "Error: {}", result.error_text);
-        assert!(result.side_effects.done_called);
-        assert_eq!(result.side_effects.done_result.get("status"), Some(&serde_json::json!("ok")));
-        assert_eq!(result.side_effects.done_result.get("count"), Some(&serde_json::json!(42)));
+        assert_eq!(result.side_effects.process_starts.len(), 1);
+        assert_eq!(result.side_effects.process_starts[0].cmd, "echo");
+        assert_eq!(result.side_effects.process_starts[0].args, vec!["hi"]);
     }
 }

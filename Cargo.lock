@@ -541,6 +541,7 @@ dependencies = [
  "hex",
  "hmac",
  "lettre",
+ "liblzma-sys",
  "mailparse",
  "notify",
  "rand 0.8.5",

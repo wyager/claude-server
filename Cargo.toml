@@ -34,3 +34,7 @@ sha2 = "0.10"
 hex = "0.4"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "builder"] }
 mailparse = "0.15"
+# Force liblzma to build from bundled source — feature unification drops the
+# homebrew dylib dep. (libffi can't be dropped: rustpython-stdlib at rev
+# 3f92c3a has an unconditional libffi dep; would require forking RustPython.)
+liblzma-sys = { version = "0.4", features = ["static"] }

@@ -45,6 +45,7 @@ impl CompactionManager {
     /// re-renders, and estimates tokens as chars/4.
     pub fn estimate_post_compaction(
         &self,
+        executor: &python::Executor,
         state: &HarnessState,
         deployment_context: &str,
         config: &RenderConfig,
@@ -58,7 +59,7 @@ impl CompactionManager {
 
         // Clone state and dry-run the compaction script
         let mut clone = state.clone();
-        let result = python::execute(&clone, &self.script, true, &HashMap::new());
+        let result = executor.execute(&clone, &self.script, true, &HashMap::new());
 
         if !result.is_error {
             // Apply history side effects to the clone
