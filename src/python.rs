@@ -5,7 +5,7 @@
 //!
 //! Architecture:
 //!
-//! - `Executor` owns the `vm::Interpreter` directly (wrapped in `ManuallyDrop`
+//! - `Executor` owns the `vm::Interpreter` directly as a struct field
 //!   to avoid RustPython's Drop-panic on the PyObjectRef graph at teardown).
 //!   No global singleton, no thread-locals.
 //!
@@ -30,7 +30,6 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::mem::ManuallyDrop;
 use std::sync::{mpsc, Arc, Mutex};
 
 use rustpython::InterpreterBuilderExt;
@@ -1171,10 +1170,7 @@ compaction_script = ""
 // ---- Executor ----
 
 pub struct Executor {
-    /// ManuallyDrop: RustPython's Drop impl walks the PyObjectRef graph during
-    /// teardown, which panics inside thread-local destructors. Leaking is
-    /// correct — the OS reclaims at process exit.
-    interpreter: ManuallyDrop<vm::Interpreter>,
+    interpreter: vm::Interpreter,
     /// For sending a KeyboardInterrupt into the VM from a watchdog thread.
     signal_tx: vm::signal::UserSignalSender,
 }
@@ -1189,10 +1185,7 @@ impl Executor {
             .add_native_module(def)
             .init_hook(move |vm| vm.set_user_signal_channel(signal_rx))
             .build();
-        Self {
-            interpreter: ManuallyDrop::new(interpreter),
-            signal_tx,
-        }
+        Self { interpreter, signal_tx }
     }
 
     pub fn execute(
