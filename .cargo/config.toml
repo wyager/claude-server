@@ -1,0 +1,5 @@
+[env]
+# RustPython's frozen-stdlib init recurses deeply during importlib bootstrap.
+# Cargo's default test thread stack (~2MB) overflows with a SIGILL trap.
+# 16MB is plenty and matches what python3 itself allocates.
+RUST_MIN_STACK = "16777216"

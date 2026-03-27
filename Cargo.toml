@@ -4,7 +4,6 @@ version = "0.2.1"
 edition = "2021"
 
 [dependencies]
-pyo3 = { version = "0.28", features = ["auto-initialize", "abi3-py38"] }
 rustpython = { git = "https://github.com/RustPython/RustPython", rev = "3f92c3ad1c5042e2694386e57335b3dbb02c3cde", default-features = false, features = ["threading", "stdlib", "freeze-stdlib", "importlib"] }
 rustpython-vm = { git = "https://github.com/RustPython/RustPython", rev = "3f92c3ad1c5042e2694386e57335b3dbb02c3cde" }
 rusqlite = { version = "0.32", features = ["bundled", "serde_json"] }
