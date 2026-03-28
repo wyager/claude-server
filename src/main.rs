@@ -53,6 +53,15 @@ const AGENT_CHANGELOG: &[(&str, &str)] = &[
 - `watch mqtt --payload=structured` — parse {attachments:[{name,base64}],data:{}}
   from MQTT, decode to --attach-dir, send file paths. No more Python receiver
   needed for camera pipelines. Also --payload=raw for unparsed binary."),
+    ("0.2.2", "\
+- New 'Information Stewardship' section in the system prompt. Review what
+  you've been sharing with other agents (agentchat, message_agent) — your
+  client configured the CHANNEL, not blanket data-sharing. Surveillance
+  observations, location, household patterns are off-limits without
+  authorization. Check your recent cross-agent messages against this.
+- If your client has granted standing authorizations (e.g. 'tell the
+  gardener about packages'), memory.pin() them NOW with explicit scope
+  (who/what/until-when) so they survive compaction."),
 ];
 
 /// Parse "X.Y.Z" into a comparable tuple. Unparseable → (0,0,0) so it sorts

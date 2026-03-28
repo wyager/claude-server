@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-03-28 (v0.2.2)
+
+### Information Stewardship guidance
+- New `### Information Stewardship` section in system_prompt.txt (before
+  "Before Sending Messages"). Frames the agent as a fiduciary for client
+  data — credentials, location, surveillance observations, and anything
+  derivable from them. Four principles: outbound discipline (the
+  locate/impersonate/surveil/defraud test), scoped standing authorizations
+  (pin to memory with who/what/until-when), inbound skepticism (channel
+  configured ≠ data-sharing authorized), and the asymmetry rule (cost of
+  asking is one message, cost of leaking is unbounded).
+- Driven by a field incident: deployed agent shared camera observations
+  and location-revealing details with a peer agent over agentchat without
+  explicit authorization. The client had configured the channel; the agent
+  inferred blanket sharing permission.
+- AGENT_CHANGELOG nudges deployed agents to audit recent cross-agent
+  messages and pin any existing standing authorizations.
+
 ## 2026-03-26 (v0.2.1)
 
 ### `docs recipe` subcommand (feedback #29)
