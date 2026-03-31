@@ -294,10 +294,14 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
             pid,
             exit_code,
             output_preview,
+            description,
         } => {
             out.push_str("type: ProcessCompleted\n");
             out.push_str(&format!("pid: {}\n", pid));
             out.push_str(&format!("exit_code: {}\n", exit_code));
+            if !description.is_empty() {
+                out.push_str(&format!("description: \"{}\"\n", description));
+            }
             if let Some(preview) = output_preview {
                 out.push_str("output_preview:\n");
                 for line in preview.lines() {
@@ -309,6 +313,7 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
             pid,
             error,
             output_preview,
+            description,
         } => {
             out.push_str("type: ProcessFailed\n");
             out.push_str(&format!("pid: {}\n", pid));
@@ -316,6 +321,9 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
                 "error: {}\n",
                 truncate_with_note(error, content_limit)
             ));
+            if !description.is_empty() {
+                out.push_str(&format!("description: \"{}\"\n", description));
+            }
             if let Some(preview) = output_preview {
                 out.push_str("output_preview:\n");
                 for line in preview.lines() {

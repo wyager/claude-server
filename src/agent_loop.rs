@@ -478,11 +478,14 @@ impl AgentLoop {
         // Apply side effects (only if no error)
         let mut done_called = false;
         if !is_error {
-            done_called = exec_result.side_effects.done_called;
+            done_called = exec_result.effects.done_called;
             if done_called {
-                self.done_result = exec_result.side_effects.done_result.clone();
+                self.done_result = exec_result.effects.done_result.clone();
             }
-            match self.apply_side_effects(exec_result.side_effects) {
+            match self.apply_side_effects(
+                exec_result.effects,
+                exec_result.committed_state.expect("committed_state is Some when !is_error"),
+            ) {
                 Ok(deferred) => {
                     self.perform_deferred_ops(deferred).await;
                 }
@@ -571,7 +574,7 @@ impl AgentLoop {
             return;
         }
 
-        let (outcome, effects) = python::run_hooks(
+        let (outcome, commit) = python::run_hooks(
             &self.state.hooks, &item, &self.state,
             Some(self.subscribers.clone()),
         );
@@ -586,7 +589,7 @@ impl AgentLoop {
             python::HookOutcome::Consumed { hook_name } => {
                 let s = self.state.hook_stats.entry(hook_name).or_default();
                 s.fired += 1; s.consumed += 1;
-                let _ = self.apply_hook_effects(effects);
+                self.apply_hook_commit(commit);
             }
             python::HookOutcome::Passed { hook_name, priority, hook_note } => {
                 let s = self.state.hook_stats.entry(hook_name.clone()).or_default();
@@ -597,7 +600,7 @@ impl AgentLoop {
                     // metadata without needing a new field on every variant.
                     item.attachments.push(format!("hook:{}:{}", hook_name, note));
                 }
-                let _ = self.apply_hook_effects(effects);
+                self.apply_hook_commit(commit);
                 self.state.work_queue.push(item);
             }
             python::HookOutcome::Failed { hook_name, error } => {
@@ -612,41 +615,25 @@ impl AgentLoop {
                     item_type: WorkItemType::HookException { hook_name, error, original },
                     attachments: Vec::new(),
                 });
-                let _ = self.apply_hook_effects(effects);
+                self.apply_hook_commit(commit);
             }
         }
     }
 
-    /// Apply the restricted subset of side effects a hook can emit.
-    /// Hooks can't fork/compact/done/etc. — the hook-mode PyHarness raises
-    /// for those — so we only handle memory, timers, processes, messages.
-    fn apply_hook_effects(&mut self, effects: python::SideEffectCollector) -> Result<()> {
-        self.state.id_generator = effects.id_gen;
-        for (k, v) in effects.memory_sets {
-            self.state.memory.insert(k, v);
-        }
-        for k in effects.memory_deletes {
-            self.state.memory.remove(&k);
-        }
-        for (k, p) in effects.memory_priority_sets {
-            self.state.memory_priorities.insert(k, p);
-        }
-        for req in effects.timer_adds {
-            self.state.timer_manager.add(build_timer(req));
-        }
-        for id in effects.timer_cancels {
-            self.state.timer_manager.cancel(&AgentId(id));
-        }
-        for id in effects.timer_acks {
-            self.state.timer_manager.acknowledge(&AgentId(id));
-        }
-        for req in effects.process_starts {
+    /// Apply a hook's commit: swap in its mutated memory/id_gen, then apply
+    /// the external half (OS spawns, broadcasts). Hooks don't touch
+    /// work_queue/timers/history/hooks so those aren't part of the commit.
+    fn apply_hook_commit(&mut self, commit: Option<python::HookCommit>) {
+        let Some(commit) = commit else { return };
+        self.state.memory = commit.memory;
+        self.state.memory_priorities = commit.memory_priorities;
+        self.state.id_generator = commit.id_generator;
+        for req in commit.process_starts {
             if let Err(e) = self.process_supervisor.spawn(req) {
                 eprintln!("[{}] hook process spawn failed: {}", self.name, e);
             }
         }
-        // Messages: reuse the normal path so subscriber checks apply.
-        for msg in effects.messages {
+        for msg in commit.messages {
             let id = self.db.save_outbound_message(&msg.chat_id, &msg.content, &msg.attachments)
                 .unwrap_or(0);
             self.broadcast(crate::http_server::BroadcastMsg::Message {
@@ -658,7 +645,6 @@ impl AgentLoop {
                 react_to: msg.react_to,
             });
         }
-        Ok(())
     }
 
     /// `!hooks list|disable NAME|clear` — bypasses all hooks, handled in Rust.
@@ -756,12 +742,12 @@ impl AgentLoop {
             }
             HarnessEvent::Process(pe) => match pe {
                 ProcessEvent::Completed { pid, exit_code } => {
-                    let prio = self
+                    let (prio, description) = self
                         .state
                         .process_manager
                         .get(&pid)
-                        .map(|p| p.success_prio)
-                        .unwrap_or(5);
+                        .map(|p| (p.success_prio, p.description.clone()))
+                        .unwrap_or((5, String::new()));
                     if let Some(p) = self.state.process_manager.get_mut(&pid) {
                         p.status = ProcessStatus::Completed { exit_code };
                     }
@@ -775,17 +761,18 @@ impl AgentLoop {
                             pid,
                             exit_code,
                             output_preview,
+                            description,
                         },
                         attachments: Vec::new(),
                     });
                 }
                 ProcessEvent::Failed { pid, error } => {
-                    let prio = self
+                    let (prio, description) = self
                         .state
                         .process_manager
                         .get(&pid)
-                        .map(|p| p.fail_prio)
-                        .unwrap_or(7);
+                        .map(|p| (p.fail_prio, p.description.clone()))
+                        .unwrap_or((7, String::new()));
                     if let Some(p) = self.state.process_manager.get_mut(&pid) {
                         p.status = ProcessStatus::Failed {
                             error: error.clone(),
@@ -801,6 +788,7 @@ impl AgentLoop {
                             pid,
                             error,
                             output_preview,
+                            description,
                         },
                         attachments: Vec::new(),
                     });
@@ -949,9 +937,11 @@ impl AgentLoop {
     /// case NO side effects have been applied (atomic rollback).
     fn apply_side_effects(
         &mut self,
-        effects: python::SideEffectCollector,
+        effects: python::ExternalEffects,
+        committed: HarnessState,
     ) -> Result<DeferredOps, String> {
-        // Validate all agent message recipients BEFORE applying anything
+        // Validate all agent message recipients BEFORE committing anything —
+        // this is the one case where a returned-Err rolls back the whole turn.
         for msg in &effects.agent_messages {
             if !self.registry.exists(&msg.recipient) {
                 return Err(format!(
@@ -961,97 +951,29 @@ impl AgentLoop {
             }
         }
 
+        // Commit the mutated clone. Memory, work_queue, timers, hooks,
+        // history, process bookkeeping, id_generator — all already mutated
+        // in place inside the pyclass Mutex<T> fields during execution.
+        // hook_stats is preserved from the pre-turn state (the script can't
+        // touch it), but we need to drop stats for hooks the script removed.
+        let old_hook_names: std::collections::HashSet<String> =
+            self.state.hooks.iter().map(|h| h.name.clone()).collect();
+        self.state = committed;
+        let new_hook_names: std::collections::HashSet<&str> =
+            self.state.hooks.iter().map(|h| h.name.as_str()).collect();
+        for gone in old_hook_names.difference(
+            &new_hook_names.iter().map(|s| s.to_string()).collect()
+        ) {
+            self.state.hook_stats.remove(gone);
+        }
+
         let mut deferred = DeferredOps::default();
 
-        // Update ID generator
-        self.state.id_generator = effects.id_gen;
-
-        // Memory operations
-        for (key, value) in effects.memory_sets {
-            self.state.memory.insert(key, value);
-        }
-        for key in effects.memory_deletes {
-            self.state.memory.remove(&key);
-            self.state.memory_priorities.remove(&key);
-        }
-        for (key, priority) in effects.memory_priority_sets {
-            self.state.memory_priorities.insert(key, priority);
-        }
-
-        // Queue removes
-        for id in effects.queue_removes {
-            self.state.work_queue.remove(&AgentId(id));
-        }
-
-        // Timer operations
-        for req in effects.timer_adds {
-            self.state.timer_manager.add(build_timer(req));
-        }
-        for id in effects.timer_cancels {
-            self.state.timer_manager.cancel(&AgentId(id));
-        }
-
-        // Timer acknowledgments
-        for id in effects.timer_acks {
-            self.state.timer_manager.acknowledge(&AgentId(id));
-        }
-
-        // Hook registration (replaces old QueueFilter mechanism). Sort once
-        // after all modifications — hooks change rarely, events arrive often,
-        // so paying the sort here keeps the per-event iteration a plain scan.
-        let hooks_changed = !effects.hook_adds.is_empty() || !effects.hook_removes.is_empty();
-        for hook in effects.hook_adds {
-            self.state.hooks.retain(|h| h.name != hook.name);
-            self.state.hooks.push(hook);
-        }
-        for name in effects.hook_removes {
-            self.state.hooks.retain(|h| h.name != name);
-            self.state.hook_stats.remove(&name);
-        }
-        if hooks_changed {
-            self.state.hooks.sort_by(|a, b| b.priority.cmp(&a.priority));
-        }
-
-        // History operations
-        for id in effects.history_removes {
-            let aid = AgentId(id);
-            if self.state.event_history.is_modifiable(&aid) || self.compaction.active {
-                self.state.event_history.remove(&aid);
-            }
-        }
-        for (id, desc) in effects.history_replaces {
-            let aid = AgentId(id);
-            if self.state.event_history.is_modifiable(&aid) || self.compaction.active {
-                self.state.event_history.replace_with_summary(&aid, desc);
-            }
-        }
-        for text in effects.history_adds {
-            if self.compaction.active {
-                let id = self.state.id_generator.next();
-                self.state.event_history.push(HistoryEntry::Summary {
-                    id,
-                    time: Utc::now(),
-                    description: text,
-                });
-            }
-        }
-
-        // Process starts
+        // Process starts: the ManagedProcess bookkeeping entries are already
+        // in state.process_manager (shell_exec added them same-turn). Here we
+        // do the actual OS spawn — the part that can fail and can't be rolled
+        // back by dropping a clone.
         for req in effects.process_starts {
-            let managed = ManagedProcess {
-                id: req.id.clone(),
-                cmd: req.cmd.clone(),
-                args: req.args.clone(),
-                env: req.env.clone(),
-                description: req.description.clone(),
-                status: ProcessStatus::Running,
-                success_prio: req.success_prio,
-                fail_prio: req.fail_prio,
-                started_at: Utc::now(),
-                os_pid: None,
-            };
-            self.state.process_manager.add(managed);
-
             let block_for_ms = req.block_for_ms;
             match self.process_supervisor.spawn(req.clone()) {
                 Ok(completion_rx) => {
@@ -1075,6 +997,7 @@ impl AgentLoop {
                             pid: req.id,
                             error: format!("spawn failed: {}", e),
                             output_preview: None,
+                            description: req.description,
                         },
                         attachments: Vec::new(),
                     });
@@ -1413,7 +1336,8 @@ impl AgentLoop {
             });
         }
 
-        // Pinned memory (shared, cached in system prompt)
+        // Pinned memory (shared, cached in system prompt) — SQLite writes,
+        // shared across agents, can't roll back by dropping a clone.
         for (key, content) in effects.memory_pins {
             if let Err(e) = self.db.save_pin(&key, &content) {
                 eprintln!("[{}] Failed to pin '{}': {}", self.name, key, e);
@@ -1422,13 +1346,6 @@ impl AgentLoop {
         for key in effects.memory_unpins {
             if let Err(e) = self.db.delete_pin(&key) {
                 eprintln!("[{}] Failed to unpin '{}': {}", self.name, key, e);
-            }
-        }
-        for (key, sensitive) in effects.sensitive_marks {
-            if sensitive {
-                self.state.sensitive_keys.insert(key);
-            } else {
-                self.state.sensitive_keys.remove(&key);
             }
         }
 
@@ -1475,22 +1392,13 @@ impl AgentLoop {
                     is_error: true,
                 });
             } else {
-                for id in compact_result.side_effects.history_removes {
-                    self.state.event_history.remove(&AgentId(id));
-                }
-                for (id, desc) in compact_result.side_effects.history_replaces {
-                    self.state
-                        .event_history
-                        .replace_with_summary(&AgentId(id), desc);
-                }
-                for text in compact_result.side_effects.history_adds {
-                    let id = self.state.id_generator.next();
-                    self.state.event_history.push(HistoryEntry::Summary {
-                        id,
-                        time: Utc::now(),
-                        description: text,
-                    });
-                }
+                // The compaction script ran against a clone of self.state and
+                // mutated its event_history in place. Commit just that piece
+                // (plus the id_generator, which history.add advanced).
+                let c = compact_result.committed_state
+                    .expect("committed_state is Some when !is_error");
+                self.state.event_history = c.event_history;
+                self.state.id_generator = c.id_generator;
 
                 // Remove the Compaction work item
                 let compaction_items: Vec<AgentId> = self
@@ -1625,30 +1533,3 @@ async fn run_child_agent_loop(
     });
 }
 
-/// Shared Timer construction from TimerAddRequest — used by both the main
-/// apply_side_effects and apply_hook_effects.
-fn build_timer(req: python::TimerAddRequest) -> Timer {
-    let schedule = if let Some(secs) = req.every_secs {
-        TimerSchedule::Recurring {
-            every: Duration::from_secs(secs),
-            next_fire: Utc::now()
-                + chrono::Duration::from_std(Duration::from_secs(secs))
-                    .unwrap_or(chrono::Duration::seconds(1)),
-        }
-    } else if let Some(epoch) = req.at_epoch {
-        TimerSchedule::OneShot {
-            at: chrono::DateTime::from_timestamp(epoch as i64, 0)
-                .unwrap_or_else(|| Utc::now() + chrono::Duration::minutes(1)),
-        }
-    } else {
-        TimerSchedule::OneShot { at: Utc::now() + chrono::Duration::minutes(1) }
-    };
-    Timer {
-        id: req.id,
-        description: req.description,
-        priority: req.priority,
-        schedule,
-        created_at: Utc::now(),
-        pending_ack: false,
-    }
-}

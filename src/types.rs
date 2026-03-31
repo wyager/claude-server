@@ -92,12 +92,19 @@ pub enum WorkItemType {
         exit_code: i32,
         #[serde(skip_serializing_if = "Option::is_none")]
         output_preview: Option<String>,
+        /// The description set at shell_exec time. Looked up from
+        /// ProcessManager by pid when the completion event arrives, so
+        /// hooks can correlate a completion back to what spawned it.
+        #[serde(default)]
+        description: String,
     },
     ProcessFailed {
         pid: AgentId,
         error: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         output_preview: Option<String>,
+        #[serde(default)]
+        description: String,
     },
     ProcessTimeout {
         pid: AgentId,
