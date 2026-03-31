@@ -628,6 +628,12 @@ impl AgentLoop {
         self.state.memory = commit.memory;
         self.state.memory_priorities = commit.memory_priorities;
         self.state.id_generator = commit.id_generator;
+        // Hook's process_manager started empty — every entry was added by the
+        // hook's shell_exec. Append them so ProcessCompleted→description
+        // lookup works for the chain pattern.
+        for p in commit.process_manager.into_processes() {
+            self.state.process_manager.add(p);
+        }
         for req in commit.process_starts {
             if let Err(e) = self.process_supervisor.spawn(req) {
                 eprintln!("[{}] hook process spawn failed: {}", self.name, e);

@@ -541,7 +541,7 @@ pub struct ManagedProcess {
     pub os_pid: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProcessManager {
     processes: Vec<ManagedProcess>,
 }
@@ -567,6 +567,13 @@ impl ProcessManager {
 
     pub fn processes(&self) -> &[ManagedProcess] {
         &self.processes
+    }
+
+    /// Consume and yield all entries. Used to merge a hook's process_manager
+    /// (which started empty, so contains only hook-created entries) into the
+    /// real state.
+    pub fn into_processes(self) -> Vec<ManagedProcess> {
+        self.processes
     }
 }
 

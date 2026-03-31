@@ -169,6 +169,12 @@ pub struct HookCommit {
     pub id_generator: IdGenerator,
     pub messages: Vec<OutboundMessageRequest>,
     pub process_starts: Vec<ProcessStartRequest>,
+    /// ManagedProcess entries the hook added via shell_exec. The hook's
+    /// PyHarness starts with an empty ProcessManager, so every entry here
+    /// was created by the hook — safe to append to self.state.process_manager
+    /// on commit. Without this, the ProcessCompleted → description lookup
+    /// finds nothing and the chain pattern breaks.
+    pub process_manager: ProcessManager,
 }
 
 // ---- #[pyclass] Types ----
@@ -1322,6 +1328,13 @@ fn run_hooks_inner(
     let commit = {
         let m = py_memory.borrow(py);
         let mut inner = std::mem::take(&mut *m.inner.lock().unwrap());
+        // Extract process_manager in its own scope so the MutexGuard drops
+        // before the PyRef — otherwise the guard's Drop outlives the borrow.
+        let process_manager = {
+            let h = harness.borrow(py);
+            let mut pm = h.process_manager.lock().unwrap();
+            std::mem::take(&mut *pm)
+        };
         let mut eff = std::mem::take(&mut *effects.lock().unwrap());
         HookCommit {
             memory: std::mem::take(&mut inner.data),
@@ -1329,6 +1342,7 @@ fn run_hooks_inner(
             id_generator: std::mem::take(&mut *id_gen.lock().unwrap()),
             messages: std::mem::take(&mut eff.messages),
             process_starts: std::mem::take(&mut eff.process_starts),
+            process_manager,
         }
     };
 
