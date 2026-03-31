@@ -37,8 +37,8 @@ exist on that variant raises `AttributeError` listing the available fields.
 |---|---|
 | `UserMessage` | `chat_id`, `user`, `content`, `message_ref` (bridge-native ID for reactions) |
 | `TimerFired` | `timer_id`, `every` (seconds int or None), `description` |
-| `ProcessCompleted` | `pid`, `exit_code`, `output_preview` (str or None) |
-| `ProcessFailed` | `pid`, `error`, `output_preview` (str or None) |
+| `ProcessCompleted` | `pid`, `exit_code`, `output_preview` (str or None), `description` |
+| `ProcessFailed` | `pid`, `error`, `output_preview` (str or None), `description` |
 | `ProcessTimeout` | `pid` |
 | `ChildAgentCompleted` | `child_name`, `result` (dict from `done(...)`), `turns_used`, `success`, `summary`, `cost_usd`, `cache_hit_pct` |
 | `AgentMessage` | `from_agent`, `content` |

@@ -1,5 +1,41 @@
 # Changelog
 
+## 2026-03-30 (v0.2.5)
+
+### Clone-and-mutate: read-after-write works everywhere
+- **Architecture change**: per-turn, clone `HarnessState`, move components
+  into pyclass `Mutex<T>` fields, mutate directly, extract on commit.
+  External effects (OS spawn, broadcast, fork, SQLite pin) still deferred —
+  can't roll back by dropping a clone.
+- `SideEffectCollector` → `ExternalEffects` (external-only).
+  `apply_side_effects` shrinks ~180→60 lines. All the in-state replay
+  loops (`memory_sets`, `timer_adds`, `hook_adds`, etc.) deleted.
+- **`list_hooks()` reads the same Mutex `register_hook()` writes to** — the
+  merge logic that faked this is gone. Same for `processes_list()`,
+  `memory.get()`, `timers.list()`. Live-agent trial: agent expected empty
+  (old behavior), got all 3 hooks. Surprised by correctness.
+- `IdGenerator` shared via `Arc<Mutex<>>` between PyTimers and PyHarness.
+  `TimerManager` too (acknowledge_timer lives on PyHarness).
+- `shell_exec`: adds `ManagedProcess` to txn's process_manager same-turn
+  (so `processes_list()` shows it), defers only the OS spawn.
+  `ProcessStartRequest.success_prio` dead code — removed.
+- Commit: `1e2497b`, net -117 LOC in agent_loop.rs. 63/63 tests.
+
+### ProcessCompleted/Failed carry `description` — chain pattern unblocked
+- `WorkItemType::ProcessCompleted` and `ProcessFailed` gain `description`:
+  the string passed to `shell_exec(description=...)`. Looked up from
+  `process_manager` by pid when the completion event arrives.
+- **`HookCommit.process_manager`**: hook's shell_exec adds a ManagedProcess
+  entry to its txn's process_manager. Now committed back on success so the
+  later description lookup works. Without this, chain was dead — trial
+  agent independently diagnosed it: *"shell_exec() called from within a
+  hook may not be preserving the description parameter."*
+- Live-agent trial confirms: probe-spawn → ProcessCompleted carries
+  `description: "chain:echo FAIL happened"` → probe-triage matched →
+  hook_note landed as `attachments: [hook:probe-triage:FAIL detected in output]`.
+  OK result consumed (never appeared in any queue). Zero API calls for the
+  happy path.
+
 ## 2026-03-30 (v0.2.4)
 
 ### Event hooks — API-free local handling (feedback #32 part 2)

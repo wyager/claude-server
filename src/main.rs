@@ -86,6 +86,15 @@ const AGENT_CHANGELOG: &[(&str, &str)] = &[
     register_hook('spam', 0, \"'BUY NOW' in e.get('content','')\", 'return None')
 - feedback --agent-personal-name 'debian-camera' — per-deployment identifier
   so the feedback server can tell which 'root' is which."),
+    ("0.2.5", "\
+- list_hooks() now shows hooks registered THIS TURN. Same for
+  processes_list(), memory reads, timers.list — read-after-write works
+  everywhere. If you expected empty lists after register/set, update.
+- ProcessCompleted/ProcessFailed now carry 'description' (what you
+  passed to shell_exec). The chain pattern works: hook A spawns with
+  description='chain:foo', hook B matches
+  e.get('description','').startswith('chain:'). Before, description was
+  empty and the chain was dead."),
 ];
 
 /// Parse "X.Y.Z" into a comparable tuple. Unparseable → (0,0,0) so it sorts

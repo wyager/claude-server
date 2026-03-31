@@ -54,7 +54,7 @@ See `INTERPRETER.md` for details on the Python integration.
 | `config.rs` | Config from env vars (`ANTHROPIC_API_KEY`, model, ports, paths) |
 | `types.rs` | Core types: WorkQueue, EventHistory, TimerManager, ProcessManager, Memory, HarnessState, API request/response types |
 | `core_loop.rs` | Thin wrapper: creates an `AgentLoop` with parent permissions and runs it |
-| `python.rs` | PyO3 executor: #[pyclass] wrappers for work_queue, memory, timers, history, harness functions. SideEffectCollector pattern. |
+| `python.rs` | PyO3 executor: #[pyclass] wrappers owning `Mutex<T>` of cloned state components. Clone-and-mutate for transactional semantics; ExternalEffects for irreversible ops. Hook executor. |
 | `renderer.rs` | Serialize HarnessState into XML-formatted context text for the API call |
 | `api_client.rs` | Claude Messages API client (reqwest, retry logic, tool_use extraction) |
 | `db.rs` | SQLite persistence (state as JSON blob, process output, outbound messages) |
@@ -81,16 +81,24 @@ and return results via work queue items. Built-in Python tools must execute in
 microseconds. This is why there's no `http_get()` — use `shell_exec("curl", ...)`
 with `block_for` instead.
 
-**Side effect collection**: Python scripts don't execute side effects directly.
-All mutations (memory writes, timer creates, message sends, process spawns) are
-collected into a `SideEffectCollector` during execution. If the script crashes,
-nothing is applied. On success, `core_loop::apply_side_effects()` applies them
-atomically to the authoritative state.
+**Clone-and-mutate**: Per-turn, clone `HarnessState`, move components into
+pyclass `Mutex<T>` fields (PyMemory owns the HashMap, PyWorkQueue owns the
+WorkQueue, etc.). Mutations happen directly on the clone — `memory[k]=v` locks
+and inserts, `list_hooks()` reads the same Mutex `register_hook()` wrote to.
+Read-after-write works without any snapshot/collector divergence. On commit,
+`Py::borrow()` + `mem::take()` extract the mutated components back into state.
+On error, clone drops — original untouched.
 
-**Synchronous ID assignment**: The `SideEffectCollector` owns the `IdGenerator`
-during Python execution. When Claude calls `timers.add()` or `shell_exec()`,
-the #[pyclass] method calls `id_gen.next()` synchronously and returns the ID.
-After execution, the updated generator is moved back into HarnessState.
+**External effects deferred**: Operations that can't be un-done by dropping a
+clone (OS process spawn, message broadcast, child fork, SQLite pin) go into
+`ExternalEffects`, applied after commit. `shell_exec` adds the `ManagedProcess`
+bookkeeping entry to the txn's process_manager same-turn (so `processes_list()`
+shows it) but defers the actual `tokio::process::Command::spawn()`.
+
+**Synchronous ID assignment**: `IdGenerator` wrapped in `Arc<Mutex<>>`, shared
+between PyTimers and PyHarness. `.next()` called synchronously during script
+execution. On commit the advanced generator swaps in; on error it rolls back
+with the clone.
 
 **Single-message context rebuild**: Each API call is a fresh conversation with
 one user message containing the full rendered context. No multi-turn replay.
