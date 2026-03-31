@@ -320,9 +320,13 @@ write a *second* hook matching `e['type'] == 'ProcessCompleted' and
 e['description'].startswith('probe:')` to triage the result. Each hook
 is synchronous; the async chain is event-driven.
 
-**Safety hatch**: send `!hooks list`, `!hooks disable NAME`, or `!hooks
-clear` from any chat — handled in Rust, bypasses all hooks. Use this if
-a buggy hook is eating every message including "fix the hook."
+**Safety hatch**: `!hooks list`, `!hooks disable NAME`, or `!hooks clear`
+sent from any chat bypasses all hooks — handled in Rust before hook
+matching. You cannot trigger this yourself (send_message doesn't go
+through that path); only a human typing into a chat can. **When you
+register your first hook, tell your client about this** — if a buggy
+hook starts eating every message including "fix the hook," they can
+recover without you.
 
 **Telemetry**: when you wake from idle, a SystemAlert in history
 summarizes hook activity (`name: N× fired, M consumed, ...`). Counters
