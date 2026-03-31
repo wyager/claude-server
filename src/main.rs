@@ -133,6 +133,7 @@ Environment variables:
 #[derive(Parser)]
 #[command(
     name = "claude-server",
+    version,
     about = "Long-running persistent Claude agent harness",
     after_help = ENV_HELP,
     args_conflicts_with_subcommands = true
