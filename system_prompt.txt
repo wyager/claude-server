@@ -52,8 +52,7 @@ work_queue[0]              # Highest-priority item
 work_queue.pop_front()     # Remove highest-priority item
 work_queue.remove(id)      # Remove by ID
 len(work_queue)            # Count
-work_queue.add_filter(name="f", regex=r"pattern")   # Persistent content filter
-work_queue.remove_filter(name="f")
+# Content filtering: use register_hook (see Hooks section below)
 ```
 
 Content fields may be truncated in the rendered `<work_queue>` view. Accessing the
@@ -177,6 +176,22 @@ send_message(chat_id="signal:+1555...", content="Here's the photo",
              attach=["/tmp/snapshot.jpg"])   # bridges deliver attachments
 ```
 
+`send_message` raises `RuntimeError` if no bridge is subscribed to `chat_id` —
+messages to typo'd or not-yet-connected chat_ids fail immediately rather than
+vanishing silently. After spawning a bridge, wait for it to connect before
+sending:
+
+```python
+shell_exec(cmd=harness_bin, args=["bridge", "signal", "--account", "+1..."], ...)
+wait_for_message_channel("signal:+15551234567", timeout_ms=3000)
+send_message("signal:+15551234567", "I'm back online")  # now safe
+```
+
+`wait_for_message_channel` blocks until a subscriber for that chat_id exists,
+or raises `TimeoutError`. Eats into your Python execution budget — keep
+`timeout_ms` well under 5000. Bridges subscribe by prefix (`signal:*`,
+`telegram:*`, etc.), so one bridge handles all peers in its namespace.
+
 ### Process management
 
 All process operations are non-blocking by default. `shell_exec` starts a process and
@@ -260,6 +275,58 @@ If it doesn't finish in time, it arrives later as normal.
 includes an `output_preview` field with the last ~500 characters of output. You can
 read it directly from the work item (`work_queue[i].output_preview`) instead of calling
 `shell_output()`. Only use `shell_output()` if you need the full output and it was truncated.
+
+### Hooks — API-free event handling
+
+Register Python scripts that run locally when events match a pattern — no
+API call unless the hook passes the event through or raises. Use for
+high-frequency, low-value events (health checks, log rotation, spam
+filtering) where waking the full agent is wasteful.
+
+```python
+register_hook(
+    name="health-check",
+    priority=5,            # higher runs first; first match wins
+    match_expr="e['type'] == 'TimerFired' and e['timer_id'] == 'a1b2'",
+    process="""
+# e is a dict: e['type'], e['content'], e['priority'], etc.
+# Allowed: memory, shell_exec (no block_for!), send_message, timedelta
+# Return None → event consumed, you never wake
+# Return e → event enters the queue (mutate e['priority'] / e['hook_note'] first if you want)
+# Raise → HookException work item wrapping the original — you see both
+try:
+    import urllib.request
+    urllib.request.urlopen("http://localhost:8080/health", timeout=2)
+    memory['health_ok_at'] = str(datetime.now())
+    return None
+except Exception as ex:
+    e['hook_note'] = f"health failed: {ex}"
+    return e   # escalate
+""",
+    timeout_ms=3000,
+)
+list_hooks()          # [(name, priority, match_expr), ...]
+remove_hook("health-check")
+```
+
+Both `match_expr` and `process` are **source strings** (not lambdas — no
+closures). Syntax-checked at registration, so typos fail immediately.
+Hooks persist across restarts. `match_expr` evaluates with `e` bound;
+first True (in priority-descending order) runs its `process`.
+
+**Chaining hooks**: `shell_exec` in a hook is fire-and-forget (no
+`block_for`). The `ProcessCompleted` arrives later as a normal event —
+write a *second* hook matching `e['type'] == 'ProcessCompleted' and
+e['description'].startswith('probe:')` to triage the result. Each hook
+is synchronous; the async chain is event-driven.
+
+**Safety hatch**: send `!hooks list`, `!hooks disable NAME`, or `!hooks
+clear` from any chat — handled in Rust, bypasses all hooks. Use this if
+a buggy hook is eating every message including "fix the hook."
+
+**Telemetry**: when you wake from idle, a SystemAlert in history
+summarizes hook activity (`name: N× fired, M consumed, ...`). Counters
+reset each wake. Not in `<agent_state>` — would thrash the cache.
 
 ### External events
 

@@ -103,6 +103,9 @@ pub struct AgentLoop {
     /// Explicit return values from done(**kwargs). Populated on the turn that
     /// calls done(); read by run_child_agent_loop after run() returns.
     done_result: HashMap<String, serde_json::Value>,
+    /// Shared with HTTP server: tracks active SSE subscribers so send_message
+    /// can fail on unroutable chat_ids and wait_for_message_channel can block.
+    subscribers: Arc<crate::http_server::SubscriberRegistry>,
 }
 
 impl AgentLoop {
@@ -124,6 +127,7 @@ impl AgentLoop {
         token_accumulator: Option<Arc<Mutex<TokenAccumulator>>>,
         registry: Arc<AgentRegistry>,
         shutdown: tokio::sync::watch::Receiver<bool>,
+        subscribers: Arc<crate::http_server::SubscriberRegistry>,
     ) -> Self {
         let max_children: u32 = std::env::var("CLAUDE_SERVER_MAX_CHILDREN")
             .ok()
@@ -157,6 +161,7 @@ impl AgentLoop {
             killed: false,
             shutdown,
             done_result: HashMap::new(),
+            subscribers,
         }
     }
 
@@ -248,6 +253,9 @@ impl AgentLoop {
                 continue;
             }
 
+            if idle {
+                self.flush_hook_telemetry();
+            }
             idle = false;
 
             if self.killed {
@@ -443,6 +451,7 @@ impl AgentLoop {
             self.permissions.agent_name.as_str(),
             &lineage_str,
             &pinned_snapshot,
+            Some(self.subscribers.clone()),
         );
 
         let mut is_error = exec_result.is_error;
@@ -539,8 +548,179 @@ impl AgentLoop {
             .check_and_fire(now, &mut self.state.id_generator);
         for item in fired {
             dimlog!("[{}] Timer fired: {}", self.name, item.id);
-            self.state.work_queue.push(item);
+            self.push_item(item);
         }
+    }
+
+    /// Push a WorkItem, running it through hooks first. First matching hook
+    /// (by priority) gets it; returns None → drop, returns e → push (possibly
+    /// with modified priority), raises → push a HookException wrapping the
+    /// original. `!hooks ...` UserMessages bypass hooks entirely so a human
+    /// can recover from a buggy hook that intercepts everything.
+    fn push_item(&mut self, mut item: WorkItem) {
+        // Safety hatch — handled in Rust, never reaches hook matching.
+        if let WorkItemType::UserMessage { ref content, .. } = item.item_type {
+            if let Some(cmd) = content.strip_prefix("!hooks ") {
+                self.handle_hooks_command(cmd.trim(), &item);
+                return;
+            }
+        }
+
+        if self.state.hooks.is_empty() {
+            self.state.work_queue.push(item);
+            return;
+        }
+
+        let (outcome, effects) = python::run_hooks(
+            &self.state.hooks, &item, &self.state,
+            Some(self.subscribers.clone()),
+        );
+
+        // Direct work_queue.push below, NOT recursive push_item — "first
+        // match wins" means once a hook has processed an item, it's done.
+        // HookException also bypasses hooks to avoid error cascades.
+        match outcome {
+            python::HookOutcome::NoMatch => {
+                self.state.work_queue.push(item);
+            }
+            python::HookOutcome::Consumed { hook_name } => {
+                let s = self.state.hook_stats.entry(hook_name).or_default();
+                s.fired += 1; s.consumed += 1;
+                let _ = self.apply_hook_effects(effects);
+            }
+            python::HookOutcome::Passed { hook_name, priority, hook_note } => {
+                let s = self.state.hook_stats.entry(hook_name.clone()).or_default();
+                s.fired += 1; s.passed += 1;
+                item.priority = priority;
+                if let Some(note) = hook_note {
+                    // Annotate via attachments — visible in queue render as
+                    // metadata without needing a new field on every variant.
+                    item.attachments.push(format!("hook:{}:{}", hook_name, note));
+                }
+                let _ = self.apply_hook_effects(effects);
+                self.state.work_queue.push(item);
+            }
+            python::HookOutcome::Failed { hook_name, error } => {
+                let s = self.state.hook_stats.entry(hook_name.clone()).or_default();
+                s.fired += 1; s.raised += 1;
+                let original = serde_json::to_value(&item).unwrap_or(serde_json::Value::Null);
+                let exc_id = self.state.id_generator.next();
+                self.state.work_queue.push(WorkItem {
+                    id: exc_id,
+                    priority: item.priority.max(8),
+                    time: Utc::now(),
+                    item_type: WorkItemType::HookException { hook_name, error, original },
+                    attachments: Vec::new(),
+                });
+                let _ = self.apply_hook_effects(effects);
+            }
+        }
+    }
+
+    /// Apply the restricted subset of side effects a hook can emit.
+    /// Hooks can't fork/compact/done/etc. — the hook-mode PyHarness raises
+    /// for those — so we only handle memory, timers, processes, messages.
+    fn apply_hook_effects(&mut self, effects: python::SideEffectCollector) -> Result<()> {
+        self.state.id_generator = effects.id_gen;
+        for (k, v) in effects.memory_sets {
+            self.state.memory.insert(k, v);
+        }
+        for k in effects.memory_deletes {
+            self.state.memory.remove(&k);
+        }
+        for (k, p) in effects.memory_priority_sets {
+            self.state.memory_priorities.insert(k, p);
+        }
+        for req in effects.timer_adds {
+            self.state.timer_manager.add(build_timer(req));
+        }
+        for id in effects.timer_cancels {
+            self.state.timer_manager.cancel(&AgentId(id));
+        }
+        for id in effects.timer_acks {
+            self.state.timer_manager.acknowledge(&AgentId(id));
+        }
+        for req in effects.process_starts {
+            if let Err(e) = self.process_supervisor.spawn(req) {
+                eprintln!("[{}] hook process spawn failed: {}", self.name, e);
+            }
+        }
+        // Messages: reuse the normal path so subscriber checks apply.
+        for msg in effects.messages {
+            let id = self.db.save_outbound_message(&msg.chat_id, &msg.content, &msg.attachments)
+                .unwrap_or(0);
+            self.broadcast(crate::http_server::BroadcastMsg::Message {
+                chat_id: msg.chat_id,
+                content: msg.content,
+                attachments: msg.attachments,
+                id,
+                created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                react_to: msg.react_to,
+            });
+        }
+        Ok(())
+    }
+
+    /// `!hooks list|disable NAME|clear` — bypasses all hooks, handled in Rust.
+    /// Response goes to the chat_id the command came from.
+    fn handle_hooks_command(&mut self, cmd: &str, item: &WorkItem) {
+        let WorkItemType::UserMessage { ref chat_id, .. } = item.item_type else { return };
+        let reply = if cmd == "list" {
+            if self.state.hooks.is_empty() {
+                "No hooks registered.".to_owned()
+            } else {
+                self.state.hooks.iter()
+                    .map(|h| format!("[{}] {} — {}", h.priority, h.name, h.match_expr))
+                    .collect::<Vec<_>>().join("\n")
+            }
+        } else if let Some(name) = cmd.strip_prefix("disable ") {
+            let before = self.state.hooks.len();
+            self.state.hooks.retain(|h| h.name != name);
+            if self.state.hooks.len() < before {
+                format!("Disabled hook '{}'.", name)
+            } else {
+                format!("No hook named '{}'.", name)
+            }
+        } else if cmd == "clear" {
+            let n = self.state.hooks.len();
+            self.state.hooks.clear();
+            self.state.hook_stats.clear();
+            format!("Cleared {} hooks.", n)
+        } else {
+            "Usage: !hooks list | !hooks disable NAME | !hooks clear".to_owned()
+        };
+        let id = self.db.save_outbound_message(chat_id, &reply, &[]).unwrap_or(0);
+        self.broadcast(crate::http_server::BroadcastMsg::Message {
+            chat_id: chat_id.clone(), content: reply, attachments: Vec::new(),
+            id, created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            react_to: None,
+        });
+    }
+
+    /// Emit a SystemAlert summarizing hook activity since the last wake,
+    /// then reset counters. Call on idle→active transition. Skipped if no
+    /// hooks fired — avoids noise and unnecessary history entries.
+    fn flush_hook_telemetry(&mut self) {
+        if self.state.hook_stats.values().all(|s| s.fired == 0) {
+            return;
+        }
+        let mut lines: Vec<String> = self.state.hook_stats.iter()
+            .filter(|(_, s)| s.fired > 0)
+            .map(|(name, s)| {
+                let mut parts = vec![format!("{}: {}× fired", name, s.fired)];
+                if s.consumed > 0 { parts.push(format!("{} consumed", s.consumed)); }
+                if s.passed > 0 { parts.push(format!("{} passed", s.passed)); }
+                if s.raised > 0 { parts.push(format!("{} RAISED", s.raised)); }
+                parts.join(", ")
+            })
+            .collect();
+        lines.sort();
+        let id = self.state.id_generator.next();
+        self.state.event_history.push(HistoryEntry::SystemAlert {
+            id, time: Utc::now(),
+            message: format!("Hook activity since last wake:\n{}", lines.join("\n")),
+        });
+        for s in self.state.hook_stats.values_mut() { *s = Default::default(); }
     }
 
     fn apply_event(&mut self, event: HarnessEvent) {
@@ -561,7 +741,7 @@ impl AgentLoop {
                     id,
                     if attachments.is_empty() { String::new() } else { format!(" [{} attachments]", attachments.len()) }
                 );
-                self.state.work_queue.push(WorkItem {
+                self.push_item(WorkItem {
                     id,
                     priority: 9,
                     time: Utc::now(),
@@ -587,7 +767,7 @@ impl AgentLoop {
                     }
                     let output_preview = self.load_output_preview(&pid.0);
                     let id = self.state.id_generator.next();
-                    self.state.work_queue.push(WorkItem {
+                    self.push_item(WorkItem {
                         id,
                         priority: prio,
                         time: Utc::now(),
@@ -613,7 +793,7 @@ impl AgentLoop {
                     }
                     let output_preview = self.load_output_preview(&pid.0);
                     let id = self.state.id_generator.next();
-                    self.state.work_queue.push(WorkItem {
+                    self.push_item(WorkItem {
                         id,
                         priority: prio,
                         time: Utc::now(),
@@ -633,7 +813,7 @@ impl AgentLoop {
                         .map(|p| p.fail_prio)
                         .unwrap_or(7);
                     let id = self.state.id_generator.next();
-                    self.state.work_queue.push(WorkItem {
+                    self.push_item(WorkItem {
                         id,
                         priority: prio,
                         time: Utc::now(),
@@ -682,7 +862,7 @@ impl AgentLoop {
                     0
                 };
 
-                self.state.work_queue.push(WorkItem {
+                self.push_item(WorkItem {
                     id,
                     priority,
                     time: Utc::now(),
@@ -710,7 +890,7 @@ impl AgentLoop {
                     from,
                     crate::renderer::trunc(&content, 50)
                 );
-                self.state.work_queue.push(WorkItem {
+                self.push_item(WorkItem {
                     id,
                     priority,
                     time: Utc::now(),
@@ -729,7 +909,7 @@ impl AgentLoop {
                    "[{}] External event from {}: {} (id={})",
                     self.name, source, event_type, id
                 );
-                self.state.work_queue.push(WorkItem {
+                self.push_item(WorkItem {
                     id,
                     priority,
                     time: Utc::now(),
@@ -805,31 +985,7 @@ impl AgentLoop {
 
         // Timer operations
         for req in effects.timer_adds {
-            let schedule = if let Some(secs) = req.every_secs {
-                TimerSchedule::Recurring {
-                    every: Duration::from_secs(secs),
-                    next_fire: Utc::now()
-                        + chrono::Duration::from_std(Duration::from_secs(secs))
-                            .unwrap_or(chrono::Duration::seconds(1)),
-                }
-            } else if let Some(epoch) = req.at_epoch {
-                let at = chrono::DateTime::from_timestamp(epoch as i64, 0)
-                    .unwrap_or_else(|| Utc::now() + chrono::Duration::minutes(1));
-                TimerSchedule::OneShot { at }
-            } else {
-                let at = Utc::now() + chrono::Duration::minutes(1);
-                TimerSchedule::OneShot { at }
-            };
-
-            let timer = Timer {
-                id: req.id,
-                description: req.description,
-                priority: req.priority,
-                schedule,
-                created_at: Utc::now(),
-                pending_ack: false,
-            };
-            self.state.timer_manager.add(timer);
+            self.state.timer_manager.add(build_timer(req));
         }
         for id in effects.timer_cancels {
             self.state.timer_manager.cancel(&AgentId(id));
@@ -840,12 +996,20 @@ impl AgentLoop {
             self.state.timer_manager.acknowledge(&AgentId(id));
         }
 
-        // Filter operations
-        for filter in effects.filter_adds {
-            self.state.work_queue.add_filter(filter);
+        // Hook registration (replaces old QueueFilter mechanism). Sort once
+        // after all modifications — hooks change rarely, events arrive often,
+        // so paying the sort here keeps the per-event iteration a plain scan.
+        let hooks_changed = !effects.hook_adds.is_empty() || !effects.hook_removes.is_empty();
+        for hook in effects.hook_adds {
+            self.state.hooks.retain(|h| h.name != hook.name);
+            self.state.hooks.push(hook);
         }
-        for name in effects.filter_removes {
-            self.state.work_queue.remove_filter(&name);
+        for name in effects.hook_removes {
+            self.state.hooks.retain(|h| h.name != name);
+            self.state.hook_stats.remove(&name);
+        }
+        if hooks_changed {
+            self.state.hooks.sort_by(|a, b| b.priority.cmp(&a.priority));
         }
 
         // History operations
@@ -903,7 +1067,7 @@ impl AgentLoop {
                         };
                     }
                     let wid = self.state.id_generator.next();
-                    self.state.work_queue.push(WorkItem {
+                    self.push_item(WorkItem {
                         id: wid,
                         priority: req.fail_prio,
                         time: Utc::now(),
@@ -936,7 +1100,7 @@ impl AgentLoop {
         // view() calls → one View work item (priority 10, lands at head)
         if !effects.view_paths.is_empty() {
             let id = self.state.id_generator.next();
-            self.state.work_queue.push(WorkItem {
+            self.push_item(WorkItem {
                 id,
                 priority: 10,
                 time: Utc::now(),
@@ -965,7 +1129,7 @@ impl AgentLoop {
                 eprintln!("[{}] Fork failed: {}", self.name, e);
                 // Push a single error work item
                 let wid = self.state.id_generator.next();
-                self.state.work_queue.push(WorkItem {
+                self.push_item(WorkItem {
                     id: wid,
                     priority: 7,
                     time: Utc::now(),
@@ -1001,7 +1165,7 @@ impl AgentLoop {
                     );
                     self.registry.deregister(&child_settings.name);
                     let wid = self.state.id_generator.next();
-                    self.state.work_queue.push(WorkItem {
+                    self.push_item(WorkItem {
                         id: wid,
                         priority: 7,
                         time: Utc::now(),
@@ -1138,7 +1302,7 @@ impl AgentLoop {
                             self.active_children = self.active_children.saturating_sub(1);
                             self.registry.deregister(&child_name_str);
                             let wid = self.state.id_generator.next();
-                            self.state.work_queue.push(WorkItem {
+                            self.push_item(WorkItem {
                                 id: wid,
                                 priority: 7,
                                 time: Utc::now(),
@@ -1197,6 +1361,7 @@ impl AgentLoop {
                     parent_tx,
                     registry,
                     self.shutdown.clone(),
+                    self.subscribers.clone(),
                 ));
             }
         }
@@ -1293,6 +1458,7 @@ impl AgentLoop {
                 self.permissions.agent_name.as_str(),
                 &format_lineage(&self.permissions.lineage),
                 &HashMap::new(), // compaction doesn't need pinned memory
+                None, // compaction script shouldn't be sending messages
             );
 
             if compact_result.is_error {
@@ -1403,6 +1569,7 @@ async fn run_child_agent_loop(
     parent_tx: mpsc::UnboundedSender<HarnessEvent>,
     registry: Arc<AgentRegistry>,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    subscribers: Arc<crate::http_server::SubscriberRegistry>,
 ) {
     let mut child_loop = AgentLoop::new(
         child_name.clone(),
@@ -1422,6 +1589,7 @@ async fn run_child_agent_loop(
         None,  // children track tokens locally
         registry.clone(),
         shutdown,
+        subscribers,
     );
 
     let reason = child_loop.run().await;
@@ -1455,4 +1623,32 @@ async fn run_child_agent_loop(
         child_cache_creation_tokens: child_loop.local_cache_creation_tokens,
         child_cache_read_tokens: child_loop.local_cache_read_tokens,
     });
+}
+
+/// Shared Timer construction from TimerAddRequest — used by both the main
+/// apply_side_effects and apply_hook_effects.
+fn build_timer(req: python::TimerAddRequest) -> Timer {
+    let schedule = if let Some(secs) = req.every_secs {
+        TimerSchedule::Recurring {
+            every: Duration::from_secs(secs),
+            next_fire: Utc::now()
+                + chrono::Duration::from_std(Duration::from_secs(secs))
+                    .unwrap_or(chrono::Duration::seconds(1)),
+        }
+    } else if let Some(epoch) = req.at_epoch {
+        TimerSchedule::OneShot {
+            at: chrono::DateTime::from_timestamp(epoch as i64, 0)
+                .unwrap_or_else(|| Utc::now() + chrono::Duration::minutes(1)),
+        }
+    } else {
+        TimerSchedule::OneShot { at: Utc::now() + chrono::Duration::minutes(1) }
+    };
+    Timer {
+        id: req.id,
+        description: req.description,
+        priority: req.priority,
+        schedule,
+        created_at: Utc::now(),
+        pending_ack: false,
+    }
 }

@@ -133,6 +133,16 @@ pub enum WorkItemType {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         changelog: Option<String>,
     },
+    /// A hook's process() raised. The original event is preserved so the
+    /// agent can diagnose and the data isn't lost.
+    HookException {
+        hook_name: String,
+        error: String,
+        /// The WorkItem the hook was processing, serialized as JSON. Stored
+        /// as a Value rather than a Box<WorkItem> to avoid recursive type
+        /// issues and keep the rendered form compact.
+        original: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,40 +159,47 @@ pub struct WorkItem {
 }
 
 
+/// Agent-registered event hook. Runs before a WorkItem enters the queue.
+/// `match_expr` and `process` are Python source strings (not lambdas — no
+/// closures, trivially serializable). Both syntax-checked at registration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueueFilter {
+pub struct Hook {
     pub name: String,
-    pub regex: String,
+    pub priority: i32,
+    /// Python expression with `e` bound to the WorkItem. Evaluated for
+    /// every incoming event (in a single interpreter pass across all hooks).
+    pub match_expr: String,
+    /// Python script with `e` bound. Returns `None` (consume), `e` or a
+    /// modified dict (pass/modify), or raises (→ HookException). Runs with
+    /// a restricted API: fire-and-forget side effects only, no block_for.
+    pub process: String,
+    pub timeout_ms: u64,
+}
+
+/// Per-hook activity counters. NOT rendered in <agent_state> — that would
+/// thrash the cache on every event. Surfaced via a SystemAlert when the
+/// agent transitions idle→active, then reset.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HookStats {
+    pub fired: u64,
+    pub consumed: u64,
+    pub passed: u64,
+    pub raised: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkQueue {
     /// Sorted by (priority DESC, time ASC)
     items: Vec<WorkItem>,
-    filters: Vec<QueueFilter>,
 }
 
 impl WorkQueue {
     pub fn new() -> Self {
-        Self {
-            items: Vec::new(),
-            filters: Vec::new(),
-        }
+        Self { items: Vec::new() }
     }
 
     /// Insert a work item, maintaining sort order.
-    /// Returns false if the item was filtered out.
-    pub fn push(&mut self, item: WorkItem) -> bool {
-        if let WorkItemType::UserMessage { ref content, .. } = item.item_type {
-            for filter in &self.filters {
-                if let Ok(re) = regex::Regex::new(&filter.regex) {
-                    if re.is_match(content) {
-                        return false;
-                    }
-                }
-            }
-        }
-
+    pub fn push(&mut self, item: WorkItem) {
         let pos = self.items.partition_point(|existing| {
             if existing.priority != item.priority {
                 existing.priority > item.priority
@@ -191,7 +208,6 @@ impl WorkQueue {
             }
         });
         self.items.insert(pos, item);
-        true
     }
 
     pub fn remove(&mut self, id: &AgentId) -> Option<WorkItem> {
@@ -218,13 +234,6 @@ impl WorkQueue {
         self.items.get(index)
     }
 
-    pub fn add_filter(&mut self, filter: QueueFilter) {
-        self.filters.push(filter);
-    }
-
-    pub fn remove_filter(&mut self, name: &str) {
-        self.filters.retain(|f| f.name != name);
-    }
 }
 
 // ---- Event History ----
@@ -581,6 +590,15 @@ pub struct HarnessState {
     /// agent learns about new capabilities without operator intervention.
     #[serde(default)]
     pub last_harness_version: Option<String>,
+    /// Agent-registered event hooks. Checked before each WorkItem enters
+    /// the queue — first match (by priority) runs its process() script.
+    #[serde(default)]
+    pub hooks: Vec<Hook>,
+    /// Per-hook activity counters since the agent's last wake. Deliberately
+    /// NOT rendered in <agent_state> — that would thrash the cache every
+    /// event. Surfaced via SystemAlert on idle→active, then reset.
+    #[serde(default)]
+    pub hook_stats: HashMap<String, HookStats>,
     pub id_generator: IdGenerator,
     pub last_input_tokens: u64,
     pub context_window: u64,
@@ -598,6 +616,8 @@ impl HarnessState {
             memory_priorities: HashMap::new(),
             sensitive_keys: std::collections::HashSet::new(),
             last_harness_version: None,
+            hooks: Vec::new(),
+            hook_stats: HashMap::new(),
             id_generator: IdGenerator::new(),
             last_input_tokens: 0,
             context_window,

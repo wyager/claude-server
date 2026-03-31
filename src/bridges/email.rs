@@ -29,7 +29,9 @@ pub struct EmailArgs {
     pub password: String,
     /// Only relay mail to/from this address
     #[arg(long)]
-    pub peer: String,
+    /// Optional allowlist of sender addresses. Omit to accept from anyone.
+    #[arg(long)]
+    pub peer: Vec<String>,
     #[arg(long, default_value = "INBOX")]
     pub folder: String,
     /// Directory to save inbound attachments
@@ -49,7 +51,6 @@ pub fn run(args: EmailArgs) {
 
 async fn run_async(args: EmailArgs) -> Result<()> {
     std::fs::create_dir_all(&args.attach_dir).ok();
-    let chat_id = format!("email:{}", args.peer);
     let (tx, rx) = mpsc::unbounded_channel::<Inbound>();
 
     // Inbound: IMAP IDLE with reconnect loop
@@ -71,26 +72,25 @@ async fn run_async(args: EmailArgs) -> Result<()> {
             .credentials(Credentials::new(args.user.clone(), args.password.clone()))
             .build();
     let from = args.user.clone();
-    let to = args.peer.clone();
 
-    super::relay_loop(&args.api.api_url, &chat_id, &args.peer, rx, move |out: super::Outbound| {
-        let (content, attachments) = (out.content, out.attachments);
+    super::relay_loop(&args.api.api_url, "email:*", &args.user, rx, move |out: super::Outbound| {
         let mailer = mailer.clone();
         let from = from.clone();
-        let to = to.clone();
         async move {
+            let to = out.chat_id.strip_prefix("email:")
+                .with_context(|| format!("bad email chat_id: {}", out.chat_id))?;
             let builder = Message::builder()
                 .from(from.parse().context("parse from address")?)
-                .to(to.parse().context("parse to address")?)
+                .to(to.parse().with_context(|| format!("parse to address: {}", to))?)
                 .subject("Message from Claude");
 
-            let msg = if attachments.is_empty() {
-                builder.body(content)?
+            let msg = if out.attachments.is_empty() {
+                builder.body(out.content)?
             } else {
                 let mut mp = MultiPart::mixed().singlepart(
-                    SinglePart::builder().header(ContentType::TEXT_PLAIN).body(content),
+                    SinglePart::builder().header(ContentType::TEXT_PLAIN).body(out.content),
                 );
-                for path in &attachments {
+                for path in &out.attachments {
                     let bytes = tokio::fs::read(path).await.with_context(|| format!("reading {}", path))?;
                     let name = std::path::Path::new(path).file_name()
                         .map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
@@ -146,14 +146,22 @@ async fn imap_loop(args: &EmailArgs, tx: &mpsc::UnboundedSender<Inbound>) -> Res
             let from = parsed.headers.iter()
                 .find(|h| h.get_key().eq_ignore_ascii_case("From"))
                 .map(|h| h.get_value()).unwrap_or_default();
-            if !from.contains(&args.peer) {
+            // Extract a clean address from the From header (may be "Name <addr>")
+            let sender = from.rfind('<')
+                .and_then(|i| from[i+1..].find('>').map(|j| &from[i+1..i+1+j]))
+                .unwrap_or(from.trim())
+                .to_owned();
+            if !args.peer.is_empty() && !args.peer.iter().any(|p| sender.contains(p)) {
                 continue;
             }
 
             let (body, attachments) = extract_parts(&parsed, &args.attach_dir, uid)?;
             eprintln!("[email bridge] mail from {}: {} chars, {} attachments",
-                args.peer, body.len(), attachments.len());
-            let _ = tx.send(Inbound { text: body, attachments, message_ref: None });
+                sender, body.len(), attachments.len());
+            let _ = tx.send(Inbound {
+                chat_id: format!("email:{}", sender),
+                text: body, attachments, message_ref: None,
+            });
         }
         drop(stream);
         last_seen = exists;

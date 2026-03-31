@@ -72,6 +72,7 @@ impl CoreLoop {
         token_accumulator: Arc<Mutex<TokenAccumulator>>,
         registry: Arc<AgentRegistry>,
         shutdown: tokio::sync::watch::Receiver<bool>,
+        subscribers: Arc<crate::http_server::SubscriberRegistry>,
     ) -> Self {
         // Register root agent in the registry
         registry
@@ -104,6 +105,7 @@ impl CoreLoop {
             Some(token_accumulator),
             registry,
             shutdown,
+            subscribers,
         );
 
         Self { agent_loop }

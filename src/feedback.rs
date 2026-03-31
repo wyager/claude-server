@@ -52,6 +52,10 @@ pub struct FeedbackArgs {
     /// Reproduction steps
     #[arg(long)]
     pub repro: Option<String>,
+    /// Per-deployment identifier (e.g. "debian-camera", "laptop-dev").
+    /// Distinguishes reports when multiple deployments all run as "root".
+    #[arg(long)]
+    pub agent_personal_name: Option<String>,
     /// Feedback server URL (env: CLAUDE_SERVER_FEEDBACK_URL)
     #[arg(long, default_value_t = default_feedback_url())]
     pub url: String,
@@ -87,6 +91,7 @@ pub fn run_client(args: FeedbackArgs) {
         "repro": args.repro,
         "harness_version": env!("CARGO_PKG_VERSION"),
         "agent_name": std::env::var("CLAUDE_SERVER_AGENT_NAME").ok(),
+        "agent_personal_name": args.agent_personal_name,
         "api_trace": api_trace,
     });
 
@@ -308,6 +313,8 @@ struct FeedbackReq {
     harness_version: Option<String>,
     agent_name: Option<String>,
     #[serde(default)]
+    agent_personal_name: Option<String>,
+    #[serde(default)]
     api_trace: Option<serde_json::Value>,
 }
 
@@ -320,6 +327,7 @@ struct FeedbackRow {
     repro: Option<String>,
     harness_version: Option<String>,
     agent_name: Option<String>,
+    agent_personal_name: Option<String>,
     remote_addr: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     has_api_trace: Option<bool>,
@@ -372,6 +380,7 @@ pub fn run_server(args: ServerArgs) {
     .expect("Failed to create feedback table");
     // Migration for existing DBs — ignore error if column already exists.
     let _ = conn.execute("ALTER TABLE feedback ADD COLUMN api_trace TEXT", []);
+    let _ = conn.execute("ALTER TABLE feedback ADD COLUMN agent_personal_name TEXT", []);
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS chat_users (
             username TEXT PRIMARY KEY,
@@ -569,8 +578,8 @@ async fn handle_post(
     let trace_json = req.api_trace.as_ref().map(|v| v.to_string());
     let db = state.db.lock().unwrap();
     db.execute(
-        "INSERT INTO feedback (timestamp, summary, details, repro, harness_version, agent_name, remote_addr, api_trace)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO feedback (timestamp, summary, details, repro, harness_version, agent_name, agent_personal_name, remote_addr, api_trace)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         rusqlite::params![
             ts,
             req.summary,
@@ -578,6 +587,7 @@ async fn handle_post(
             req.repro,
             req.harness_version,
             req.agent_name,
+            req.agent_personal_name,
             addr.ip().to_string(),
             trace_json
         ],
@@ -652,7 +662,7 @@ async fn handle_get(
     let db = state.db.lock().unwrap();
     let mut stmt = db
         .prepare(
-            "SELECT id, timestamp, summary, details, repro, harness_version, agent_name, remote_addr,
+            "SELECT id, timestamp, summary, details, repro, harness_version, agent_name, agent_personal_name, remote_addr,
                     api_trace IS NOT NULL
              FROM feedback WHERE id > ?1 ORDER BY id DESC LIMIT ?2",
         )
@@ -667,8 +677,9 @@ async fn handle_get(
                 repro: r.get(4)?,
                 harness_version: r.get(5)?,
                 agent_name: r.get(6)?,
-                remote_addr: r.get(7)?,
-                has_api_trace: Some(r.get(8)?),
+                agent_personal_name: r.get(7)?,
+                remote_addr: r.get(8)?,
+                has_api_trace: Some(r.get(9)?),
             })
         })
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?

@@ -38,8 +38,8 @@ pub struct SideEffectCollector {
     pub timer_adds: Vec<TimerAddRequest>,
     pub timer_cancels: Vec<String>,
     pub timer_acks: Vec<String>,
-    pub filter_adds: Vec<QueueFilter>,
-    pub filter_removes: Vec<String>,
+    pub hook_adds: Vec<Hook>,
+    pub hook_removes: Vec<String>,
     pub messages: Vec<OutboundMessageRequest>,
     pub process_starts: Vec<ProcessStartRequest>,
     pub process_kills: Vec<String>,
@@ -298,6 +298,12 @@ fn work_item_to_py(item: &WorkItem) -> PyWorkItem {
             );
             "AgentStartup"
         }
+        WorkItemType::HookException { hook_name, error, original } => {
+            fields.insert("hook_name".into(), hook_name.clone().into());
+            fields.insert("error".into(), error.clone().into());
+            fields.insert("original".into(), original.clone());
+            "HookException"
+        }
     };
 
     fields.insert("attachments".into(), item.attachments.clone().into());
@@ -349,19 +355,6 @@ impl PyWorkQueue {
         Ok(())
     }
 
-    fn add_filter(&self, name: String, regex: String) -> PyResult<()> {
-        self.collector
-            .lock()
-            .unwrap()
-            .filter_adds
-            .push(QueueFilter { name, regex });
-        Ok(())
-    }
-
-    fn remove_filter(&self, name: String) -> PyResult<()> {
-        self.collector.lock().unwrap().filter_removes.push(name);
-        Ok(())
-    }
 }
 
 #[pyclass]
@@ -638,12 +631,39 @@ struct PyHarness {
     agent_name: String,
     agent_lineage: String,
     harness_bin: String,
+    /// None in test/compaction-estimate contexts where there's no HTTP server.
+    /// When None, send_message skips the routability check and
+    /// wait_for_message_channel raises.
+    subscribers: Option<Arc<crate::http_server::SubscriberRegistry>>,
+    /// For block_on inside wait_for_message_channel. Python runs on a
+    /// dedicated std::thread, so we're outside tokio — need the handle.
+    tokio_handle: Option<tokio::runtime::Handle>,
+    /// When true, methods that block on external results or manipulate
+    /// agent lifecycle raise. shell_exec is allowed but block_for is not.
+    hook_mode: bool,
+    /// (name, priority, match_expr) — for list_hooks(). Empty in hook mode.
+    hooks_snapshot: Vec<(String, i32, String)>,
 }
 
 #[pymethods]
 impl PyHarness {
     #[pyo3(signature = (chat_id, content, attach=vec![], react_to=None))]
     fn send_message(&self, chat_id: String, content: String, attach: Vec<String>, react_to: Option<String>) -> PyResult<()> {
+        // Fail fast if no subscriber exists for this chat_id. The broadcast
+        // channel is fire-and-forget — without this check, messages to typo'd
+        // or not-yet-connected chat_ids vanish silently (feedback #30).
+        if let Some(subs) = &self.subscribers {
+            if !subs.would_reach(&chat_id) {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!(
+                        "send_message: no subscriber for chat_id '{}'. \
+                         If you just spawned the bridge, call \
+                         wait_for_message_channel('{}', timeout_ms=...) first.",
+                        chat_id, chat_id
+                    ),
+                ));
+            }
+        }
         for p in &attach {
             if !std::path::Path::new(p).is_file() {
                 return Err(pyo3::exceptions::PyFileNotFoundError::new_err(
@@ -657,6 +677,35 @@ impl PyHarness {
             .messages
             .push(OutboundMessageRequest { chat_id, content, attachments: attach, react_to });
         Ok(())
+    }
+
+    /// Block until a subscriber for `chat_id` is connected, or raise on
+    /// timeout. Use after spawning a bridge and before the first send_message
+    /// to it — closes the startup race where the bridge hasn't finished its
+    /// SSE handshake yet. timeout_ms eats into the Python execution budget;
+    /// keep it well under CLAUDE_SERVER_PYTHON_TIMEOUT (default 5000ms).
+    #[pyo3(signature = (chat_id, timeout_ms=3000))]
+    fn wait_for_message_channel(&self, chat_id: String, timeout_ms: u64) -> PyResult<()> {
+        if self.hook_mode {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "wait_for_message_channel: hooks cannot block on external state",
+            ));
+        }
+        let (subs, handle) = match (&self.subscribers, &self.tokio_handle) {
+            (Some(s), Some(h)) => (s, h),
+            _ => return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "wait_for_message_channel: not available in this context (no HTTP server)",
+            )),
+        };
+        let dur = std::time::Duration::from_millis(timeout_ms);
+        let reached = handle.block_on(subs.wait_for(&chat_id, dur));
+        if reached {
+            Ok(())
+        } else {
+            Err(pyo3::exceptions::PyTimeoutError::new_err(
+                format!("no subscriber for '{}' after {}ms", chat_id, timeout_ms),
+            ))
+        }
     }
 
     #[pyo3(signature = (cmd, args=vec![], env=HashMap::new(), description="".to_string(), alert_timer=None, success_prio=7, fail_prio=8, block_for=None, interactive=false))]
@@ -676,6 +725,13 @@ impl PyHarness {
             Some(val) => extract_seconds(val)? as u64,
             None => 300,
         };
+        if self.hook_mode && block_for.is_some() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "shell_exec(block_for=...) not available in hooks — spawn \
+                 fire-and-forget, then register a second hook matching the \
+                 ProcessCompleted event to handle the result",
+            ));
+        }
         let block_for_ms = match block_for {
             Some(val) => Some((extract_seconds(val)? * 1000.0) as u64),
             None => None,
@@ -765,21 +821,31 @@ impl PyHarness {
     }
 
     fn compact(&self) -> PyResult<()> {
+        if self.hook_mode {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err("compact: not available in hooks"));
+        }
         self.collector.lock().unwrap().compact_called = true;
         Ok(())
     }
 
     fn request_compaction(&self) -> PyResult<()> {
+        if self.hook_mode {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err("request_compaction: not available in hooks"));
+        }
         self.collector.lock().unwrap().compaction_requested = true;
         Ok(())
     }
 
     /// Fork child agents. Takes a list of ChildSettings objects.
+    #[allow(clippy::too_many_arguments)]
     fn fork<'py>(
         &self,
         _py: Python<'py>,
         children: &Bound<'py, PyAny>,
     ) -> PyResult<Vec<String>> {
+        if self.hook_mode {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err("fork: not available in hooks"));
+        }
         if self.child_depth_remaining == 0 {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "Cannot fork sub-agents at this depth",
@@ -870,8 +936,65 @@ impl PyHarness {
         Ok(())
     }
 
+    /// Register an event hook. `match_expr` and `process` are Python source
+    /// strings — both compile-checked here so a typo fails at registration,
+    /// not on the first matching event weeks later. `match_expr` is an
+    /// expression with `e` bound to the WorkItem; `process` is a script with
+    /// `e` bound, returns None (consume) / e or dict (pass/modify) / raises
+    /// (→ HookException wrapping the original).
+    #[pyo3(signature = (name, priority, match_expr, process, timeout_ms=3000))]
+    fn register_hook<'py>(
+        &self, py: Python<'py>,
+        name: String, priority: i32, match_expr: String, process: String, timeout_ms: u64,
+    ) -> PyResult<()> {
+        if self.hook_mode {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "register_hook: not available inside a hook",
+            ));
+        }
+        // Syntax-check both. process is wrapped in `def __hook():` at runtime
+        // (so `return` works), so validate the same wrapped form here.
+        let builtins = py.import("builtins")?;
+        let compile = builtins.getattr("compile")?;
+        compile.call1((&match_expr, format!("<hook:{}:match>", name), "eval"))
+            .map_err(|e| pyo3::exceptions::PySyntaxError::new_err(
+                format!("match_expr: {}", e)
+            ))?;
+        let wrapped_process = format!(
+            "def __hook():\n{}",
+            process.lines().map(|l| format!("    {}", l)).collect::<Vec<_>>().join("\n"),
+        );
+        compile.call1((&wrapped_process, format!("<hook:{}:process>", name), "exec"))
+            .map_err(|e| pyo3::exceptions::PySyntaxError::new_err(
+                format!("process: {}", e)
+            ))?;
+        self.collector.lock().unwrap().hook_adds.push(Hook {
+            name, priority, match_expr, process, timeout_ms,
+        });
+        Ok(())
+    }
+
+    fn remove_hook(&self, name: String) -> PyResult<()> {
+        if self.hook_mode {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "remove_hook: not available inside a hook",
+            ));
+        }
+        self.collector.lock().unwrap().hook_removes.push(name);
+        Ok(())
+    }
+
+    fn list_hooks(&self) -> Vec<(String, i32, String)> {
+        // (name, priority, match_expr) — enough to see what's registered
+        // without dumping full process scripts into context.
+        self.hooks_snapshot.clone()
+    }
+
     #[pyo3(signature = (**result))]
     fn done<'py>(&self, py: Python<'py>, result: Option<&Bound<'py, PyDict>>) -> PyResult<()> {
+        if self.hook_mode {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err("done: not available in hooks"));
+        }
         let mut col = self.collector.lock().unwrap();
         col.done_called = true;
         if let Some(dict) = result {
@@ -922,6 +1045,197 @@ impl StdoutCapture {
     }
 }
 
+// ---- Hook executor ----
+
+pub enum HookOutcome {
+    /// No hook matched — push the item unchanged.
+    NoMatch,
+    /// Hook returned None — drop the item.
+    Consumed { hook_name: String },
+    /// Hook returned e (possibly mutated). Push with the updated priority
+    /// and optional hook_note.
+    Passed { hook_name: String, priority: u8, hook_note: Option<String> },
+    /// Hook's process() raised. Wrap in HookException, preserve original.
+    Failed { hook_name: String, error: String },
+}
+
+/// Single interpreter pass: eval each hook's match_expr against `e` (a dict
+/// built from the WorkItem), call process() for the first True. Hooks are
+/// pre-sorted by priority descending. `e` is a plain mutable dict —
+/// hooks read `e["type"]`, `e["content"]`, etc., and can set `e["priority"]`
+/// or `e["hook_note"]` before returning.
+///
+/// The hook's process() runs with a hook-mode PyHarness: fire-and-forget
+/// side effects OK (shell_exec without block_for, timers, send_message,
+/// memory), blocking on external results raises.
+pub fn run_hooks(
+    hooks: &[Hook],
+    item: &WorkItem,
+    state: &HarnessState,
+    subscribers: Option<Arc<crate::http_server::SubscriberRegistry>>,
+) -> (HookOutcome, SideEffectCollector) {
+    if hooks.is_empty() {
+        return (HookOutcome::NoMatch, SideEffectCollector::default());
+    }
+    let tokio_handle = tokio::runtime::Handle::try_current().ok();
+    Python::attach(|py| {
+        run_hooks_inner(py, hooks, item, state, subscribers, tokio_handle)
+    })
+}
+
+fn run_hooks_inner(
+    py: Python<'_>,
+    hooks: &[Hook],
+    item: &WorkItem,
+    state: &HarnessState,
+    subscribers: Option<Arc<crate::http_server::SubscriberRegistry>>,
+    tokio_handle: Option<tokio::runtime::Handle>,
+) -> (HookOutcome, SideEffectCollector) {
+    // Build e as a dict. Use work_item_to_py's field extraction, then
+    // flatten id/priority/type/time + variant fields into one dict.
+    let pwi = work_item_to_py(item);
+    let e = PyDict::new(py);
+    let _ = e.set_item("id", &pwi.id);
+    let _ = e.set_item("priority", pwi.priority);
+    let _ = e.set_item("type", &pwi.item_type);
+    let _ = e.set_item("time", &pwi.time);
+    for (k, v) in &pwi.fields {
+        if let Ok(pyv) = json_to_py(py, v) {
+            let _ = e.set_item(k, pyv);
+        }
+    }
+
+    // Match loop — single interpreter pass, all matches evaluated here.
+    let locals = PyDict::new(py);
+    let _ = locals.set_item("e", &e);
+    let matched: Option<&Hook> = hooks.iter().find(|h| {
+        let expr = match CString::new(h.match_expr.as_str()) { Ok(c) => c, Err(_) => return false };
+        match py.eval(&expr, None, Some(&locals)) {
+            Ok(v) => v.is_truthy().unwrap_or(false),
+            Err(_) => false,  // match errors don't escalate; treat as non-match
+        }
+    });
+
+    let Some(hook) = matched else {
+        return (HookOutcome::NoMatch, SideEffectCollector::default());
+    };
+
+    // Build hook-mode PyHarness. Memory is a snapshot; writes go to collector.
+    let collector = Arc::new(Mutex::new(SideEffectCollector {
+        id_gen: state.id_generator.clone(),
+        ..Default::default()
+    }));
+    let harness = match Py::new(py, PyHarness {
+        collector: collector.clone(),
+        process_outputs: HashMap::new(),
+        process_statuses: HashMap::new(),
+        process_info: Vec::new(),
+        child_depth_remaining: 0,
+        agent_name: "hook".into(),
+        agent_lineage: "hook".into(),
+        harness_bin: std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "claude-server".into()),
+        subscribers,
+        tokio_handle,
+        hook_mode: true,
+        hooks_snapshot: Vec::new(),
+    }) {
+        Ok(h) => h,
+        Err(e) => return (
+            HookOutcome::Failed { hook_name: hook.name.clone(), error: format!("harness init: {}", e) },
+            SideEffectCollector::default(),
+        ),
+    };
+
+    // Memory snapshot for the hook to read. Writes go through _harness.
+    let memory = match Py::new(py, PyMemory {
+        collector: collector.clone(),
+        data: state.memory.clone(),
+        priorities: state.memory_priorities.clone(),
+        pinned: HashMap::new(),
+    }) {
+        Ok(m) => m,
+        Err(e) => return (
+            HookOutcome::Failed { hook_name: hook.name.clone(), error: format!("memory init: {}", e) },
+            SideEffectCollector::default(),
+        ),
+    };
+
+    // Use the locals dict as globals too — py.run(code, globals, locals)
+    // with globals==locals means `def __hook()` can see e/memory/_harness.
+    // Python scoping: a function body can't see the *enclosing exec's* locals,
+    // only module-level globals. Passing the same dict for both makes our
+    // injected names behave as module-level.
+    let _ = locals.set_item("_harness", harness);
+    let _ = locals.set_item("memory", memory);
+    let _ = locals.set_item("_result", py.None());
+
+    let wrapped = format!(
+        "from datetime import timedelta, datetime\n\
+         send_message = _harness.send_message\n\
+         shell_exec = _harness.shell_exec\n\
+         def __hook():\n{}\n\
+         _result = __hook()\n",
+        hook.process.lines().map(|l| format!("    {}", l)).collect::<Vec<_>>().join("\n"),
+    );
+    let code = match CString::new(wrapped) {
+        Ok(c) => c,
+        Err(e) => return (
+            HookOutcome::Failed { hook_name: hook.name.clone(), error: format!("NUL in process: {}", e) },
+            SideEffectCollector::default(),
+        ),
+    };
+
+    let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
+    let timeout = std::time::Duration::from_millis(hook.timeout_ms);
+    let watchdog = std::thread::spawn(move || {
+        use std::sync::mpsc::RecvTimeoutError;
+        // Only fire on Timeout. Disconnected means the hook finished and
+        // dropped cancel_tx — normal completion, don't interrupt.
+        if matches!(cancel_rx.recv_timeout(timeout), Err(RecvTimeoutError::Timeout)) {
+            unsafe { pyo3::ffi::PyErr_SetInterrupt(); }
+        }
+    });
+
+    let run_res = py.run(&code, Some(&locals), Some(&locals));
+    drop(cancel_tx);
+    let _ = watchdog.join();
+
+    let effects = std::mem::take(&mut *collector.lock().unwrap());
+
+    match run_res {
+        Ok(()) => {
+            let result = locals.get_item("_result").ok().flatten();
+            match result {
+                None => (HookOutcome::Consumed { hook_name: hook.name.clone() }, effects),
+                Some(r) if r.is_none() => (HookOutcome::Consumed { hook_name: hook.name.clone() }, effects),
+                Some(_) => {
+                    // Hook returned e — read back mutations.
+                    let priority = e.get_item("priority").ok().flatten()
+                        .and_then(|v| v.extract::<u8>().ok())
+                        .unwrap_or(item.priority);
+                    let hook_note = e.get_item("hook_note").ok().flatten()
+                        .and_then(|v| v.extract::<String>().ok());
+                    (HookOutcome::Passed { hook_name: hook.name.clone(), priority, hook_note }, effects)
+                }
+            }
+        }
+        Err(exc) => {
+            let tb = exc.traceback(py)
+                .and_then(|t| t.format().ok())
+                .unwrap_or_default();
+            (
+                HookOutcome::Failed {
+                    hook_name: hook.name.clone(),
+                    error: format!("{}{}", tb, exc),
+                },
+                effects,  // side effects before the exception still apply
+            )
+        }
+    }
+}
+
 // ---- Python Preamble ----
 
 const PREAMBLE: &str = r#"
@@ -941,6 +1255,7 @@ class ChildSettings:
     prefix_attach: list[str] | None = None
 
 send_message = _harness.send_message
+wait_for_message_channel = _harness.wait_for_message_channel
 shell_exec = _harness.shell_exec
 shell_status = _harness.shell_status
 shell_output = _harness.shell_output
@@ -955,6 +1270,9 @@ fork = _harness.fork
 kill_child = _harness.kill_child
 message_agent = _harness.message_agent
 done = _harness.done
+register_hook = _harness.register_hook
+remove_hook = _harness.remove_hook
+list_hooks = _harness.list_hooks
 agent_name = _harness.agent_name
 agent_lineage = _harness.agent_lineage
 harness_bin = _harness.harness_bin
@@ -991,9 +1309,10 @@ pub fn execute(
     is_compaction: bool,
     process_outputs: &HashMap<String, String>,
 ) -> ExecutionResult {
-    execute_with_timeout(state, code, is_compaction, process_outputs, 5, 1, "root", "root", &HashMap::new())
+    execute_with_timeout(state, code, is_compaction, process_outputs, 5, 1, "root", "root", &HashMap::new(), None)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn execute_with_timeout(
     state: &HarnessState,
     code: &str,
@@ -1004,6 +1323,7 @@ pub fn execute_with_timeout(
     agent_name: &str,
     agent_lineage: &str,
     pinned_memory: &HashMap<String, String>,
+    subscribers: Option<Arc<crate::http_server::SubscriberRegistry>>,
 ) -> ExecutionResult {
     // Clone everything the thread needs (state is already Clone)
     let state = state.clone();
@@ -1012,11 +1332,20 @@ pub fn execute_with_timeout(
     let agent_name = agent_name.to_string();
     let agent_lineage = agent_lineage.to_string();
     let pinned_memory = pinned_memory.clone();
+    // Capture the tokio handle if we're in a runtime (we are, in agent_loop).
+    // wait_for_message_channel needs this to block_on the async wait. Tests
+    // that call execute() directly without a runtime get None → the function
+    // raises cleanly.
+    let tokio_handle = tokio::runtime::Handle::try_current().ok();
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<ExecutionResult>(1);
 
     std::thread::spawn(move || {
-        let result = execute_inner(&state, &code, is_compaction, &process_outputs, child_depth_remaining, &agent_name, &agent_lineage, &pinned_memory);
+        let result = execute_inner(
+            &state, &code, is_compaction, &process_outputs,
+            child_depth_remaining, &agent_name, &agent_lineage, &pinned_memory,
+            subscribers, tokio_handle,
+        );
         let _ = tx.send(result);
     });
 
@@ -1072,6 +1401,7 @@ pub fn execute_with_timeout(
 }
 
 /// Inner execution function that runs on a dedicated thread.
+#[allow(clippy::too_many_arguments)]
 fn execute_inner(
     state: &HarnessState,
     code: &str,
@@ -1081,6 +1411,8 @@ fn execute_inner(
     agent_name: &str,
     agent_lineage: &str,
     pinned_memory: &HashMap<String, String>,
+    subscribers: Option<Arc<crate::http_server::SubscriberRegistry>>,
+    tokio_handle: Option<tokio::runtime::Handle>,
 ) -> ExecutionResult {
     let collector = Arc::new(Mutex::new(SideEffectCollector {
         id_gen: state.id_generator.clone(),
@@ -1236,6 +1568,12 @@ fn execute_inner(
                 harness_bin: std::env::current_exe()
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|_| "claude-server".into()),
+                subscribers: subscribers.clone(),
+                tokio_handle: tokio_handle.clone(),
+                hook_mode: false,
+                hooks_snapshot: state.hooks.iter()
+                    .map(|h| (h.name.clone(), h.priority, h.match_expr.clone()))
+                    .collect(),
             },
         )?;
         locals.set_item("_harness", harness)?;
@@ -1531,6 +1869,7 @@ print("all passed")
             "root",
             "root",
             &HashMap::new(),
+            None,
         );
         assert!(!result.is_error, "Error: {}", result.error_text);
         assert_eq!(result.stdout.trim(), "all passed");
@@ -1557,6 +1896,7 @@ print("all passed")
             "root",
             "root",
             &HashMap::new(),
+            None,
         );
         let elapsed = start.elapsed();
         assert!(result.is_error, "Should have timed out");
@@ -1597,6 +1937,7 @@ print("forked")
             "root",
             "root",
             &HashMap::new(),
+            None,
         );
         assert!(!result.is_error, "Error: {}", result.error_text);
         assert_eq!(result.stdout.trim(), "forked");
@@ -1699,6 +2040,7 @@ fork([
             "root",
             "root",
             &HashMap::new(),
+            None,
         );
         assert!(!result.is_error, "Error: {}", result.error_text);
         let req = &result.side_effects.fork_requests[0];
@@ -1781,6 +2123,7 @@ print(agent_lineage)
             "api-checker",
             "api-checker, child of plan-builder, child of root",
             &HashMap::new(),
+            None,
         );
         assert!(!result.is_error, "Error: {}", result.error_text);
         let lines: Vec<&str> = result.stdout.trim().lines().collect();
@@ -1843,6 +2186,7 @@ memory.unpin("existing")
             "root",
             "root",
             &pinned,
+            None,
         );
         assert!(!result.is_error, "Error: {}", result.error_text);
         assert!(result.stdout.contains("pinned: ['existing']"));
@@ -1949,4 +2293,190 @@ except AttributeError as e:
         assert!(result.stdout.contains("has no field 'chat_id'"));
         assert!(result.stdout.contains("Available fields"));
     }
+
+    // ---- Hook tests ----
+
+    #[test]
+    fn test_register_hook_syntax_validation() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        // Bad match_expr
+        let r = execute(&state,
+            r#"register_hook("h", 5, "e.type ==", "return None")"#,
+            false, &HashMap::new());
+        assert!(r.is_error, "expected syntax error for bad match_expr");
+        assert!(r.error_text.contains("match_expr"), "error: {}", r.error_text);
+        // Bad process
+        let r = execute(&state,
+            r#"register_hook("h", 5, "True", "return return")"#,
+            false, &HashMap::new());
+        assert!(r.is_error, "expected syntax error for bad process");
+        assert!(r.error_text.contains("process"), "error: {}", r.error_text);
+        // Good
+        let r = execute(&state,
+            r#"register_hook("h", 5, "e['type'] == 'UserMessage'", "return None")"#,
+            false, &HashMap::new());
+        assert!(!r.is_error, "Error: {}", r.error_text);
+        assert_eq!(r.side_effects.hook_adds.len(), 1);
+        assert_eq!(r.side_effects.hook_adds[0].name, "h");
+        assert_eq!(r.side_effects.hook_adds[0].priority, 5);
+    }
+
+    fn mk_usermsg_item(content: &str) -> WorkItem {
+        WorkItem {
+            id: AgentId("test".into()),
+            priority: 5,
+            time: chrono::Utc::now(),
+            item_type: WorkItemType::UserMessage {
+                chat_id: "c1".into(), user: "u".into(),
+                content: content.into(), message_ref: None,
+            },
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_hook_consumed() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        let hooks = vec![Hook {
+            name: "drop-hi".into(), priority: 5,
+            match_expr: "e['type'] == 'UserMessage' and 'hi' in e['content']".into(),
+            process: "return None".into(),
+            timeout_ms: 3000,
+        }];
+        let (out, fx) = run_hooks(&hooks, &mk_usermsg_item("hi there"), &state, None);
+        assert!(matches!(out, HookOutcome::Consumed { .. }));
+        assert!(fx.messages.is_empty());
+    }
+
+    #[test]
+    fn test_hook_passed_with_priority_bump() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        let hooks = vec![Hook {
+            name: "escalate".into(), priority: 5,
+            match_expr: "'urgent' in e.get('content', '')".into(),
+            process: "e['priority'] = 9\ne['hook_note'] = 'bumped'\nreturn e".into(),
+            timeout_ms: 3000,
+        }];
+        let (out, _) = run_hooks(&hooks, &mk_usermsg_item("urgent thing"), &state, None);
+        match out {
+            HookOutcome::Passed { hook_name, priority, hook_note } => {
+                assert_eq!(hook_name, "escalate");
+                assert_eq!(priority, 9);
+                assert_eq!(hook_note, Some("bumped".into()));
+            }
+            _ => panic!("expected Passed, got {:?}", std::mem::discriminant(&out)),
+        }
+    }
+
+    #[test]
+    fn test_hook_no_match() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        let hooks = vec![Hook {
+            name: "never".into(), priority: 5,
+            match_expr: "False".into(),
+            process: "return None".into(),
+            timeout_ms: 3000,
+        }];
+        let (out, _) = run_hooks(&hooks, &mk_usermsg_item("anything"), &state, None);
+        assert!(matches!(out, HookOutcome::NoMatch));
+    }
+
+    #[test]
+    fn test_hook_raises_preserves_original() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        let hooks = vec![Hook {
+            name: "boom".into(), priority: 5,
+            match_expr: "True".into(),
+            process: "raise ValueError('kaboom')".into(),
+            timeout_ms: 3000,
+        }];
+        let (out, _) = run_hooks(&hooks, &mk_usermsg_item("trigger"), &state, None);
+        match out {
+            HookOutcome::Failed { hook_name, error } => {
+                assert_eq!(hook_name, "boom");
+                assert!(error.contains("kaboom"), "error: {}", error);
+            }
+            _ => panic!("expected Failed"),
+        }
+    }
+
+    #[test]
+    fn test_hook_priority_order() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        // Both match — higher priority wins. Caller (apply_side_effects)
+        // maintains sort order; simulate that here.
+        let mut hooks = vec![
+            Hook { name: "low".into(), priority: 1, match_expr: "True".into(),
+                   process: "return None".into(), timeout_ms: 3000 },
+            Hook { name: "high".into(), priority: 10, match_expr: "True".into(),
+                   process: "return None".into(), timeout_ms: 3000 },
+        ];
+        hooks.sort_by(|a, b| b.priority.cmp(&a.priority));
+        let (out, _) = run_hooks(&hooks, &mk_usermsg_item("x"), &state, None);
+        match out {
+            HookOutcome::Consumed { hook_name } => assert_eq!(hook_name, "high"),
+            _ => panic!("expected Consumed"),
+        }
+    }
+
+    #[test]
+    fn test_hook_block_for_disallowed() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        let hooks = vec![Hook {
+            name: "tries-block".into(), priority: 5,
+            match_expr: "True".into(),
+            process: "shell_exec(cmd='echo', args=['hi'], block_for=timedelta(seconds=1))".into(),
+            timeout_ms: 3000,
+        }];
+        let (out, _) = run_hooks(&hooks, &mk_usermsg_item("x"), &state, None);
+        match out {
+            HookOutcome::Failed { error, .. } => {
+                assert!(error.contains("block_for") && error.contains("second hook"),
+                    "error: {}", error);
+            }
+            _ => panic!("expected Failed from block_for restriction"),
+        }
+    }
+
+    #[test]
+    fn test_hook_shell_exec_fire_and_forget_ok() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        let hooks = vec![Hook {
+            name: "spawn".into(), priority: 5,
+            match_expr: "True".into(),
+            process: "shell_exec(cmd='ffprobe', args=[e['content']], description='probe')\nreturn None".into(),
+            timeout_ms: 3000,
+        }];
+        let (out, fx) = run_hooks(&hooks, &mk_usermsg_item("/tmp/vid.mp4"), &state, None);
+        assert!(matches!(out, HookOutcome::Consumed { .. }));
+        assert_eq!(fx.process_starts.len(), 1);
+        assert_eq!(fx.process_starts[0].cmd, "ffprobe");
+        assert_eq!(fx.process_starts[0].args, vec!["/tmp/vid.mp4".to_string()]);
+    }
+
+    #[test]
+    fn test_hook_memory_write() {
+        init();
+        let state = HarnessState::new(200_000, 16384);
+        let hooks = vec![Hook {
+            name: "counter".into(), priority: 5,
+            match_expr: "True".into(),
+            process: "memory['hits'] = memory.get('hits', 0) + 1\nreturn None".into(),
+            timeout_ms: 3000,
+        }];
+        let (out, fx) = run_hooks(&hooks, &mk_usermsg_item("x"), &state, None);
+        assert!(matches!(out, HookOutcome::Consumed { .. }));
+        assert_eq!(fx.memory_sets.len(), 1);
+        assert_eq!(fx.memory_sets[0].0, "hits");
+    }
+
+
 }

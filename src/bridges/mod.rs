@@ -57,6 +57,10 @@ pub fn run(cmd: BridgeCmd) {
 /// Core relay loop shared by all bridges.
 ///
 pub struct Inbound {
+    /// Full chat_id including the bridge prefix (e.g. "signal:+15551234567").
+    /// Bridges construct this from the message source so a single bridge
+    /// instance can handle multiple peers.
+    pub chat_id: String,
     pub text: String,
     pub attachments: Vec<String>,
     /// Bridge-native message ID (Signal timestamp, Discord snowflake, etc.)
@@ -64,28 +68,30 @@ pub struct Inbound {
     pub message_ref: Option<String>,
 }
 
-impl From<String> for Inbound {
-    fn from(text: String) -> Self {
-        Self { text, attachments: Vec::new(), message_ref: None }
-    }
-}
-
 /// Outbound message from agent to bridge. When `react_to` is set, the bridge
 /// sends a reaction (emoji in `content`) to the referenced message instead
-/// of a regular message.
+/// of a regular message. `chat_id` carries the full destination — bridges
+/// parse the recipient from the suffix (e.g. strip "signal:" to get the
+/// phone number).
 pub struct Outbound {
+    pub chat_id: String,
     pub content: String,
     pub attachments: Vec<String>,
     pub react_to: Option<String>,
 }
 
-/// - `inbound_rx`: messages received from the external service
-/// - `outbound`: called for each agent message pulled from the SSE stream
+/// - `sse_pattern`: subscription pattern for the SSE stream. Use a prefix
+///   ending in `*` (e.g. `signal:*`) so one bridge handles all peers in its
+///   namespace. The outbound closure receives the full chat_id to parse the
+///   recipient from.
+/// - `inbound_rx`: messages received from the external service. Each carries
+///   its own chat_id (e.g. `signal:{src}`) so the agent knows who sent it.
+/// - `outbound`: called for each agent message pulled from the SSE stream.
 ///
 /// Runs until either side closes or errors.
 pub async fn relay_loop<F, Fut>(
     api_url: &str,
-    chat_id: &str,
+    sse_pattern: &str,
     user: &str,
     mut inbound_rx: mpsc::UnboundedReceiver<Inbound>,
     outbound: F,
@@ -96,9 +102,9 @@ where
 {
     let client = reqwest::Client::new();
     let msg_url = format!("{}/message", api_url);
-    let sse_url = format!("{}/messages/{}/stream", api_url, chat_id);
+    let sse_url = format!("{}/messages/{}/stream", api_url, sse_pattern);
 
-    eprintln!("[bridge] chat_id={} api_url={}", chat_id, api_url);
+    eprintln!("[bridge] sse_pattern={} api_url={}", sse_pattern, api_url);
 
     // Outbound: SSE → external service
     let resp = client
@@ -123,7 +129,7 @@ where
                 match maybe_msg {
                     Some(msg) => {
                         let body = json!({
-                            "chat_id": chat_id,
+                            "chat_id": msg.chat_id,
                             "user": user,
                             "content": msg.text,
                             "attachments": msg.attachments,
@@ -159,7 +165,10 @@ where
                             }
                             if pending_event == "message" && !pending_data.is_empty() {
                                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pending_data) {
-                                    if let Some(content) = v.get("content").and_then(|c| c.as_str()) {
+                                    if let (Some(content), Some(msg_chat_id)) = (
+                                        v.get("content").and_then(|c| c.as_str()),
+                                        v.get("chat_id").and_then(|c| c.as_str()),
+                                    ) {
                                         let attachments: Vec<String> = v.get("attachments")
                                             .and_then(|a| a.as_array())
                                             .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
@@ -167,9 +176,14 @@ where
                                         let react_to = v.get("react_to")
                                             .and_then(|r| r.as_str())
                                             .map(String::from);
-                                        let out = Outbound { content: content.to_string(), attachments, react_to };
+                                        let out = Outbound {
+                                            chat_id: msg_chat_id.to_string(),
+                                            content: content.to_string(),
+                                            attachments,
+                                            react_to,
+                                        };
                                         if let Err(e) = outbound(out).await {
-                                            eprintln!("[bridge] outbound send failed: {}", e);
+                                            eprintln!("[bridge] outbound send failed: {:#}", e);
                                         }
                                     }
                                 }

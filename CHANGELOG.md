@@ -1,5 +1,70 @@
 # Changelog
 
+## 2026-03-30 (v0.2.4)
+
+### Event hooks — API-free local handling (feedback #32 part 2)
+- **`register_hook(name, priority, match_expr, process, timeout_ms)`** —
+  agent-registered Python scripts that run before a WorkItem enters the
+  queue. First matching hook (priority-descending, first-match-wins) runs
+  its `process()`. Returns `None` → event consumed (no API call);
+  returns `e` → event passes (optionally with `e['priority']`/`e['hook_note']`
+  mutated); raises → `HookException` WorkItem wrapping the original.
+  Both `match_expr` and `process` are source strings — syntax-validated
+  at registration via `compile()`, no closures.
+- **Execution model** (`python::run_hooks`): single interpreter-enter per
+  event, all match expressions evaluated in one pass. `e` is a plain dict
+  built from the WorkItem. Hook-mode `PyHarness`: `shell_exec` allowed
+  but `block_for` raises ("chain a second hook for ProcessCompleted"),
+  `fork`/`done`/`compact`/`wait_for_message_channel` raise. Watchdog
+  thread + `PyErr_SetInterrupt` bounds each hook to its `timeout_ms`.
+- **Integration** (`agent_loop::push_item`): all `work_queue.push` calls
+  in `apply_event` go through the hook pipeline. `apply_hook_effects`
+  applies the restricted side-effect subset (memory, timers, fire-and-forget
+  processes, messages). Hook-emitted side effects from a partial run
+  (before a raise) still apply.
+- **`!hooks list|disable NAME|clear`** safety hatch — handled in Rust
+  before hook matching, so a buggy hook can't intercept the rescue command.
+- **Telemetry**: `HarnessState.hook_stats` tracks `(fired, consumed,
+  passed, raised)` per hook. NOT rendered in `<agent_state>` (would thrash
+  cache). `flush_hook_telemetry()` pushes a `SystemAlert` to history on
+  idle→active, then resets.
+- **`QueueFilter` removed** — `work_queue.add_filter`/`remove_filter`
+  deleted. Hooks subsume: `register_hook('spam', 0, "'BUY' in e.get('content','')", 'return None')`.
+- **`--agent-personal-name`** on `feedback` subcommand — per-deployment
+  identifier stored alongside `agent_name` so triage can tell which
+  `root` is which.
+
+## 2026-03-30 (v0.2.3)
+
+### Message routing overhaul (feedback #30, #31)
+- **`SubscriberRegistry`** (`http_server.rs`): tracks active SSE subscription
+  patterns (exact + prefix). Guard-based — register returns a guard, drop
+  decrements. `would_reach(chat_id)` is a sync HashMap check;
+  `wait_for(chat_id, timeout)` is an async arm-then-check-then-wait loop
+  using `tokio::sync::Notify`.
+- **`send_message` fails fast**: raises `RuntimeError` if
+  `subscribers.would_reach(chat_id)` is false. No more silent drops to
+  typo'd chat_ids or not-yet-connected bridges. Error message suggests
+  `wait_for_message_channel`.
+- **`wait_for_message_channel(chat_id, timeout_ms=3000)`**: new Python
+  builtin. Blocks until a subscriber for `chat_id` exists, or raises
+  `TimeoutError`. Captures the tokio `Handle` before the Python thread
+  spawn so `block_on` works from the dedicated thread. Closes the startup
+  race where `shell_exec(bridge...); send_message(...)` in the same turn
+  fired before the bridge finished its SSE handshake.
+- **Bridges subscribe by prefix**: `signal:*`, `telegram:*`, `discord:*`,
+  `slack:*`, `email:*`. One bridge instance handles all peers in its
+  namespace. `--peer`/`--channel` is now an optional allowlist (`Vec<String>`)
+  — omit to accept from anyone. Outbound recipient parsed from
+  `out.chat_id.strip_prefix(...)`. `Inbound` and `Outbound` structs gained
+  `chat_id` fields; `relay_loop` takes `sse_pattern` instead of `chat_id`.
+- **Telegram 4096-char chunking** (feedback #31): `chunk_for_telegram()`
+  splits at line boundaries, falls back to char-boundary-safe hard splits
+  for single lines exceeding the limit. Previously messages >4096 chars
+  got a 400 from Telegram and were silently dropped.
+- Local stdio chat registers `"local"` so `send_message("local", ...)` passes
+  the routability check.
+
 ## 2026-03-28 (v0.2.2)
 
 ### Information Stewardship guidance

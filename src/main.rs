@@ -62,6 +62,30 @@ const AGENT_CHANGELOG: &[(&str, &str)] = &[
 - If your client has granted standing authorizations (e.g. 'tell the
   gardener about packages'), memory.pin() them NOW with explicit scope
   (who/what/until-when) so they survive compaction."),
+    ("0.2.3", "\
+- send_message now RAISES if no bridge is subscribed to the chat_id.
+  Previously messages to typo'd or not-yet-connected chat_ids vanished
+  silently. Your restart-notification pattern needs updating:
+    shell_exec(cmd=harness_bin, args=['bridge', 'signal', ...])
+    wait_for_message_channel('signal:+1555...', timeout_ms=3000)
+    send_message('signal:+1555...', 'I restarted')
+- Bridges now subscribe by PREFIX (signal:*, telegram:*, etc.) — one
+  bridge instance handles all peers in its namespace. Drop --peer from
+  your bridge spawn args (or keep it as an allowlist). You can now
+  send_message to any Signal number without spawning a new bridge per
+  number."),
+    ("0.2.4", "\
+- Hooks: register_hook(name, priority, match_expr, process, timeout_ms)
+  runs Python locally on matching events — no API call unless the hook
+  passes through or raises. Use for health checks, spam filters, routine
+  event triage. match_expr and process are SOURCE STRINGS (syntax-checked
+  at registration). shell_exec allowed but NOT block_for — chain a second
+  hook for the ProcessCompleted. '!hooks list/disable/clear' from any chat
+  bypasses all hooks if one breaks. SystemAlert on wake shows what fired.
+- work_queue.add_filter/remove_filter are GONE. Replace with:
+    register_hook('spam', 0, \"'BUY NOW' in e.get('content','')\", 'return None')
+- feedback --agent-personal-name 'debian-camera' — per-deployment identifier
+  so the feedback server can tell which 'root' is which."),
 ];
 
 /// Parse "X.Y.Z" into a comparable tuple. Unparseable → (0,0,0) so it sorts
@@ -278,6 +302,11 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
     let registry = Arc::new(types::AgentRegistry::new());
     let registry_for_http = registry.clone();
 
+    // Subscriber registry: tracks active SSE subscriptions so send_message
+    // can fail fast on unroutable chat_ids and wait_for_message_channel can
+    // block until a bridge connects.
+    let subscribers = Arc::new(http_server::SubscriberRegistry::default());
+
     // Shutdown signal — watch channel so every select! can race against it.
     // Setting it cancels in-flight turns (API retries, sleeps) via future drop.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -298,6 +327,7 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
         token_accumulator.clone(),
         registry,
         shutdown_rx,
+        subscribers.clone(),
     );
 
     // Forward process events to the main event channel
@@ -324,7 +354,16 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
         std::process::exit(130);
     });
 
-    let local_chat_rx = local_chat.then(|| broadcast_tx.subscribe());
+    // Local chat subscribes to "local" so send_message("local", ...) passes
+    // the routability check. Guard bound at function scope — lives until
+    // run_daemon returns (i.e. process exit).
+    let _local_guard;
+    let local_chat_rx = if local_chat {
+        _local_guard = subscribers.register("local");
+        Some(broadcast_tx.subscribe())
+    } else {
+        None
+    };
 
     // Start HTTP server
     let router = http_server::create_router(
@@ -336,6 +375,7 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
         shutdown_tx.clone(),
         registry_for_http,
         api_trace,
+        subscribers,
     );
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     println!("  HTTP server listening on {}", config.listen_addr);

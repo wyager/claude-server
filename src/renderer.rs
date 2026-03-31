@@ -423,6 +423,15 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
                 }
             }
         }
+        WorkItemType::HookException { hook_name, error, original } => {
+            out.push_str("type: HookException\n");
+            out.push_str(&format!("hook_name: {}\n", hook_name));
+            out.push_str(&format!("error: {}\n", truncate_with_note(error, content_limit)));
+            // Original shown compact — agent can access full via item.original
+            if let Ok(s) = serde_json::to_string(original) {
+                out.push_str(&format!("original: {}\n", truncate_with_note(&s, content_limit)));
+            }
+        }
     }
 
     if !item.attachments.is_empty() {

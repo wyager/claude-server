@@ -19,6 +19,81 @@ use crate::core_loop::HarnessEvent;
 use crate::db::Database;
 use crate::types::{AgentRegistry, TokenAccumulator};
 
+/// Tracks active SSE subscription patterns so `send_message` can fail fast
+/// on unroutable chat_ids and `wait_for_message_channel` can block until a
+/// bridge connects. Patterns are either exact chat_ids or prefixes (trailing
+/// `*` stripped before insert; see `would_reach`).
+#[derive(Default)]
+pub struct SubscriberRegistry {
+    inner: Mutex<SubscriberInner>,
+    notify: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct SubscriberInner {
+    /// Exact-match subscriptions → count (same chat_id can have multiple subs).
+    exact: std::collections::HashMap<String, usize>,
+    /// Prefix subscriptions (without the `*`) → count.
+    prefix: std::collections::HashMap<String, usize>,
+}
+
+impl SubscriberRegistry {
+    /// Register a subscription. Returns a guard that unregisters on drop.
+    /// `pattern` is the raw SSE path segment — trailing `*` means prefix match.
+    pub fn register(self: &Arc<Self>, pattern: &str) -> SubscriberGuard {
+        let (key, is_prefix) = match pattern.strip_suffix('*') {
+            Some(p) => (p.to_owned(), true),
+            None => (pattern.to_owned(), false),
+        };
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let map = if is_prefix { &mut inner.prefix } else { &mut inner.exact };
+            *map.entry(key.clone()).or_default() += 1;
+        }
+        self.notify.notify_waiters();
+        SubscriberGuard { reg: self.clone(), key, is_prefix }
+    }
+
+    /// Would a `send_message(chat_id, ...)` reach at least one subscriber?
+    pub fn would_reach(&self, chat_id: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.exact.contains_key(chat_id)
+            || inner.prefix.keys().any(|p| chat_id.starts_with(p))
+    }
+
+    /// Block until `would_reach(chat_id)` is true or timeout. Arm-then-check
+    /// closes the TOCTOU gap between checking and waiting.
+    pub async fn wait_for(&self, chat_id: &str, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.notify.notified();
+            if self.would_reach(chat_id) {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return false;
+            }
+        }
+    }
+}
+
+pub struct SubscriberGuard {
+    reg: Arc<SubscriberRegistry>,
+    key: String,
+    is_prefix: bool,
+}
+
+impl Drop for SubscriberGuard {
+    fn drop(&mut self) {
+        let mut inner = self.reg.inner.lock().unwrap();
+        let map = if self.is_prefix { &mut inner.prefix } else { &mut inner.exact };
+        if let Some(c) = map.get_mut(&self.key) {
+            *c -= 1;
+            if *c == 0 { map.remove(&self.key); }
+        }
+    }
+}
+
 /// Broadcast message sent from the core loop to SSE subscribers.
 #[derive(Debug, Clone)]
 pub enum BroadcastMsg {
@@ -47,6 +122,7 @@ struct AppState {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     registry: Arc<AgentRegistry>,
     api_trace: Arc<Mutex<crate::api_client::ApiTrace>>,
+    subscribers: Arc<SubscriberRegistry>,
 }
 
 // ---- Request/Response types ----
@@ -218,8 +294,12 @@ async fn handle_sse(
     // chat_ids under a namespace (e.g. `agentchat:*`) and parse the
     // recipient from the suffix.
     let prefix = chat_id.strip_suffix('*').map(str::to_owned);
+    // Guard lives in the stream closure; drops when the stream ends (client
+    // disconnect), decrementing the subscriber count.
+    let guard = state.subscribers.register(&chat_id);
     let stream = BroadcastStream::new(rx)
         .filter_map(move |msg| {
+            let _guard = &guard;
             match msg {
                 Ok(BroadcastMsg::Message {
                     chat_id: ref msg_chat_id,
@@ -265,6 +345,7 @@ pub fn create_router(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     registry: Arc<AgentRegistry>,
     api_trace: Arc<Mutex<crate::api_client::ApiTrace>>,
+    subscribers: Arc<SubscriberRegistry>,
 ) -> Router {
     let state = AppState {
         event_tx,
@@ -275,6 +356,7 @@ pub fn create_router(
         shutdown_tx,
         registry,
         api_trace,
+        subscribers,
     };
 
     Router::new()
@@ -296,4 +378,67 @@ fn rand_id() -> u32 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     (d.as_nanos() & 0xFFFFFFFF) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_subscriber_registry_would_reach() {
+        let reg = Arc::new(SubscriberRegistry::default());
+        assert!(!reg.would_reach("signal:+1555"));
+
+        let g1 = reg.register("signal:+1555");
+        assert!(reg.would_reach("signal:+1555"));
+        assert!(!reg.would_reach("signal:+1999"));
+        assert!(!reg.would_reach("telegram:123"));
+
+        let g2 = reg.register("telegram:*");
+        assert!(reg.would_reach("telegram:123"));
+        assert!(reg.would_reach("telegram:anything"));
+        assert!(!reg.would_reach("telegraph:x"));
+
+        drop(g1);
+        assert!(!reg.would_reach("signal:+1555"));
+        assert!(reg.would_reach("telegram:123"));
+
+        drop(g2);
+        assert!(!reg.would_reach("telegram:123"));
+    }
+
+    #[test]
+    fn test_subscriber_registry_refcount() {
+        let reg = Arc::new(SubscriberRegistry::default());
+        let g1 = reg.register("signal:*");
+        let g2 = reg.register("signal:*");
+        assert!(reg.would_reach("signal:+1"));
+        drop(g1);
+        assert!(reg.would_reach("signal:+1")); // g2 still holds it
+        drop(g2);
+        assert!(!reg.would_reach("signal:+1"));
+    }
+
+    #[tokio::test]
+    async fn test_subscriber_wait_for() {
+        let reg = Arc::new(SubscriberRegistry::default());
+
+        // Already subscribed → immediate
+        let g = reg.register("x:*");
+        assert!(reg.wait_for("x:1", std::time::Duration::from_millis(10)).await);
+        drop(g);
+
+        // Timeout
+        assert!(!reg.wait_for("y:1", std::time::Duration::from_millis(50)).await);
+
+        // Subscribe mid-wait
+        let reg2 = reg.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            // Guard held to end of task — long enough for the waiter to observe.
+            let _g = reg2.register("z:*");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+        assert!(reg.wait_for("z:1", std::time::Duration::from_millis(200)).await);
+    }
 }
