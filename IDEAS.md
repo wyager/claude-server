@@ -14,7 +14,7 @@ with `block_for` instead.
 
 - **Dynamic modification window**: Instead of fixed last-5-entries, compute based on token budget. When context is tight, shrink the window; when it's spacious, expand it.
 
-- **Incremental context diffing**: Instead of re-rendering the entire context each turn, compute the diff from last turn and send only changed portions. Would dramatically improve prompt cache hit rates for the user message (not just the system prompt).
+- ~~**Incremental context diffing**~~: REJECTED — API trace #23 proved the cache requires 100% byte-identical blocks with no partial/diff update surface. You always send the full context; it either hits (exact match → cache_read at 10%) or misses (full re-ingest). Geometric tiers (stride=5/tiers=2) achieve the same goal differently: keep breakpoints byte-stable across many turns so bulk content stays in cache_read; the "diff" is implicit in the bounded uncached tail.
 
 ## Agent Capabilities
 
@@ -48,7 +48,7 @@ with `block_for` instead.
 
 ## Operations & Observability
 
-- **Web dashboard**: A real-time web UI showing the agent's memory contents, active timers, running processes, event history, and queue state. Much more useful than `--dump-turns` for understanding what the agent is doing.
+- ~~**Web dashboard**~~: DONE — `GET /dashboard` serves a single-file HTML UI; `GET /dashboard/state` returns JSON snapshots of all agents (root + children). Each `AgentLoop` pushes a full snapshot to `AgentRegistry` at the start of each turn ("thinking" — shows what the model sees) and on idle (post-execution — shows results). Memory values included (truncated, sensitive keys redacted), collapsed by default in the UI. Per-agent cards show status, queue, history tail, memory, timers, processes, hooks + stats, last-turn usage/cost. 2s poll; open/closed section state preserved across re-renders.
 
 - **Structured logging**: Replace `println!` statements with structured JSON logs (using `tracing` crate). Enable log levels, filtering, and integration with monitoring tools.
 

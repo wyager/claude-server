@@ -217,6 +217,8 @@ GET  /messages/:chat_id          → { messages: [...] }
 GET  /messages/:chat_id/stream   SSE stream (prefix match if chat_id ends in *)
 GET  /api-trace                  → last N request/response pairs (sensitive values pre-scrubbed)
 GET  /cost                       → { input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, estimated_cost_usd }
+GET  /dashboard                  → embedded HTML UI (live view of all agents)
+GET  /dashboard/state            → { agent_name: AgentSnapshot, ... } — queue, history tail, memory, timers, processes, hooks, usage
 POST /shutdown                   → { status }
 ```
 

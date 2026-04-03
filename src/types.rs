@@ -787,6 +787,10 @@ use tokio::sync::mpsc;
 /// Shared across all agent loops for inter-agent messaging and fork validation.
 pub struct AgentRegistry {
     agents: Mutex<HashMap<String, AgentEntry>>,
+    /// Per-agent state snapshots for the web dashboard. Updated once per turn
+    /// by each AgentLoop. Separate mutex from `agents` so dashboard reads
+    /// don't contend with message routing.
+    snapshots: Mutex<HashMap<String, AgentSnapshot>>,
 }
 
 struct AgentEntry {
@@ -801,6 +805,7 @@ impl AgentRegistry {
     pub fn new() -> Self {
         Self {
             agents: Mutex::new(HashMap::new()),
+            snapshots: Mutex::new(HashMap::new()),
         }
     }
 
@@ -894,6 +899,129 @@ impl AgentRegistry {
     pub fn exists(&self, name: &str) -> bool {
         self.agents.lock().unwrap().contains_key(name)
     }
+
+    /// Replace this agent's snapshot. Called once per turn by each AgentLoop,
+    /// right after render (so the dashboard sees the same state the model does).
+    pub fn update_snapshot(&self, snapshot: AgentSnapshot) {
+        self.snapshots.lock().unwrap().insert(snapshot.name.clone(), snapshot);
+    }
+
+    /// Fast patch for status transitions (idle ↔ thinking ↔ executing) without
+    /// rebuilding the whole snapshot. No-op if the agent has no snapshot yet.
+    pub fn set_status(&self, name: &str, status: &str) {
+        if let Some(s) = self.snapshots.lock().unwrap().get_mut(name) {
+            s.status = status.into();
+            s.updated_at = chrono::Utc::now().to_rfc3339();
+        }
+    }
+
+    /// Full snapshot map for the dashboard JSON endpoint.
+    pub fn all_snapshots(&self) -> HashMap<String, AgentSnapshot> {
+        self.snapshots.lock().unwrap().clone()
+    }
+
+    /// Remove a snapshot (dashboard dismiss). Only meaningful for agents
+    /// that have exited — a live agent will re-populate on its next turn.
+    pub fn remove_snapshot(&self, name: &str) -> bool {
+        self.snapshots.lock().unwrap().remove(name).is_some()
+    }
+
+    /// Bulk-remove all snapshots whose status is terminal. Returns the
+    /// count removed. Used by the "dismiss all done" dashboard button.
+    pub fn prune_terminal_snapshots(&self) -> usize {
+        const TERMINAL: &[&str] = &["done", "shutdown", "killed", "max_turns", "channel_closed"];
+        let mut s = self.snapshots.lock().unwrap();
+        let before = s.len();
+        s.retain(|_, snap| !TERMINAL.contains(&snap.status.as_str()));
+        before - s.len()
+    }
+}
+
+// ---- Dashboard snapshot types ----
+//
+// Lightweight, serializable views of agent state for the web dashboard.
+// Deliberately truncated — full history/memory/output would make every
+// snapshot megabytes. The dashboard shows enough to spot problems; for
+// forensics use --dump-dir.
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentSnapshot {
+    pub name: String,
+    pub lineage: String,
+    pub turn: u32,
+    pub max_turns: Option<u32>,
+    /// "idle" | "thinking" | "executing" — mirrors BroadcastMsg::Status.
+    pub status: String,
+    pub queue: Vec<WorkItemSummary>,
+    pub history_len: usize,
+    /// Last N history entries (code + output truncated).
+    pub history_tail: Vec<HistorySummary>,
+    pub memory: Vec<MemoryEntry>,
+    pub timers: Vec<TimerSummary>,
+    pub processes: Vec<ProcessSummary>,
+    /// (name, priority, match_expr truncated)
+    pub hooks: Vec<(String, i32, String)>,
+    pub hook_stats: HashMap<String, HookStats>,
+    pub last_usage: Option<UsageSummary>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryEntry {
+    pub key: String,
+    pub priority: u8,
+    /// Serialized JSON, truncated. UI collapses by default; the size + a
+    /// peek is enough to decide if you want to expand. Sensitive keys
+    /// (per HarnessState.sensitive_keys) are redacted.
+    pub value: String,
+    /// Full size before truncation, so you can see "2.1KB" without expanding.
+    pub value_len: usize,
+    pub sensitive: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkItemSummary {
+    pub id: String,
+    pub priority: u8,
+    pub item_type: String,
+    /// First ~120 chars of content/output/error — enough to recognize the item.
+    pub preview: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HistorySummary {
+    pub id: String,
+    pub time: String,
+    pub kind: String,  // "Execution" | "Summary" | "SystemAlert"
+    pub code: String,  // truncated
+    pub output: String, // truncated
+    pub is_error: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TimerSummary {
+    pub id: String,
+    pub description: String,
+    pub next_fire: String,
+    pub recurring: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessSummary {
+    pub id: String,
+    pub cmd: String,
+    pub description: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageSummary {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub cost_usd: f64,
+    pub cache_hit_pct: u8,
 }
 
 // ---- API Types ----

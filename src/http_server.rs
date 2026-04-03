@@ -5,7 +5,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::Json;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
@@ -189,6 +189,54 @@ async fn handle_status() -> Json<StatusResponse> {
     })
 }
 
+/// Full state snapshot for all agents (root + children). Each snapshot is
+/// updated once per turn by the owning AgentLoop, so this is "eventually
+/// consistent" with a ~seconds lag. Cheap to serve — just clones the
+/// registry's HashMap.
+async fn handle_dashboard_state(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::to_value(state.registry.all_snapshots()).unwrap_or_default())
+}
+
+/// Remove a snapshot from the dashboard. If the agent is still running
+/// it'll reappear on its next turn — this is for clearing completed
+/// children, not hiding live agents. `:name` of `*` prunes all terminal
+/// snapshots at once (saves clicking through a dozen done children).
+async fn handle_dashboard_dismiss(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Json<serde_json::Value> {
+    if name == "*" {
+        let n = state.registry.prune_terminal_snapshots();
+        Json(serde_json::json!({"removed": n}))
+    } else {
+        let removed = state.registry.remove_snapshot(&name);
+        Json(serde_json::json!({"removed": if removed { 1 } else { 0 }}))
+    }
+}
+
+/// Serve the embedded dashboard HTML. Single-file, no build step — same
+/// pattern as chat.html. The page polls /dashboard/state every 2s; SSE felt
+/// like overkill given snapshots only change once per turn anyway.
+async fn handle_dashboard() -> axum::response::Html<String> {
+    axum::response::Html(include_str!("dashboard.html").to_string())
+}
+
+/// Root landing page — just a link index so hitting the base URL in a
+/// browser doesn't 404. Intentionally spartan; this is plumbing, not a
+/// product surface.
+async fn handle_index() -> axum::response::Html<&'static str> {
+    axum::response::Html(r#"<!doctype html><meta charset=utf-8>
+<title>claude-server</title>
+<style>body{font:14px/1.6 ui-monospace,Menlo,monospace;background:#0d1117;color:#c9d1d9;padding:2em}
+a{color:#58a6ff;text-decoration:none}a:hover{text-decoration:underline}
+code{background:#161b22;padding:1px 5px;border-radius:3px}</style>
+<h3>claude-server</h3>
+<p><a href="/dashboard">→ dashboard</a> (live agent state)</p>
+<p><a href="/status">/status</a> · <a href="/cost">/cost</a> · <a href="/api-trace">/api-trace</a> · <a href="/dashboard/state">/dashboard/state</a></p>
+<p><code>POST /message</code> · <code>POST /event</code> · <code>POST /shutdown</code></p>
+"#)
+}
+
 async fn handle_get_messages(
     State(state): State<AppState>,
     Path(chat_id): Path<String>,
@@ -362,7 +410,11 @@ pub fn create_router(
     Router::new()
         .route("/message", post(handle_message))
         .route("/event", post(handle_event))
+        .route("/", get(handle_index))
         .route("/status", get(handle_status))
+        .route("/dashboard", get(handle_dashboard))
+        .route("/dashboard/state", get(handle_dashboard_state))
+        .route("/dashboard/state/{name}", delete(handle_dashboard_dismiss))
         .route("/cost", get(handle_cost))
         .route("/api-trace", get(handle_api_trace))
         .route("/messages/{chat_id}", get(handle_get_messages))

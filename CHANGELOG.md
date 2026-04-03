@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-04-02
+
+### Web dashboard (`GET /dashboard`)
+- Single-file HTML embedded via `include_str!` (like `chat.html`). No
+  build step, no frameworks — vanilla JS, 2s poll.
+- `GET /dashboard/state` returns `HashMap<String, AgentSnapshot>` for all
+  agents in the registry. Each `AgentLoop` pushes a full snapshot at two
+  points: (1) "thinking" — the pre-API state the model sees; (2) "idle" —
+  post-execution with side effects applied and usage numbers populated.
+  Status transitions ("executing") patch the existing snapshot.
+- Snapshot fields: queue items, history tail (last 10, truncated), memory
+  (values included, sensitive keys redacted per `mark_sensitive`), timers,
+  processes, hooks + stats, last-turn usage (tokens/cost/cache-hit).
+- `AgentSnapshot` and friends in `types.rs`; builder at
+  `agent_loop.rs:build_snapshot`. Bounded truncation throughout so
+  serialization stays cheap for long-running agents.
+- UI: per-agent cards, root first. Memory entries are `<details>` —
+  collapsed by default, expand to see the value. Open/closed state
+  survives re-renders (tracked in a Set keyed on agent+section).
+
+### System prompt — behavioral guidance (ported from Claude Code)
+- **Honest Status Reporting**: lead with failures, distinguish "started"
+  from "confirmed working", don't collapse uncertainty into checkmarks.
+- **Irreversible Actions**: recovery-cost framing before destructive
+  shell_exec, "unfamiliar state is not garbage."
+- **Error Recovery** expanded: stop respawning after 3 failed restarts,
+  diagnose instead.
+- **Memory** expanded: what to pin vs what to skip, verify-before-acting
+  on stale beliefs.
+
 ## 2026-03-30 (v0.2.5)
 
 ### Clone-and-mutate: read-after-write works everywhere

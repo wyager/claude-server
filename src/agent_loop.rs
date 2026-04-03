@@ -49,6 +49,18 @@ pub enum FinishReason {
     ChannelClosed,
 }
 
+impl FinishReason {
+    fn as_status(&self) -> &'static str {
+        match self {
+            FinishReason::Done => "done",
+            FinishReason::MaxTurns(_) => "max_turns",
+            FinishReason::Shutdown => "shutdown",
+            FinishReason::Killed => "killed",
+            FinishReason::ChannelClosed => "channel_closed",
+        }
+    }
+}
+
 /// Format a lineage vector into a human-readable string.
 /// e.g. vec!["root", "planner", "worker"] → "worker, child of planner, child of root"
 pub fn format_lineage(lineage: &[String]) -> String {
@@ -93,6 +105,9 @@ pub struct AgentLoop {
     local_output_tokens: u64,
     local_cache_creation_tokens: u64,
     local_cache_read_tokens: u64,
+    /// Last turn's API usage, shown in the next turn's dashboard snapshot.
+    /// None until the first API call completes.
+    last_usage: Option<UsageSummary>,
     /// Shared agent registry for naming and inter-agent messaging.
     registry: Arc<AgentRegistry>,
     /// Set when a KillSignal is received; checked each turn boundary.
@@ -157,6 +172,7 @@ impl AgentLoop {
             local_output_tokens: 0,
             local_cache_creation_tokens: 0,
             local_cache_read_tokens: 0,
+            last_usage: None,
             registry,
             killed: false,
             shutdown,
@@ -168,6 +184,163 @@ impl AgentLoop {
     fn broadcast(&self, msg: BroadcastMsg) {
         if let Some(ref tx) = self.broadcast_tx {
             let _ = tx.send(msg);
+        }
+    }
+
+    /// Finalize the dashboard snapshot on exit. Without this, a child that
+    /// finishes mid-turn stays frozen at "executing" forever — confusing
+    /// when you're trying to tell live agents from dead ones. The final
+    /// snapshot shows post-mortem state (what was in memory, what the last
+    /// turn cost) with a terminal status ("done", "killed", etc.).
+    fn finish(&self, reason: FinishReason) -> FinishReason {
+        self.registry.update_snapshot(
+            self.build_snapshot(reason.as_status(), self.last_usage.clone())
+        );
+        reason
+    }
+
+    /// Build a dashboard snapshot from current state. Called once per turn
+    /// (right before the API call, so the dashboard mirrors what the model
+    /// sees) and patched at status transitions. Everything here is bounded
+    /// — we cap history tail, truncate strings — so serialization stays
+    /// cheap even for long-running agents with big histories.
+    fn build_snapshot(&self, status: &str, usage: Option<UsageSummary>) -> AgentSnapshot {
+        const TAIL: usize = 10;
+        const TRUNC: usize = 200;
+        let tr = |s: &str| crate::renderer::trunc(s, TRUNC).to_string();
+
+        let queue: Vec<WorkItemSummary> = self.state.work_queue.items().iter()
+            .map(|item| {
+                let (ty, preview) = match &item.item_type {
+                    WorkItemType::UserMessage { content, chat_id, .. } =>
+                        ("UserMessage", format!("[{}] {}", chat_id, tr(content))),
+                    WorkItemType::TimerFired { description, .. } =>
+                        ("TimerFired", tr(description)),
+                    WorkItemType::ProcessCompleted { pid, exit_code, output_preview, .. } =>
+                        ("ProcessCompleted", format!("{} exit={} {}", pid.0, exit_code,
+                            output_preview.as_deref().map(tr).unwrap_or_default())),
+                    WorkItemType::ProcessFailed { pid, error, .. } =>
+                        ("ProcessFailed", format!("{} {}", pid.0, tr(error))),
+                    WorkItemType::ProcessTimeout { pid } =>
+                        ("ProcessTimeout", pid.0.clone()),
+                    WorkItemType::ChildAgentCompleted { child_name, success, summary, .. } =>
+                        ("ChildAgentCompleted", format!("{} ok={} {}", child_name, success, tr(summary))),
+                    WorkItemType::AgentMessage { from, content } =>
+                        ("AgentMessage", format!("[{}] {}", from, tr(content))),
+                    WorkItemType::ExternalEvent { source, event_type, .. } =>
+                        ("ExternalEvent", format!("{}:{}", source, event_type)),
+                    WorkItemType::View { paths } =>
+                        ("View", paths.join(", ")),
+                    WorkItemType::Compaction => ("Compaction", String::new()),
+                    WorkItemType::AgentStartup { .. } => ("AgentStartup", String::new()),
+                    WorkItemType::HookException { hook_name, error, .. } =>
+                        ("HookException", format!("{}: {}", hook_name, tr(error))),
+                };
+                WorkItemSummary {
+                    id: item.id.0.clone(),
+                    priority: item.priority,
+                    item_type: ty.into(),
+                    preview,
+                }
+            })
+            .collect();
+
+        let entries = self.state.event_history.entries();
+        let history_tail: Vec<HistorySummary> = entries.iter().rev().take(TAIL).rev()
+            .map(|e| match e {
+                HistoryEntry::Execution { id, time, code, output, is_error } => HistorySummary {
+                    id: id.0.clone(),
+                    time: time.to_rfc3339(),
+                    kind: "Execution".into(),
+                    code: tr(code),
+                    output: tr(output),
+                    is_error: *is_error,
+                },
+                HistoryEntry::Summary { id, time, description } => HistorySummary {
+                    id: id.0.clone(),
+                    time: time.to_rfc3339(),
+                    kind: "Summary".into(),
+                    code: String::new(),
+                    output: tr(description),
+                    is_error: false,
+                },
+                HistoryEntry::SystemAlert { id, time, message } => HistorySummary {
+                    id: id.0.clone(),
+                    time: time.to_rfc3339(),
+                    kind: "SystemAlert".into(),
+                    code: String::new(),
+                    output: tr(message),
+                    is_error: false,
+                },
+            })
+            .collect();
+
+        // Memory values are included (truncated) so the dashboard can show
+        // them collapsed-by-default. Sensitive keys get redacted — same keys
+        // scrubbed from API traces. Cap value length at 500 chars; dashboard
+        // shows "…(2.1KB)" for anything bigger. Full values are in --dump-dir
+        // if needed.
+        const MEM_TRUNC: usize = 500;
+        let mut memory: Vec<MemoryEntry> = self.state.memory.iter()
+            .map(|(k, v)| {
+                let priority = self.state.memory_priorities.get(k).copied().unwrap_or(5);
+                let sensitive = self.state.sensitive_keys.contains(k);
+                let full = serde_json::to_string(v).unwrap_or_else(|_| "?".into());
+                let value_len = full.len();
+                let value = if sensitive {
+                    "<SENSITIVE, REDACTED>".into()
+                } else {
+                    crate::renderer::trunc(&full, MEM_TRUNC).to_string()
+                };
+                MemoryEntry { key: k.clone(), priority, value, value_len, sensitive }
+            })
+            .collect();
+        memory.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.key.cmp(&b.key)));
+
+        let timers: Vec<TimerSummary> = self.state.timer_manager.list().iter()
+            .map(|t| {
+                let (next, recurring) = match &t.schedule {
+                    TimerSchedule::OneShot { at } => (at.to_rfc3339(), false),
+                    TimerSchedule::Recurring { next_fire, .. } => (next_fire.to_rfc3339(), true),
+                };
+                TimerSummary {
+                    id: t.id.0.clone(),
+                    description: t.description.clone(),
+                    next_fire: next,
+                    recurring,
+                }
+            })
+            .collect();
+
+        let processes: Vec<ProcessSummary> = self.state.process_manager.processes().iter()
+            .map(|p| ProcessSummary {
+                id: p.id.0.clone(),
+                cmd: p.cmd.clone(),
+                description: p.description.clone(),
+                status: format!("{:?}", p.status),
+            })
+            .collect();
+
+        let hooks: Vec<(String, i32, String)> = self.state.hooks.iter()
+            .map(|h| (h.name.clone(), h.priority, tr(&h.match_expr)))
+            .collect();
+
+        AgentSnapshot {
+            name: self.name.clone(),
+            lineage: format_lineage(&self.permissions.lineage),
+            turn: self.turn_counter,
+            max_turns: self.permissions.max_turns,
+            status: status.into(),
+            queue,
+            history_len: entries.len(),
+            history_tail,
+            memory,
+            timers,
+            processes,
+            hooks,
+            hook_stats: self.state.hook_stats.clone(),
+            last_usage: usage,
+            updated_at: Utc::now().to_rfc3339(),
         }
     }
 
@@ -197,7 +370,7 @@ impl AgentLoop {
 
             if *self.shutdown.borrow() {
                 dimlog!("[{}] Shutdown requested", self.name);
-                return FinishReason::Shutdown;
+                return self.finish(FinishReason::Shutdown);
             }
 
             // If work queue is empty, wait for events (messages, process
@@ -220,6 +393,12 @@ impl AgentLoop {
                         );
                     }
                     idle = true;
+                    // Full snapshot on idle, not just a status patch — the
+                    // turn's side effects have been applied by now, so this
+                    // shows post-execution state (memory writes, queue pops,
+                    // usage numbers). Without this the dashboard would show
+                    // pre-turn state with a misleading "idle" badge on it.
+                    self.registry.update_snapshot(self.build_snapshot("idle", self.last_usage.clone()));
                     self.broadcast(BroadcastMsg::Status {
                         status: "idle".to_string(),
                     });
@@ -241,7 +420,7 @@ impl AgentLoop {
                             Some(event) => self.apply_event(event),
                             None => {
                                 dimlog!("[{}] Event channel closed, shutting down", self.name);
-                                return FinishReason::ChannelClosed;
+                                return self.finish(FinishReason::ChannelClosed);
                             }
                         }
                     }
@@ -260,7 +439,7 @@ impl AgentLoop {
 
             if self.killed {
                 dimlog!("[{}] Kill signal received, exiting", self.name);
-                return FinishReason::Killed;
+                return self.finish(FinishReason::Killed);
             }
 
             // Check max_turns limit
@@ -270,7 +449,7 @@ impl AgentLoop {
                        "[{}] Max turns ({}) reached, exiting",
                         self.name, max
                     );
-                    return FinishReason::MaxTurns(max);
+                    return self.finish(FinishReason::MaxTurns(max));
                 }
             }
 
@@ -282,13 +461,13 @@ impl AgentLoop {
                 r = self.run_turn() => r,
                 _ = shutdown.changed() => {
                     dimlog!("[{}] Shutdown requested (mid-turn)", self.name);
-                    return FinishReason::Shutdown;
+                    return self.finish(FinishReason::Shutdown);
                 }
             };
             match turn_result {
                 Ok(true) => {
                     dimlog!("[{}] done() called, exiting", self.name);
-                    return FinishReason::Done;
+                    return self.finish(FinishReason::Done);
                 }
                 Ok(false) => {}
                 Err(e) => {
@@ -367,6 +546,11 @@ impl AgentLoop {
         );
 
         // Broadcast thinking status
+        // Full snapshot here — we're about to call the API, so the dashboard
+        // should show exactly what the model will see (queue, memory, etc.).
+        // last_usage is None because we don't have this turn's numbers yet;
+        // it gets filled on the *next* turn's snapshot.
+        self.registry.update_snapshot(self.build_snapshot("thinking", self.last_usage.clone()));
         self.broadcast(BroadcastMsg::Status {
             status: "thinking".to_string(),
         });
@@ -414,6 +598,17 @@ impl AgentLoop {
         // Update token tracking
         self.state.last_input_tokens = api_result.input_tokens;
         self.turn_counter += 1;
+        // Stash usage for the next turn's dashboard snapshot. We do it here
+        // (not immediately after the API call) so turn_counter is already
+        // advanced — the dashboard's "turn N" correctly pairs with N's cost.
+        self.last_usage = Some(UsageSummary {
+            input_tokens: api_result.input_tokens,
+            output_tokens: api_result.output_tokens,
+            cache_read: api_result.cache_read_tokens,
+            cache_write: api_result.cache_creation_tokens,
+            cost_usd: turn_cost,
+            cache_hit_pct: cache_hit_pct as u8,
+        });
 
         // Accumulate tokens
         if let Some(ref acc) = self.token_accumulator {
@@ -434,7 +629,7 @@ impl AgentLoop {
         // Load process outputs for shell_output() calls
         let process_outputs = self.db.load_all_process_outputs().unwrap_or_default();
 
-        // Broadcast executing status
+        self.registry.set_status(&self.name, "executing");
         self.broadcast(BroadcastMsg::Status {
             status: "executing".to_string(),
         });
