@@ -118,6 +118,7 @@ struct AppState {
     db: Arc<Database>,
     broadcast_tx: broadcast::Sender<BroadcastMsg>,
     token_accumulator: Arc<Mutex<TokenAccumulator>>,
+    usage_log: Arc<Mutex<crate::types::UsageLog>>,
     config: Arc<Config>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     registry: Arc<AgentRegistry>,
@@ -232,7 +233,7 @@ a{color:#58a6ff;text-decoration:none}a:hover{text-decoration:underline}
 code{background:#161b22;padding:1px 5px;border-radius:3px}</style>
 <h3>claude-server</h3>
 <p><a href="/dashboard">→ dashboard</a> (live agent state)</p>
-<p><a href="/status">/status</a> · <a href="/cost">/cost</a> · <a href="/api-trace">/api-trace</a> · <a href="/dashboard/state">/dashboard/state</a></p>
+<p><a href="/status">/status</a> · <a href="/cost">/cost</a> · <a href="/metrics/turns">/metrics/turns</a> · <a href="/metrics/rate">/metrics/rate</a> · <a href="/api-trace">/api-trace</a> · <a href="/dashboard/state">/dashboard/state</a></p>
 <p><code>POST /message</code> · <code>POST /event</code> · <code>POST /shutdown</code></p>
 "#)
 }
@@ -280,6 +281,78 @@ async fn handle_cost(
         "estimated_cost_usd": (cost * 100.0).round() / 100.0,
         "turns": acc.turns,
     }))
+}
+
+// ---- Metrics Handlers ----
+
+#[derive(Deserialize)]
+struct MetricsTurnsQuery {
+    limit: Option<usize>,
+}
+
+/// GET /metrics/turns?limit=N → last N per-turn usage entries (newest last).
+async fn handle_metrics_turns(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<MetricsTurnsQuery>,
+) -> Json<serde_json::Value> {
+    let log = state.usage_log.lock().unwrap();
+    let capacity = log.capacity();
+    let snap = log.snapshot();
+    let limit = q.limit.unwrap_or(100).min(snap.len());
+    let start = snap.len().saturating_sub(limit);
+    let entries: Vec<_> = snap.iter().skip(start).cloned().collect();
+    Json(serde_json::json!({ "entries": entries, "total_in_log": snap.len(), "capacity": capacity }))
+}
+
+/// GET /metrics/rate → rolling sums for the last 5 min / 1 h / 24 h.
+/// Sums over whatever fits in the ring buffer — if the buffer is smaller
+/// than the window, the shown totals are an under-count (reflected in
+/// `window_covered_secs`).
+async fn handle_metrics_rate(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let now = chrono::Utc::now().timestamp();
+    let log = state.usage_log.lock().unwrap();
+    let snap = log.snapshot();
+
+    let windows = [(5 * 60i64, "last_5m"), (3600, "last_1h"), (86400, "last_24h")];
+    let mut out = serde_json::Map::new();
+    for (secs, label) in windows {
+        let cutoff = now - secs;
+        let mut input = 0u64;
+        let mut output = 0u64;
+        let mut cache_read = 0u64;
+        let mut cache_write = 0u64;
+        let mut cost = 0.0f64;
+        let mut turns = 0u64;
+        let mut oldest_in_window: Option<i64> = None;
+        for e in snap.iter().rev() {
+            if e.ts < cutoff {
+                break;
+            }
+            input += e.input_tokens;
+            output += e.output_tokens;
+            cache_read += e.cache_read_tokens;
+            cache_write += e.cache_creation_tokens;
+            cost += e.cost_usd;
+            turns += 1;
+            oldest_in_window = Some(e.ts);
+        }
+        let covered = oldest_in_window.map(|t| (now - t).max(0)).unwrap_or(0);
+        out.insert(
+            label.to_string(),
+            serde_json::json!({
+                "input_tokens": input,
+                "output_tokens": output,
+                "cache_read_tokens": cache_read,
+                "cache_creation_tokens": cache_write,
+                "cost_usd": (cost * 10000.0).round() / 10000.0,
+                "turns": turns,
+                "window_covered_secs": covered,
+            }),
+        );
+    }
+    Json(serde_json::Value::Object(out))
 }
 
 // ---- Event Handler ----
@@ -389,6 +462,7 @@ pub fn create_router(
     db: Arc<Database>,
     broadcast_tx: broadcast::Sender<BroadcastMsg>,
     token_accumulator: Arc<Mutex<TokenAccumulator>>,
+    usage_log: Arc<Mutex<crate::types::UsageLog>>,
     config: Arc<Config>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     registry: Arc<AgentRegistry>,
@@ -400,6 +474,7 @@ pub fn create_router(
         db,
         broadcast_tx,
         token_accumulator,
+        usage_log,
         config,
         shutdown_tx,
         registry,
@@ -416,6 +491,8 @@ pub fn create_router(
         .route("/dashboard/state", get(handle_dashboard_state))
         .route("/dashboard/state/{name}", delete(handle_dashboard_dismiss))
         .route("/cost", get(handle_cost))
+        .route("/metrics/turns", get(handle_metrics_turns))
+        .route("/metrics/rate", get(handle_metrics_rate))
         .route("/api-trace", get(handle_api_trace))
         .route("/messages/{chat_id}", get(handle_get_messages))
         .route("/messages/{chat_id}/stream", get(handle_sse))

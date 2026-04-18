@@ -100,6 +100,8 @@ pub struct AgentLoop {
     max_children: u32,
     /// Shared accumulator for the parent agent (None for children).
     token_accumulator: Option<Arc<Mutex<TokenAccumulator>>>,
+    /// Shared per-turn usage log — all agents write here for dev metrics.
+    usage_log: Arc<Mutex<crate::types::UsageLog>>,
     /// Local token accumulators for child agents (not shared).
     local_input_tokens: u64,
     local_output_tokens: u64,
@@ -140,6 +142,7 @@ impl AgentLoop {
         dump_dir: Option<PathBuf>,
         dump_to_stdout: bool,
         token_accumulator: Option<Arc<Mutex<TokenAccumulator>>>,
+        usage_log: Arc<Mutex<crate::types::UsageLog>>,
         registry: Arc<AgentRegistry>,
         shutdown: tokio::sync::watch::Receiver<bool>,
         subscribers: Arc<crate::http_server::SubscriberRegistry>,
@@ -168,6 +171,7 @@ impl AgentLoop {
             active_children: 0,
             max_children,
             token_accumulator,
+            usage_log,
             local_input_tokens: 0,
             local_output_tokens: 0,
             local_cache_creation_tokens: 0,
@@ -625,6 +629,18 @@ impl AgentLoop {
             self.local_cache_creation_tokens += api_result.cache_creation_tokens;
             self.local_cache_read_tokens += api_result.cache_read_tokens;
         }
+
+        // Per-turn usage log (for /metrics/turns and /metrics/rate). Every
+        // agent writes here — the log covers all API calls, not just the root.
+        self.usage_log.lock().unwrap().push(crate::types::UsageEntry {
+            ts: Utc::now().timestamp(),
+            agent: self.name.clone(),
+            input_tokens: api_result.input_tokens,
+            output_tokens: api_result.output_tokens,
+            cache_read_tokens: api_result.cache_read_tokens,
+            cache_creation_tokens: api_result.cache_creation_tokens,
+            cost_usd: turn_cost,
+        });
 
         // Load process outputs for shell_output() calls
         let process_outputs = self.db.load_all_process_outputs().unwrap_or_default();
@@ -1396,7 +1412,7 @@ impl AgentLoop {
                 // Create child API client
                 let child_config = Arc::new(Config {
                     model: model.clone(),
-                    api_key: self.config.api_key.clone(),
+                    auth: self.config.auth.clone(),
                     api_base_url: self.config.api_base_url.clone(),
                     max_tokens: self.config.max_tokens,
                     context_window: self.config.context_window,
@@ -1486,6 +1502,7 @@ impl AgentLoop {
                     registry,
                     self.shutdown.clone(),
                     self.subscribers.clone(),
+                    self.usage_log.clone(),
                 ));
             }
         }
@@ -1679,6 +1696,7 @@ async fn run_child_agent_loop(
     registry: Arc<AgentRegistry>,
     shutdown: tokio::sync::watch::Receiver<bool>,
     subscribers: Arc<crate::http_server::SubscriberRegistry>,
+    usage_log: Arc<Mutex<crate::types::UsageLog>>,
 ) {
     let mut child_loop = AgentLoop::new(
         child_name.clone(),
@@ -1696,6 +1714,7 @@ async fn run_child_agent_loop(
         dump_dir,
         false, // children don't dump to stdout
         None,  // children track tokens locally
+        usage_log,
         registry.clone(),
         shutdown,
         subscribers,

@@ -778,6 +778,52 @@ pub struct TokenAccumulator {
     pub turns: u32,
 }
 
+// ---- Per-turn usage log ----
+
+/// One row per agent turn, written when we accumulate tokens.
+/// Timestamp is unix seconds to keep JSON serialization compact.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct UsageEntry {
+    pub ts: i64,
+    pub agent: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cost_usd: f64,
+}
+
+/// Bounded ring buffer of per-turn usage. Oldest entries drop once capacity
+/// fills — fine for a metric surface, not a billing record.
+pub struct UsageLog {
+    entries: std::collections::VecDeque<UsageEntry>,
+    capacity: usize,
+}
+
+impl UsageLog {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            entries: std::collections::VecDeque::with_capacity(capacity.max(1)),
+            capacity: capacity.max(1),
+        }
+    }
+
+    pub fn push(&mut self, entry: UsageEntry) {
+        while self.entries.len() >= self.capacity {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(entry);
+    }
+
+    pub fn snapshot(&self) -> &std::collections::VecDeque<UsageEntry> {
+        &self.entries
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
 // ---- Agent Registry ----
 
 use std::sync::Mutex;

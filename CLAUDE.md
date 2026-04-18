@@ -217,6 +217,8 @@ GET  /messages/:chat_id          → { messages: [...] }
 GET  /messages/:chat_id/stream   SSE stream (prefix match if chat_id ends in *)
 GET  /api-trace                  → last N request/response pairs (sensitive values pre-scrubbed)
 GET  /cost                       → { input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, estimated_cost_usd }
+GET  /metrics/turns?limit=N      → { entries: [{ts, agent, input/output/cache tokens, cost_usd}, ...], total_in_log, capacity }
+GET  /metrics/rate               → { last_5m, last_1h, last_24h } — rolling sums; window_covered_secs shows buffer coverage
 GET  /dashboard                  → embedded HTML UI (live view of all agents)
 GET  /dashboard/state            → { agent_name: AgentSnapshot, ... } — queue, history tail, memory, timers, processes, hooks, usage
 POST /shutdown                   → { status }
@@ -228,7 +230,10 @@ All endpoints have CORS enabled (permissive). The chat UI uses these directly.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | (required) | Anthropic API key |
+| `ANTHROPIC_API_KEY` | (one of these required) | Console API key — `x-api-key` auth, production path |
+| `CLAUDE_SERVER_BEARER_TOKEN` | (one of these required) | OAuth bearer token — dev-only, `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20`. Mutually exclusive with `ANTHROPIC_API_KEY`. Requires TTY + typed "I AGREE" at startup unless `CLAUDE_SERVER_AUTH_ACK=1`. On 401 the daemon exits rather than retry (assumes token expired). |
+| `CLAUDE_SERVER_AUTH_ACK` | (unset) | Set to `1` to bypass the Bearer-mode TTY + acknowledgment prompt (for scripted test harnesses only). |
+| `CLAUDE_SERVER_USAGE_LOG_CAPACITY` | `1000` | Ring buffer size for per-turn usage entries exposed via `/metrics/turns` and `/metrics/rate`. |
 | `CLAUDE_SERVER_MODEL` | `claude-opus-4-6` | Model to use |
 | `CLAUDE_SERVER_LISTEN` | `127.0.0.1:3000` | API listen address |
 | `CLAUDE_SERVER_DB` | `claude-server.db` | SQLite database path |

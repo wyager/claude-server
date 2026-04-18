@@ -305,8 +305,13 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
     let event_url = format!("http://{}/event", config.listen_addr);
     let process_supervisor = process::ProcessSupervisor::new(process_event_tx, database.clone(), event_url, "root".to_string());
 
-    // Create token accumulator
+    // Create token accumulator (cumulative) + per-turn usage log (bounded)
     let token_accumulator = Arc::new(Mutex::new(TokenAccumulator::default()));
+    let usage_log_capacity: usize = std::env::var("CLAUDE_SERVER_USAGE_LOG_CAPACITY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000);
+    let usage_log = Arc::new(Mutex::new(types::UsageLog::new(usage_log_capacity)));
 
     // Create agent registry (shared with HTTP server for /event routing)
     let registry = Arc::new(types::AgentRegistry::new());
@@ -335,6 +340,7 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
         dump_dir,
         broadcast_tx.clone(),
         token_accumulator.clone(),
+        usage_log.clone(),
         registry,
         shutdown_rx,
         subscribers.clone(),
@@ -381,6 +387,7 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
         database.clone(),
         broadcast_tx,
         token_accumulator.clone(),
+        usage_log.clone(),
         config.clone(),
         shutdown_tx.clone(),
         registry_for_http,
