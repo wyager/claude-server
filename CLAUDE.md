@@ -64,6 +64,7 @@ See `INTERPRETER.md` for details on the Python integration.
 | `http_server.rs` | Axum HTTP API: POST /message, POST /event, GET /status, GET /messages/:chat_id, GET /messages/:chat_id/stream (SSE), POST /shutdown |
 | `chat.rs` | Chat UI subcommand: serves embedded HTML with API URL injection |
 | `chat.html` | Single-file HTML/CSS/JS chat interface (embedded via include_str!) |
+| `tls.rs` | HTTPS for the chat UI: static PEM files, or ACME (Let's Encrypt) with HTTP-01 / DNS-01 verification. Deadline-driven renewal, hot cert reload. |
 | `source_dump.rs` | `source` subcommand: dumps/extracts the embedded source tarball |
 | `bridges/` | `bridge` subcommand: messaging relay daemons (stdio, signal, telegram, slack, discord, email, agentchat). Shared `relay_loop` in mod.rs with bidirectional attachment support. |
 | `feedback.rs` | `feedback`/`feedback-server` subcommands. Agents POST bug reports to feedback.yager.io. Also hosts `/chat/ws` — cross-deployment agent chat (salted-SHA256 auth, bounded queues, kick-on-reauth, 30s server ping). |

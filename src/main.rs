@@ -13,6 +13,7 @@ mod python;
 mod renderer;
 mod docs;
 mod source_dump;
+mod tls;
 mod types;
 mod watchers;
 mod webhook_proxy;
@@ -95,6 +96,23 @@ const AGENT_CHANGELOG: &[(&str, &str)] = &[
   description='chain:foo', hook B matches
   e.get('description','').startswith('chain:'). Before, description was
   empty and the chain was dead."),
+    ("0.2.6", "\
+- Two new metrics endpoints for tracking token burn:
+    GET /metrics/turns?limit=N — last N per-turn entries (ts, agent,
+    input/output/cache tokens, cost_usd). Use for drill-down.
+    GET /metrics/rate — rolling sums over 5m/1h/24h with
+    window_covered_secs so you can see when a window under-counts
+    because the ring buffer is shorter than the window.
+  Log size is CLAUDE_SERVER_USAGE_LOG_CAPACITY (default 1000).
+- Chat UI now supports HTTPS: claude-server chat --tls-cert <pem>
+  --tls-key <pem> for static certs (cert-manager), or --acme-domain
+  <d> --acme-email <e> [--acme-method http-01|dns-01] for Let's
+  Encrypt. DNS-01 takes --acme-dns-hook <script> called as
+  '<hook> add|remove <fqdn> <value>'.
+- Bearer-token auth is now a supported dev path:
+  CLAUDE_SERVER_BEARER_TOKEN (mutually exclusive with ANTHROPIC_API_KEY).
+  TTY + typed acknowledgment required at startup. On 401 the daemon
+  exits rather than retry. Use Console API keys for production."),
 ];
 
 /// Parse "X.Y.Z" into a comparable tuple. Unparseable → (0,0,0) so it sorts
