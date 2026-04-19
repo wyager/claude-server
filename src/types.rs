@@ -1112,9 +1112,12 @@ pub struct ApiRequest {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ThinkingConfig {
-    #[serde(rename = "type")]
-    pub thinking_type: String,
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ThinkingConfig {
+    /// Opus 4.6/4.7, Sonnet 4.6 — model decides thinking depth dynamically.
+    Adaptive,
+    /// Legacy pre-4.6 models — fixed token budget.
+    Enabled { budget_tokens: u64 },
 }
 
 #[derive(Debug, Serialize)]

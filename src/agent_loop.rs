@@ -1441,7 +1441,11 @@ impl AgentLoop {
                     .unwrap_or_else(|_| String::new());
 
                 let child_api_client =
-                    match ApiClient::new_with_prompt(child_config.clone(), &system_prompt) {
+                    match ApiClient::new_with_prompt(
+                        child_config.clone(),
+                        &system_prompt,
+                        self.api_client.capability_cache(),
+                    ) {
                         Ok(c) => c,
                         Err(e) => {
                             self.active_children = self.active_children.saturating_sub(1);

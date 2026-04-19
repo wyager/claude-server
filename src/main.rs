@@ -8,6 +8,7 @@ mod core_loop;
 mod db;
 mod feedback;
 mod http_server;
+mod model_capabilities;
 mod process;
 mod python;
 mod renderer;
@@ -113,6 +114,22 @@ const AGENT_CHANGELOG: &[(&str, &str)] = &[
   CLAUDE_SERVER_BEARER_TOKEN (mutually exclusive with ANTHROPIC_API_KEY).
   TTY + typed acknowledgment required at startup. On 401 the daemon
   exits rather than retry. Use Console API keys for production."),
+    ("0.2.7", "\
+- Per-turn thinking config is now probed from /v1/models/{id} and cached
+  per model — no more hardcoded compat. Spawning children on mixed
+  models (e.g. Opus 4.7 root + Sonnet 4.5 child) now Just Works;
+  adaptive vs enabled-with-budget is selected automatically. On probe
+  failure we fall back to no-thinking/no-effort, not an error.
+- Model selection guidance: when spawning children or recommending
+  models, prefer the LATEST within each class. Current frontier as of
+  daemon release:
+    Opus   → claude-opus-4-7   (reasoning, agentic, long-horizon)
+    Sonnet → claude-sonnet-4-6 (balanced; default for most work)
+    Haiku  → claude-haiku-4-5  (fast, cheap, simple classification)
+  Do NOT pin to dated IDs like claude-sonnet-4-5-20250929 — older
+  models still work but you're leaving capability + price on the
+  table. If you have ChildSettings or memory.pin'd configs referencing
+  older point releases (4.5, 4.1, 3.5), update them now."),
 ];
 
 /// Parse "X.Y.Z" into a comparable tuple. Unparseable → (0,0,0) so it sorts

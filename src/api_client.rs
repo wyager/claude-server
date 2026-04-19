@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::Config;
+use crate::model_capabilities::{ModelCapabilities, ModelCapabilityCache, ThinkingMode};
 use crate::renderer::RenderedContext;
 use crate::types::*;
 
@@ -124,6 +125,7 @@ pub struct ApiClient {
     config: Arc<Config>,
     base_system_prompt: String,
     trace: Option<Arc<std::sync::Mutex<ApiTrace>>>,
+    capabilities: Arc<ModelCapabilityCache>,
 }
 
 pub struct ApiTurnResult {
@@ -142,17 +144,25 @@ impl ApiClient {
             .build()?;
 
         let base_system_prompt = config.load_system_prompt()?;
+        let capabilities = ModelCapabilityCache::new_arc(&config);
 
         Ok(Self {
             client,
             config,
             base_system_prompt,
             trace: None,
+            capabilities,
         })
     }
 
-    /// Create an API client with a pre-loaded system prompt (used by child agents).
-    pub fn new_with_prompt(config: Arc<Config>, system_prompt: &str) -> Result<Self> {
+    /// Create an API client with a pre-loaded system prompt and a shared
+    /// capability cache from the parent (used by child agents so repeated
+    /// fork-with-same-model doesn't re-probe `/v1/models/{id}`).
+    pub fn new_with_prompt(
+        config: Arc<Config>,
+        system_prompt: &str,
+        capabilities: Arc<ModelCapabilityCache>,
+    ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()?;
@@ -162,12 +172,18 @@ impl ApiClient {
             config,
             base_system_prompt: system_prompt.to_string(),
             trace: None,
+            capabilities,
         })
     }
 
     pub fn with_trace(mut self, trace: Arc<std::sync::Mutex<ApiTrace>>) -> Self {
         self.trace = Some(trace);
         self
+    }
+
+    /// Shared capability cache — pass to child ApiClients when forking.
+    pub fn capability_cache(&self) -> Arc<ModelCapabilityCache> {
+        self.capabilities.clone()
     }
 
     pub async fn call(
@@ -178,7 +194,8 @@ impl ApiClient {
         turn: u32,
         sensitive_values: &[String],
     ) -> Result<ApiTurnResult> {
-        let request = self.build_request(rendered, pinned_memory);
+        let caps = self.capabilities.get(&self.config.model).await;
+        let request = self.build_request(rendered, pinned_memory, caps);
         if let Ok(path) = std::env::var("CLAUDE_SERVER_DUMP_REQUEST") {
             let json = serde_json::to_string(&request).unwrap_or_default();
             if path == "1" {
@@ -303,7 +320,12 @@ impl ApiClient {
         prompt
     }
 
-    fn build_request(&self, rendered: &RenderedContext, pinned_memory: &[(String, String)]) -> ApiRequest {
+    fn build_request(
+        &self,
+        rendered: &RenderedContext,
+        pinned_memory: &[(String, String)],
+        caps: ModelCapabilities,
+    ) -> ApiRequest {
         let system = vec![SystemBlock {
             block_type: "text".to_string(),
             text: self.build_system_prompt(pinned_memory),
@@ -378,18 +400,25 @@ impl ApiClient {
             content,
         }];
 
+        let thinking = match caps.thinking {
+            ThinkingMode::Adaptive => Some(ThinkingConfig::Adaptive),
+            ThinkingMode::Enabled => Some(ThinkingConfig::Enabled { budget_tokens: 10_000 }),
+            ThinkingMode::None => None,
+        };
+        // effort is only valid when thinking is on and the model supports it.
+        let output_config = match (caps.thinking, caps.supports_effort) {
+            (ThinkingMode::Adaptive, true) => Some(OutputConfig { effort: "high".to_string() }),
+            _ => None,
+        };
+
         ApiRequest {
             model: self.config.model.clone(),
             max_tokens: self.config.max_tokens,
             system,
             tools,
             messages,
-            thinking: Some(ThinkingConfig {
-                thinking_type: "adaptive".to_string(),
-            }),
-            output_config: Some(OutputConfig {
-                effort: "high".to_string(),
-            }),
+            thinking,
+            output_config,
         }
     }
 

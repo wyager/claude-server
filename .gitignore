@@ -3,6 +3,7 @@
 *.db-journal
 *.db-wal
 *.db-shm
+.claude
 test-dumps/
 nohup.out
 /runtime/
