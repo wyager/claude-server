@@ -1746,6 +1746,7 @@ fn execute_inner(
                     last_harness_version: txn.last_harness_version,
                     hook_stats: txn.hook_stats,
                     last_input_tokens: txn.last_input_tokens,
+                    last_total_input_tokens: txn.last_total_input_tokens,
                     context_window: txn.context_window,
                     max_tokens: txn.max_tokens,
                 }

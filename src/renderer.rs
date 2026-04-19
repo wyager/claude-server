@@ -627,8 +627,9 @@ fn render_context_metadata(
         now.format("%Y-%m-%d %H:%M:%S %Z")
     ));
     out.push_str(&format!(
-        "Last turn input tokens: {}\n",
-        state.last_input_tokens
+        "Last turn total input tokens: {} (billed {} + cache_read + cache_write; this is what compaction compares against)\n",
+        state.last_total_input_tokens,
+        state.last_input_tokens,
     ));
 
     out.push_str(&format!("Compaction threshold: {} tokens\n", compact_at));

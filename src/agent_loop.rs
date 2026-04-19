@@ -365,8 +365,8 @@ impl AgentLoop {
                 && CompactionManager::should_trigger(&self.state, self.config.compact_at)
             {
                 dimlog!(
-                   "[{}] Triggering compaction (input_tokens {} > threshold {})",
-                    self.name, self.state.last_input_tokens, self.config.compact_at
+                   "[{}] Triggering compaction (total_input_tokens {} > threshold {})",
+                    self.name, self.state.last_total_input_tokens, self.config.compact_at
                 );
                 self.compaction
                     .trigger(&mut self.state, self.config.compact_target);
@@ -498,7 +498,7 @@ impl AgentLoop {
         let compaction_state = if self.compaction.active {
             let mut cs = self
                 .compaction
-                .compaction_state(self.state.last_input_tokens);
+                .compaction_state(self.state.last_total_input_tokens);
             cs.estimated_post_compaction = self.compaction.estimate_post_compaction(
                 &self.state,
                 &self.deployment_context,
@@ -606,6 +606,11 @@ impl AgentLoop {
 
         // Update token tracking
         self.state.last_input_tokens = api_result.input_tokens;
+        // Full context-window pressure for the compaction trigger: billed
+        // input + cache writes + cache reads.
+        self.state.last_total_input_tokens = api_result.input_tokens
+            + api_result.cache_creation_tokens
+            + api_result.cache_read_tokens;
         self.turn_counter += 1;
         // Stash usage for the next turn's dashboard snapshot. We do it here
         // (not immediately after the API call) so turn_counter is already
@@ -1373,6 +1378,7 @@ impl AgentLoop {
                 child_state.timer_manager = TimerManager::new();
                 child_state.process_manager = ProcessManager::new();
                 child_state.last_input_tokens = 0;
+                child_state.last_total_input_tokens = 0;
 
                 if !child_settings.inherit_history {
                     child_state.event_history = EventHistory::new();

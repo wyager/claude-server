@@ -614,7 +614,17 @@ pub struct HarnessState {
     #[serde(default)]
     pub hook_stats: HashMap<String, HookStats>,
     pub id_generator: IdGenerator,
+    /// Uncached-remainder input tokens from the last API response. This is
+    /// the wire `usage.input_tokens` field — i.e. tokens the API billed at
+    /// full rate, excluding cache reads/writes. Use this for billing views,
+    /// not context-window pressure.
     pub last_input_tokens: u64,
+    /// Total prompt tokens actually loaded into the model's context window
+    /// last turn: `input_tokens + cache_creation_input_tokens +
+    /// cache_read_input_tokens`. This is what the compaction trigger cares
+    /// about, since a large cached prefix still consumes context.
+    #[serde(default)]
+    pub last_total_input_tokens: u64,
     pub context_window: u64,
     pub max_tokens: u64,
 }
@@ -634,6 +644,7 @@ impl HarnessState {
             hook_stats: HashMap::new(),
             id_generator: IdGenerator::new(),
             last_input_tokens: 0,
+            last_total_input_tokens: 0,
             context_window,
             max_tokens,
         }

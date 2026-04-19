@@ -19,9 +19,12 @@ impl CompactionManager {
         }
     }
 
-    /// Check if compaction should be triggered.
+    /// Check if compaction should be triggered. Compares against the total
+    /// prompt-token load (billed + cache read + cache write) because a
+    /// multi-hundred-KB cached prefix still consumes the context window even
+    /// though it doesn't show up in `last_input_tokens`.
     pub fn should_trigger(state: &HarnessState, compact_at: u64) -> bool {
-        state.last_input_tokens > compact_at
+        state.last_total_input_tokens > compact_at
     }
 
     /// Insert a Compaction work item and activate compaction mode.
