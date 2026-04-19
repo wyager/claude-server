@@ -512,8 +512,13 @@ impl AgentLoop {
 
         // Render context
         let lineage_str = format_lineage(&self.permissions.lineage);
-        // Load pinned memory from DB (shared across agents, injected into system prompt)
-        let pinned = self.db.load_pinned().unwrap_or_default();
+        // Load pinned memory from DB (shared across agents, injected into system prompt).
+        // Surfaces (rather than swallows) load failures so ops notice if the shared
+        // knowledge tier is broken — agent still proceeds with empty pinned memory.
+        let pinned = self.db.load_pinned().unwrap_or_else(|e| {
+            eprintln!("[{}] failed to load pinned memory: {} — continuing with empty pinned tier", self.name, e);
+            Vec::new()
+        });
         let pinned_snapshot: HashMap<String, String> = pinned.iter().cloned().collect();
         let pinned_summary = if pinned.is_empty() {
             None
