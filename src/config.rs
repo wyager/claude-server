@@ -57,7 +57,7 @@ impl Config {
         let auth = Self::auth_from_env()?;
 
         let model = std::env::var("CLAUDE_SERVER_MODEL")
-            .unwrap_or_else(|_| "claude-opus-4-6".to_string());
+            .unwrap_or_else(|_| "claude-opus-4-7".to_string());
 
         let api_base_url = std::env::var("CLAUDE_SERVER_API_URL")
             .unwrap_or_else(|_| "https://api.anthropic.com".to_string());

@@ -141,7 +141,7 @@ fn changelog_since(prev: &str, current: &str) -> Option<String> {
 const ENV_HELP: &str = "\
 Environment variables:
   ANTHROPIC_API_KEY                 API key (required for daemon)
-  CLAUDE_SERVER_MODEL               Model name (default: claude-opus-4-6)
+  CLAUDE_SERVER_MODEL               Model name (default: claude-opus-4-7)
   CLAUDE_SERVER_LISTEN              API listen address (default: 127.0.0.1:3000)
   CLAUDE_SERVER_DB                  SQLite path (default: claude-server.db)
   CLAUDE_SERVER_SYSTEM_PROMPT       System prompt file (default: system_prompt.txt)

@@ -143,7 +143,7 @@ Each turn is a single API call. The harness constructs the request as follows:
 
 ```json
 {
-  "model": "claude-opus-4-6",
+  "model": "claude-opus-4-7",
   "max_tokens": 16384,
   "system": [
     {
@@ -177,7 +177,7 @@ Each turn is a single API call. The harness constructs the request as follows:
 }
 ```
 
-The model is configurable (default: `claude-opus-4-6`).
+The model is configurable (default: `claude-opus-4-7`).
 
 ### Why tool_use Instead of Raw Text
 
@@ -1465,7 +1465,7 @@ All endpoints have CORS enabled (permissive).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ANTHROPIC_API_KEY` | (required) | Anthropic API key |
-| `CLAUDE_SERVER_MODEL` | `claude-opus-4-6` | Model to use |
+| `CLAUDE_SERVER_MODEL` | `claude-opus-4-7` | Model to use |
 | `CLAUDE_SERVER_LISTEN` | `127.0.0.1:3000` | API listen address |
 | `CLAUDE_SERVER_DB` | `claude-server.db` | SQLite database path |
 | `CLAUDE_SERVER_SYSTEM_PROMPT` | `system_prompt.txt` | System prompt file |
