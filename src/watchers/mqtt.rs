@@ -71,6 +71,10 @@ pub async fn run(args: MqttArgs) -> Result<()> {
         .unwrap_or_else(|| format!("claude-server-{}", std::process::id()));
     let mut opts = MqttOptions::new(client_id, host, port);
     opts.set_keep_alive(Duration::from_secs(30));
+    // rumqttc defaults to ~10KB max packet size which is too small for real
+    // Home Assistant / Frigate / WLED traffic where attribute or snapshot
+    // messages routinely run 100KB+. Bump to 10MB on both sides.
+    opts.set_max_packet_size(10 * 1024 * 1024, 10 * 1024 * 1024);
     if let (Some(u), Some(p)) = (&args.username, &args.password) {
         opts.set_credentials(u, p);
     }
