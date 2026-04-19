@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use base64::Engine;
 use clap::{Args, ValueEnum};
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
+use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, TlsConfiguration, Transport};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
@@ -46,16 +46,24 @@ pub struct MqttArgs {
     /// Max per-message subdirs to retain (oldest deleted when exceeded)
     #[arg(long, default_value_t = 50)]
     pub attach_retain: usize,
+    /// Connect via TLS (MQTTS). Typically used with port 8883.
+    #[arg(long)]
+    pub tls: bool,
+    /// Path to a PEM-encoded CA cert to trust instead of the system store.
+    /// Only meaningful with --tls. Use for brokers with private-CA certs.
+    #[arg(long, value_name = "PATH", requires = "tls")]
+    pub ca_file: Option<PathBuf>,
     #[command(flatten)]
     pub common: Common,
 }
 
 pub async fn run(args: MqttArgs) -> Result<()> {
+    let default_port = if args.tls { 8883 } else { 1883 };
     let (host, port) = args
         .broker
         .rsplit_once(':')
-        .map(|(h, p)| (h.to_string(), p.parse().unwrap_or(1883)))
-        .unwrap_or((args.broker.clone(), 1883));
+        .map(|(h, p)| (h.to_string(), p.parse().unwrap_or(default_port)))
+        .unwrap_or((args.broker.clone(), default_port));
 
     let client_id = args
         .client_id
@@ -63,8 +71,16 @@ pub async fn run(args: MqttArgs) -> Result<()> {
         .unwrap_or_else(|| format!("claude-server-{}", std::process::id()));
     let mut opts = MqttOptions::new(client_id, host, port);
     opts.set_keep_alive(Duration::from_secs(30));
+    // rumqttc defaults to ~10KB max packet size which is too small for real
+    // Home Assistant / Frigate / WLED traffic where attribute or snapshot
+    // messages routinely run 100KB+. Bump to 10MB on both sides.
+    opts.set_max_packet_size(10 * 1024 * 1024, 10 * 1024 * 1024);
     if let (Some(u), Some(p)) = (&args.username, &args.password) {
         opts.set_credentials(u, p);
+    }
+    if args.tls {
+        opts.set_transport(Transport::Tls(build_tls_config(args.ca_file.as_deref())?));
+        eprintln!("[watch mqtt] TLS enabled");
     }
 
     let (client, mut eventloop) = AsyncClient::new(opts, 64);
@@ -113,6 +129,41 @@ pub async fn run(args: MqttArgs) -> Result<()> {
     });
 
     debounce_loop(rx, &args.common, "mqtt").await
+}
+
+/// Build a `TlsConfiguration::Simple` for rumqttc.
+///
+/// rumqttc 0.24 bundles its own (older) rustls version, so we can't share a
+/// `rustls::ClientConfig` with the crate's `rustls` dep. Instead we feed it PEM
+/// bytes: the user's CA file if `--ca-file` is set, otherwise all system native
+/// roots concatenated into a PEM buffer.
+fn build_tls_config(ca_file: Option<&std::path::Path>) -> Result<TlsConfiguration> {
+    if let Some(path) = ca_file {
+        let ca = std::fs::read(path)
+            .with_context(|| format!("read CA file {}", path.display()))?;
+        return Ok(TlsConfiguration::Simple { ca, alpn: None, client_auth: None });
+    }
+
+    let mut pem = Vec::new();
+    let result = rustls_native_certs::load_native_certs();
+    if result.certs.is_empty() {
+        anyhow::bail!(
+            "no system CA certificates loaded ({} errors) — pass --ca-file to supply one",
+            result.errors.len()
+        );
+    }
+    for cert in &result.certs {
+        pem.extend_from_slice(b"-----BEGIN CERTIFICATE-----\n");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(cert.as_ref());
+        // Wrap base64 at 64 chars per PEM convention — strictly optional for
+        // parsers but keeps the buffer readable if dumped for debugging.
+        for chunk in b64.as_bytes().chunks(64) {
+            pem.extend_from_slice(chunk);
+            pem.push(b'\n');
+        }
+        pem.extend_from_slice(b"-----END CERTIFICATE-----\n");
+    }
+    Ok(TlsConfiguration::Simple { ca: pem, alpn: None, client_auth: None })
 }
 
 fn handle_publish(
