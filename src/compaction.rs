@@ -36,6 +36,7 @@ impl CompactionManager {
             priority: 10,
             time: chrono::Utc::now(),
             item_type: WorkItemType::Compaction,
+            attachments: Vec::new(),
         });
     }
 
@@ -51,37 +52,21 @@ impl CompactionManager {
     ) -> u64 {
         if self.script.is_empty() {
             let rendered =
-                renderer::render_context(state, deployment_context, None, config, compact_at, None, None, Vec::new());
+                renderer::render_context(state, deployment_context, None, None, config, compact_at, None, None);
             return (rendered.text.len() as u64) / 4;
         }
 
-        // Clone state and dry-run the compaction script
-        let mut clone = state.clone();
-        let result = python::execute(&clone, &self.script, true, &HashMap::new());
+        // Dry-run the compaction script. execute() already clones internally;
+        // on success, committed_state IS the post-compaction state with
+        // history mutations applied in place.
+        let result = python::execute(state, &self.script, true, &HashMap::new());
+        let post = match result.committed_state {
+            Some(c) => c,
+            None => state.clone(),  // script errored; estimate unchanged
+        };
 
-        if !result.is_error {
-            // Apply history side effects to the clone
-            for id in result.side_effects.history_removes {
-                clone.event_history.remove(&AgentId(id));
-            }
-            for (id, desc) in result.side_effects.history_replaces {
-                clone
-                    .event_history
-                    .replace_with_summary(&AgentId(id), desc);
-            }
-            for text in result.side_effects.history_adds {
-                let id = clone.id_generator.next();
-                clone.event_history.push(HistoryEntry::Summary {
-                    id,
-                    time: chrono::Utc::now(),
-                    description: text,
-                });
-            }
-        }
-
-        // Re-render and estimate
         let rendered =
-            renderer::render_context(&clone, deployment_context, None, config, compact_at, None, None, Vec::new());
+            renderer::render_context(&post, deployment_context, None, None, config, compact_at, None, None);
         (rendered.text.len() as u64) / 4
     }
 

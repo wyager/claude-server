@@ -43,8 +43,22 @@ pub enum FinishReason {
     MaxTurns(u32),
     /// Shutdown signal received.
     Shutdown,
+    /// Parent sent kill_child().
+    Killed,
     /// Event channel closed (parent dropped).
     ChannelClosed,
+}
+
+impl FinishReason {
+    fn as_status(&self) -> &'static str {
+        match self {
+            FinishReason::Done => "done",
+            FinishReason::MaxTurns(_) => "max_turns",
+            FinishReason::Shutdown => "shutdown",
+            FinishReason::Killed => "killed",
+            FinishReason::ChannelClosed => "channel_closed",
+        }
+    }
 }
 
 /// Format a lineage vector into a human-readable string.
@@ -74,6 +88,10 @@ pub struct AgentLoop {
     event_rx: mpsc::UnboundedReceiver<HarnessEvent>,
     event_tx: mpsc::UnboundedSender<HarnessEvent>,
     deployment_context: String,
+    /// Per-child stable prefix (role instructions + reference images) that
+    /// renders before event_history and sits in the cached region. None for
+    /// the root agent.
+    role_prefix: Option<renderer::RolePrefix>,
     broadcast_tx: Option<broadcast::Sender<BroadcastMsg>>,
     dump_dir: Option<PathBuf>,
     dump_to_stdout: bool,
@@ -82,19 +100,29 @@ pub struct AgentLoop {
     max_children: u32,
     /// Shared accumulator for the parent agent (None for children).
     token_accumulator: Option<Arc<Mutex<TokenAccumulator>>>,
+    /// Shared per-turn usage log — all agents write here for dev metrics.
+    usage_log: Arc<Mutex<crate::types::UsageLog>>,
     /// Local token accumulators for child agents (not shared).
     local_input_tokens: u64,
     local_output_tokens: u64,
     local_cache_creation_tokens: u64,
     local_cache_read_tokens: u64,
+    /// Last turn's API usage, shown in the next turn's dashboard snapshot.
+    /// None until the first API call completes.
+    last_usage: Option<UsageSummary>,
     /// Shared agent registry for naming and inter-agent messaging.
     registry: Arc<AgentRegistry>,
-    /// Attachments queued for the next turn's API request. Consumed once, then cleared.
-    /// Populated by attach() or by ChildSettings.attach on fork.
-    pending_attachments: Vec<Attachment>,
+    /// Set when a KillSignal is received; checked each turn boundary.
+    killed: bool,
+    /// Shutdown signal. When true, run() exits at the next cancellation point
+    /// — including mid-API-retry, since run_turn() is wrapped in select!.
+    shutdown: tokio::sync::watch::Receiver<bool>,
     /// Explicit return values from done(**kwargs). Populated on the turn that
     /// calls done(); read by run_child_agent_loop after run() returns.
     done_result: HashMap<String, serde_json::Value>,
+    /// Shared with HTTP server: tracks active SSE subscribers so send_message
+    /// can fail on unroutable chat_ids and wait_for_message_channel can block.
+    subscribers: Arc<crate::http_server::SubscriberRegistry>,
 }
 
 impl AgentLoop {
@@ -109,11 +137,15 @@ impl AgentLoop {
         event_rx: mpsc::UnboundedReceiver<HarnessEvent>,
         event_tx: mpsc::UnboundedSender<HarnessEvent>,
         deployment_context: String,
+        role_prefix: Option<renderer::RolePrefix>,
         broadcast_tx: Option<broadcast::Sender<BroadcastMsg>>,
         dump_dir: Option<PathBuf>,
         dump_to_stdout: bool,
         token_accumulator: Option<Arc<Mutex<TokenAccumulator>>>,
+        usage_log: Arc<Mutex<crate::types::UsageLog>>,
         registry: Arc<AgentRegistry>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+        subscribers: Arc<crate::http_server::SubscriberRegistry>,
     ) -> Self {
         let max_children: u32 = std::env::var("CLAUDE_SERVER_MAX_CHILDREN")
             .ok()
@@ -131,6 +163,7 @@ impl AgentLoop {
             event_rx,
             event_tx,
             deployment_context,
+            role_prefix,
             broadcast_tx,
             dump_dir,
             dump_to_stdout,
@@ -138,19 +171,18 @@ impl AgentLoop {
             active_children: 0,
             max_children,
             token_accumulator,
+            usage_log,
             local_input_tokens: 0,
             local_output_tokens: 0,
             local_cache_creation_tokens: 0,
             local_cache_read_tokens: 0,
+            last_usage: None,
             registry,
-            pending_attachments: Vec::new(),
+            killed: false,
+            shutdown,
             done_result: HashMap::new(),
+            subscribers,
         }
-    }
-
-    /// Seed attachments for the first turn (used by fork to give children initial content).
-    pub fn set_initial_attachments(&mut self, attachments: Vec<Attachment>) {
-        self.pending_attachments = attachments;
     }
 
     fn broadcast(&self, msg: BroadcastMsg) {
@@ -159,10 +191,166 @@ impl AgentLoop {
         }
     }
 
+    /// Finalize the dashboard snapshot on exit. Without this, a child that
+    /// finishes mid-turn stays frozen at "executing" forever — confusing
+    /// when you're trying to tell live agents from dead ones. The final
+    /// snapshot shows post-mortem state (what was in memory, what the last
+    /// turn cost) with a terminal status ("done", "killed", etc.).
+    fn finish(&self, reason: FinishReason) -> FinishReason {
+        self.registry.update_snapshot(
+            self.build_snapshot(reason.as_status(), self.last_usage.clone())
+        );
+        reason
+    }
+
+    /// Build a dashboard snapshot from current state. Called once per turn
+    /// (right before the API call, so the dashboard mirrors what the model
+    /// sees) and patched at status transitions. Everything here is bounded
+    /// — we cap history tail, truncate strings — so serialization stays
+    /// cheap even for long-running agents with big histories.
+    fn build_snapshot(&self, status: &str, usage: Option<UsageSummary>) -> AgentSnapshot {
+        const TAIL: usize = 10;
+        const TRUNC: usize = 200;
+        let tr = |s: &str| crate::renderer::trunc(s, TRUNC).to_string();
+
+        let queue: Vec<WorkItemSummary> = self.state.work_queue.items().iter()
+            .map(|item| {
+                let (ty, preview) = match &item.item_type {
+                    WorkItemType::UserMessage { content, chat_id, .. } =>
+                        ("UserMessage", format!("[{}] {}", chat_id, tr(content))),
+                    WorkItemType::TimerFired { description, .. } =>
+                        ("TimerFired", tr(description)),
+                    WorkItemType::ProcessCompleted { pid, exit_code, output_preview, .. } =>
+                        ("ProcessCompleted", format!("{} exit={} {}", pid.0, exit_code,
+                            output_preview.as_deref().map(tr).unwrap_or_default())),
+                    WorkItemType::ProcessFailed { pid, error, .. } =>
+                        ("ProcessFailed", format!("{} {}", pid.0, tr(error))),
+                    WorkItemType::ProcessTimeout { pid } =>
+                        ("ProcessTimeout", pid.0.clone()),
+                    WorkItemType::ChildAgentCompleted { child_name, success, summary, .. } =>
+                        ("ChildAgentCompleted", format!("{} ok={} {}", child_name, success, tr(summary))),
+                    WorkItemType::AgentMessage { from, content } =>
+                        ("AgentMessage", format!("[{}] {}", from, tr(content))),
+                    WorkItemType::ExternalEvent { source, event_type, .. } =>
+                        ("ExternalEvent", format!("{}:{}", source, event_type)),
+                    WorkItemType::View { paths } =>
+                        ("View", paths.join(", ")),
+                    WorkItemType::Compaction => ("Compaction", String::new()),
+                    WorkItemType::AgentStartup { .. } => ("AgentStartup", String::new()),
+                    WorkItemType::HookException { hook_name, error, .. } =>
+                        ("HookException", format!("{}: {}", hook_name, tr(error))),
+                };
+                WorkItemSummary {
+                    id: item.id.0.clone(),
+                    priority: item.priority,
+                    item_type: ty.into(),
+                    preview,
+                }
+            })
+            .collect();
+
+        let entries = self.state.event_history.entries();
+        let history_tail: Vec<HistorySummary> = entries.iter().rev().take(TAIL).rev()
+            .map(|e| match e {
+                HistoryEntry::Execution { id, time, code, output, is_error } => HistorySummary {
+                    id: id.0.clone(),
+                    time: time.to_rfc3339(),
+                    kind: "Execution".into(),
+                    code: tr(code),
+                    output: tr(output),
+                    is_error: *is_error,
+                },
+                HistoryEntry::Summary { id, time, description } => HistorySummary {
+                    id: id.0.clone(),
+                    time: time.to_rfc3339(),
+                    kind: "Summary".into(),
+                    code: String::new(),
+                    output: tr(description),
+                    is_error: false,
+                },
+                HistoryEntry::SystemAlert { id, time, message } => HistorySummary {
+                    id: id.0.clone(),
+                    time: time.to_rfc3339(),
+                    kind: "SystemAlert".into(),
+                    code: String::new(),
+                    output: tr(message),
+                    is_error: false,
+                },
+            })
+            .collect();
+
+        // Memory values are included (truncated) so the dashboard can show
+        // them collapsed-by-default. Sensitive keys get redacted — same keys
+        // scrubbed from API traces. Cap value length at 500 chars; dashboard
+        // shows "…(2.1KB)" for anything bigger. Full values are in --dump-dir
+        // if needed.
+        const MEM_TRUNC: usize = 500;
+        let mut memory: Vec<MemoryEntry> = self.state.memory.iter()
+            .map(|(k, v)| {
+                let priority = self.state.memory_priorities.get(k).copied().unwrap_or(5);
+                let sensitive = self.state.sensitive_keys.contains(k);
+                let full = serde_json::to_string(v).unwrap_or_else(|_| "?".into());
+                let value_len = full.len();
+                let value = if sensitive {
+                    "<SENSITIVE, REDACTED>".into()
+                } else {
+                    crate::renderer::trunc(&full, MEM_TRUNC).to_string()
+                };
+                MemoryEntry { key: k.clone(), priority, value, value_len, sensitive }
+            })
+            .collect();
+        memory.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.key.cmp(&b.key)));
+
+        let timers: Vec<TimerSummary> = self.state.timer_manager.list().iter()
+            .map(|t| {
+                let (next, recurring) = match &t.schedule {
+                    TimerSchedule::OneShot { at } => (at.to_rfc3339(), false),
+                    TimerSchedule::Recurring { next_fire, .. } => (next_fire.to_rfc3339(), true),
+                };
+                TimerSummary {
+                    id: t.id.0.clone(),
+                    description: t.description.clone(),
+                    next_fire: next,
+                    recurring,
+                }
+            })
+            .collect();
+
+        let processes: Vec<ProcessSummary> = self.state.process_manager.processes().iter()
+            .map(|p| ProcessSummary {
+                id: p.id.0.clone(),
+                cmd: p.cmd.clone(),
+                description: p.description.clone(),
+                status: format!("{:?}", p.status),
+            })
+            .collect();
+
+        let hooks: Vec<(String, i32, String)> = self.state.hooks.iter()
+            .map(|h| (h.name.clone(), h.priority, tr(&h.match_expr)))
+            .collect();
+
+        AgentSnapshot {
+            name: self.name.clone(),
+            lineage: format_lineage(&self.permissions.lineage),
+            turn: self.turn_counter,
+            max_turns: self.permissions.max_turns,
+            status: status.into(),
+            queue,
+            history_len: entries.len(),
+            history_tail,
+            memory,
+            timers,
+            processes,
+            hooks,
+            hook_stats: self.state.hook_stats.clone(),
+            last_usage: usage,
+            updated_at: Utc::now().to_rfc3339(),
+        }
+    }
+
     pub async fn run(&mut self) -> FinishReason {
         dimlog!("[{}] Agent loop started", self.name);
         let mut idle = false;
-        let finish_reason;
 
         loop {
             // Drain any pending events
@@ -184,12 +372,37 @@ impl AgentLoop {
                     .trigger(&mut self.state, self.config.compact_target);
             }
 
+            if *self.shutdown.borrow() {
+                dimlog!("[{}] Shutdown requested", self.name);
+                return self.finish(FinishReason::Shutdown);
+            }
+
             // If work queue is empty, wait for events (messages, process
             // completions, timer fires). Agents exit explicitly via done().
             if self.state.work_queue.is_empty() {
                 if !idle {
-                    dimlog!("[{}] Idle, waiting for events...", self.name);
+                    let timers = self.state.timer_manager.list();
+                    if timers.is_empty() {
+                        dimlog!("[{}] Idle, waiting for events...", self.name);
+                    } else {
+                        let next_in = self.state.timer_manager.next_deadline()
+                            .map(|d| (d - Utc::now()).to_std().unwrap_or(Duration::ZERO))
+                            .unwrap_or(Duration::ZERO);
+                        dimlog!(
+                            "[{}] Idle, waiting for events... [{} timer{} active, next in {}]",
+                            self.name,
+                            timers.len(),
+                            if timers.len() == 1 { "" } else { "s" },
+                            format!("{:?}", next_in)
+                        );
+                    }
                     idle = true;
+                    // Full snapshot on idle, not just a status patch — the
+                    // turn's side effects have been applied by now, so this
+                    // shows post-execution state (memory writes, queue pops,
+                    // usage numbers). Without this the dashboard would show
+                    // pre-turn state with a misleading "idle" badge on it.
+                    self.registry.update_snapshot(self.build_snapshot("idle", self.last_usage.clone()));
                     self.broadcast(BroadcastMsg::Status {
                         status: "idle".to_string(),
                     });
@@ -208,27 +421,30 @@ impl AgentLoop {
                 tokio::select! {
                     event = self.event_rx.recv() => {
                         match event {
-                            Some(HarnessEvent::Shutdown) => {
-                                dimlog!("[{}] Shutdown requested", self.name);
-                                finish_reason = FinishReason::Shutdown;
-                                break;
-                            }
                             Some(event) => self.apply_event(event),
                             None => {
                                 dimlog!("[{}] Event channel closed, shutting down", self.name);
-                                finish_reason = FinishReason::ChannelClosed;
-                                break;
+                                return self.finish(FinishReason::ChannelClosed);
                             }
                         }
                     }
                     _ = timer_sleep => {
                         self.check_timers();
                     }
+                    _ = self.shutdown.changed() => {}
                 }
                 continue;
             }
 
+            if idle {
+                self.flush_hook_telemetry();
+            }
             idle = false;
+
+            if self.killed {
+                dimlog!("[{}] Kill signal received, exiting", self.name);
+                return self.finish(FinishReason::Killed);
+            }
 
             // Check max_turns limit
             if let Some(max) = self.permissions.max_turns {
@@ -237,34 +453,43 @@ impl AgentLoop {
                        "[{}] Max turns ({}) reached, exiting",
                         self.name, max
                     );
-                    finish_reason = FinishReason::MaxTurns(max);
-                    break;
+                    return self.finish(FinishReason::MaxTurns(max));
                 }
             }
 
-            // Run a turn
-            match self.run_turn().await {
+            // Run a turn. Wrapping in select! makes the entire turn future
+            // (API call, retry sleeps, Python exec) cancellable on shutdown —
+            // dropping the future cancels in-flight HTTP requests and sleeps.
+            let mut shutdown = self.shutdown.clone();
+            let turn_result = tokio::select! {
+                r = self.run_turn() => r,
+                _ = shutdown.changed() => {
+                    dimlog!("[{}] Shutdown requested (mid-turn)", self.name);
+                    return self.finish(FinishReason::Shutdown);
+                }
+            };
+            match turn_result {
                 Ok(true) => {
                     dimlog!("[{}] done() called, exiting", self.name);
-                    finish_reason = FinishReason::Done;
-                    break;
+                    return self.finish(FinishReason::Done);
                 }
                 Ok(false) => {}
                 Err(e) => {
                     eprintln!("[{}] Turn error: {}", self.name, e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                        _ = self.shutdown.changed() => {}
+                    }
                 }
             }
 
-            // Persist state (parent only — children don't persist)
-            if self.permissions.max_turns.is_none() {
+            // Persist state (root only — children, even persistent ones, don't)
+            if self.permissions.agent_name.is_root() {
                 if let Err(e) = self.db.save_state(&self.state) {
                     eprintln!("[{}] Failed to persist state: {}", self.name, e);
                 }
             }
         }
-
-        finish_reason
     }
 
     /// Run a single turn. Returns Ok(true) if the agent called done().
@@ -287,8 +512,13 @@ impl AgentLoop {
 
         // Render context
         let lineage_str = format_lineage(&self.permissions.lineage);
-        // Load pinned memory from DB (shared across agents, injected into system prompt)
-        let pinned = self.db.load_pinned().unwrap_or_default();
+        // Load pinned memory from DB (shared across agents, injected into system prompt).
+        // Surfaces (rather than swallows) load failures so ops notice if the shared
+        // knowledge tier is broken — agent still proceeds with empty pinned memory.
+        let pinned = self.db.load_pinned().unwrap_or_else(|e| {
+            eprintln!("[{}] failed to load pinned memory: {} — continuing with empty pinned tier", self.name, e);
+            Vec::new()
+        });
         let pinned_snapshot: HashMap<String, String> = pinned.iter().cloned().collect();
         let pinned_summary = if pinned.is_empty() {
             None
@@ -298,53 +528,96 @@ impl AgentLoop {
         };
 
         let agent_identity = renderer::AgentIdentity {
-            name: &self.permissions.agent_name,
+            name: self.permissions.agent_name.as_str(),
             lineage: &lineage_str,
             turn_counter: self.turn_counter,
             max_turns: self.permissions.max_turns,
         };
-        // Consume pending attachments — they're visible for exactly this one turn
-        let attachments = std::mem::take(&mut self.pending_attachments);
-
         let rendered = renderer::render_context(
             &self.state,
             &self.deployment_context,
+            self.role_prefix.as_ref(),
             compaction_state.as_ref(),
             &self.config.render_config,
             self.config.compact_at,
             Some(&agent_identity),
             pinned_summary,
-            attachments,
         );
 
+        let seg_sizes: Vec<usize> = rendered.cached_segments.iter().map(String::len).collect();
         dimlog!(
-           "[{}] Rendered context: {} chars, queue: {} items, attachments: {}",
+           "[{}] Rendered context: {} chars (cached segs: {:?}), queue: {} items, attachments: {}",
             self.name,
             rendered.text.len(),
+            seg_sizes,
             self.state.work_queue.len(),
             rendered.attachments.len()
         );
 
         // Broadcast thinking status
+        // Full snapshot here — we're about to call the API, so the dashboard
+        // should show exactly what the model will see (queue, memory, etc.).
+        // last_usage is None because we don't have this turn's numbers yet;
+        // it gets filled on the *next* turn's snapshot.
+        self.registry.update_snapshot(self.build_snapshot("thinking", self.last_usage.clone()));
         self.broadcast(BroadcastMsg::Status {
             status: "thinking".to_string(),
         });
 
-        // Call Claude API
-        let api_result = self.api_client.call(&rendered, &pinned).await?;
+        // Collect sensitive values for trace scrubbing. Check both local
+        // and pinned memory; extract string repr.
+        let sensitive_values: Vec<String> = self.state.sensitive_keys.iter()
+            .filter_map(|k| {
+                self.state.memory.get(k).map(|v| match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .or_else(|| pinned.iter().find(|(pk, _)| pk == k).map(|(_, v)| v.clone()))
+            })
+            .filter(|v| v.len() >= 8)  // skip trivially short values (false-positive risk)
+            .collect();
 
+        // Call Claude API
+        let api_result = self.api_client.call(&rendered, &pinned, &self.name, self.turn_counter, &sensitive_values).await?;
+
+        let turn_cost = (api_result.input_tokens as f64 * self.config.cost_per_m_input
+            + api_result.output_tokens as f64 * self.config.cost_per_m_output
+            + api_result.cache_creation_tokens as f64 * self.config.cost_per_m_cache_write
+            + api_result.cache_read_tokens as f64 * self.config.cost_per_m_cache_read)
+            / 1_000_000.0;
+        let total_in = api_result.input_tokens
+            + api_result.cache_creation_tokens
+            + api_result.cache_read_tokens;
+        let cache_hit_pct = if total_in > 0 {
+            100.0 * api_result.cache_read_tokens as f64 / total_in as f64
+        } else {
+            0.0
+        };
         dimlog!(
-           "[{}] API response: {} input tokens, {} output tokens (cache: {} created, {} read)",
+            "[{}] API response: in={} out={} cache_write={} cache_read={} | ${:.4}/turn, {:.0}% cache hit",
             self.name,
             api_result.input_tokens,
             api_result.output_tokens,
             api_result.cache_creation_tokens,
-            api_result.cache_read_tokens
+            api_result.cache_read_tokens,
+            turn_cost,
+            cache_hit_pct
         );
 
         // Update token tracking
         self.state.last_input_tokens = api_result.input_tokens;
         self.turn_counter += 1;
+        // Stash usage for the next turn's dashboard snapshot. We do it here
+        // (not immediately after the API call) so turn_counter is already
+        // advanced — the dashboard's "turn N" correctly pairs with N's cost.
+        self.last_usage = Some(UsageSummary {
+            input_tokens: api_result.input_tokens,
+            output_tokens: api_result.output_tokens,
+            cache_read: api_result.cache_read_tokens,
+            cache_write: api_result.cache_creation_tokens,
+            cost_usd: turn_cost,
+            cache_hit_pct: cache_hit_pct as u8,
+        });
 
         // Accumulate tokens
         if let Some(ref acc) = self.token_accumulator {
@@ -362,10 +635,22 @@ impl AgentLoop {
             self.local_cache_read_tokens += api_result.cache_read_tokens;
         }
 
+        // Per-turn usage log (for /metrics/turns and /metrics/rate). Every
+        // agent writes here — the log covers all API calls, not just the root.
+        self.usage_log.lock().unwrap().push(crate::types::UsageEntry {
+            ts: Utc::now().timestamp(),
+            agent: self.name.clone(),
+            input_tokens: api_result.input_tokens,
+            output_tokens: api_result.output_tokens,
+            cache_read_tokens: api_result.cache_read_tokens,
+            cache_creation_tokens: api_result.cache_creation_tokens,
+            cost_usd: turn_cost,
+        });
+
         // Load process outputs for shell_output() calls
         let process_outputs = self.db.load_all_process_outputs().unwrap_or_default();
 
-        // Broadcast executing status
+        self.registry.set_status(&self.name, "executing");
         self.broadcast(BroadcastMsg::Status {
             status: "executing".to_string(),
         });
@@ -379,9 +664,10 @@ impl AgentLoop {
             &process_outputs,
             self.config.python_timeout_secs,
             self.permissions.child_depth_remaining,
-            &self.permissions.agent_name,
+            self.permissions.agent_name.as_str(),
             &lineage_str,
             &pinned_snapshot,
+            Some(self.subscribers.clone()),
         );
 
         let mut is_error = exec_result.is_error;
@@ -396,17 +682,26 @@ impl AgentLoop {
         );
 
         if !stdout.is_empty() {
-            print!("\x1b[2m[stdout] {}\x1b[0m", stdout);
+            let preview = truncate_for_log(&stdout, 200);
+            let extra = stdout.lines().count().saturating_sub(preview.lines().count());
+            print!("\x1b[2m[stdout] {}", preview);
+            if extra > 0 {
+                print!(" [+{} more lines]", extra);
+            }
+            println!("\x1b[0m");
         }
 
         // Apply side effects (only if no error)
         let mut done_called = false;
         if !is_error {
-            done_called = exec_result.side_effects.done_called;
+            done_called = exec_result.effects.done_called;
             if done_called {
-                self.done_result = exec_result.side_effects.done_result.clone();
+                self.done_result = exec_result.effects.done_result.clone();
             }
-            match self.apply_side_effects(exec_result.side_effects) {
+            match self.apply_side_effects(
+                exec_result.effects,
+                exec_result.committed_state.expect("committed_state is Some when !is_error"),
+            ) {
                 Ok(deferred) => {
                     self.perform_deferred_ops(deferred).await;
                 }
@@ -439,8 +734,13 @@ impl AgentLoop {
             write_turn_dump(
                 &self.name,
                 self.turn_counter,
-                &rendered.text,
-                &rendered.attachments,
+                &rendered,
+                (
+                    api_result.input_tokens,
+                    api_result.output_tokens,
+                    api_result.cache_creation_tokens,
+                    api_result.cache_read_tokens,
+                ),
                 api_result.thinking.as_deref(),
                 &api_result.code,
                 &output,
@@ -467,8 +767,168 @@ impl AgentLoop {
             .check_and_fire(now, &mut self.state.id_generator);
         for item in fired {
             dimlog!("[{}] Timer fired: {}", self.name, item.id);
-            self.state.work_queue.push(item);
+            self.push_item(item);
         }
+    }
+
+    /// Push a WorkItem, running it through hooks first. First matching hook
+    /// (by priority) gets it; returns None → drop, returns e → push (possibly
+    /// with modified priority), raises → push a HookException wrapping the
+    /// original. `!hooks ...` UserMessages bypass hooks entirely so a human
+    /// can recover from a buggy hook that intercepts everything.
+    fn push_item(&mut self, mut item: WorkItem) {
+        // Safety hatch — handled in Rust, never reaches hook matching.
+        if let WorkItemType::UserMessage { ref content, .. } = item.item_type {
+            if let Some(cmd) = content.strip_prefix("!hooks ") {
+                self.handle_hooks_command(cmd.trim(), &item);
+                return;
+            }
+        }
+
+        if self.state.hooks.is_empty() {
+            self.state.work_queue.push(item);
+            return;
+        }
+
+        let (outcome, commit) = python::run_hooks(
+            &self.state.hooks, &item, &self.state,
+            Some(self.subscribers.clone()),
+        );
+
+        // Direct work_queue.push below, NOT recursive push_item — "first
+        // match wins" means once a hook has processed an item, it's done.
+        // HookException also bypasses hooks to avoid error cascades.
+        match outcome {
+            python::HookOutcome::NoMatch => {
+                self.state.work_queue.push(item);
+            }
+            python::HookOutcome::Consumed { hook_name } => {
+                let s = self.state.hook_stats.entry(hook_name).or_default();
+                s.fired += 1; s.consumed += 1;
+                self.apply_hook_commit(commit);
+            }
+            python::HookOutcome::Passed { hook_name, priority, hook_note } => {
+                let s = self.state.hook_stats.entry(hook_name.clone()).or_default();
+                s.fired += 1; s.passed += 1;
+                item.priority = priority;
+                if let Some(note) = hook_note {
+                    // Annotate via attachments — visible in queue render as
+                    // metadata without needing a new field on every variant.
+                    item.attachments.push(format!("hook:{}:{}", hook_name, note));
+                }
+                self.apply_hook_commit(commit);
+                self.state.work_queue.push(item);
+            }
+            python::HookOutcome::Failed { hook_name, error } => {
+                let s = self.state.hook_stats.entry(hook_name.clone()).or_default();
+                s.fired += 1; s.raised += 1;
+                let original = serde_json::to_value(&item).unwrap_or(serde_json::Value::Null);
+                let exc_id = self.state.id_generator.next();
+                self.state.work_queue.push(WorkItem {
+                    id: exc_id,
+                    priority: item.priority.max(8),
+                    time: Utc::now(),
+                    item_type: WorkItemType::HookException { hook_name, error, original },
+                    attachments: Vec::new(),
+                });
+                self.apply_hook_commit(commit);
+            }
+        }
+    }
+
+    /// Apply a hook's commit: swap in its mutated memory/id_gen, then apply
+    /// the external half (OS spawns, broadcasts). Hooks don't touch
+    /// work_queue/timers/history/hooks so those aren't part of the commit.
+    fn apply_hook_commit(&mut self, commit: Option<python::HookCommit>) {
+        let Some(commit) = commit else { return };
+        self.state.memory = commit.memory;
+        self.state.memory_priorities = commit.memory_priorities;
+        self.state.id_generator = commit.id_generator;
+        // Hook's process_manager started empty — every entry was added by the
+        // hook's shell_exec. Append them so ProcessCompleted→description
+        // lookup works for the chain pattern.
+        for p in commit.process_manager.into_processes() {
+            self.state.process_manager.add(p);
+        }
+        for req in commit.process_starts {
+            if let Err(e) = self.process_supervisor.spawn(req) {
+                eprintln!("[{}] hook process spawn failed: {}", self.name, e);
+            }
+        }
+        for msg in commit.messages {
+            let id = self.db.save_outbound_message(&msg.chat_id, &msg.content, &msg.attachments)
+                .unwrap_or(0);
+            self.broadcast(crate::http_server::BroadcastMsg::Message {
+                chat_id: msg.chat_id,
+                content: msg.content,
+                attachments: msg.attachments,
+                id,
+                created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                react_to: msg.react_to,
+            });
+        }
+    }
+
+    /// `!hooks list|disable NAME|clear` — bypasses all hooks, handled in Rust.
+    /// Response goes to the chat_id the command came from.
+    fn handle_hooks_command(&mut self, cmd: &str, item: &WorkItem) {
+        let WorkItemType::UserMessage { ref chat_id, .. } = item.item_type else { return };
+        let reply = if cmd == "list" {
+            if self.state.hooks.is_empty() {
+                "No hooks registered.".to_owned()
+            } else {
+                self.state.hooks.iter()
+                    .map(|h| format!("[{}] {} — {}", h.priority, h.name, h.match_expr))
+                    .collect::<Vec<_>>().join("\n")
+            }
+        } else if let Some(name) = cmd.strip_prefix("disable ") {
+            let before = self.state.hooks.len();
+            self.state.hooks.retain(|h| h.name != name);
+            if self.state.hooks.len() < before {
+                format!("Disabled hook '{}'.", name)
+            } else {
+                format!("No hook named '{}'.", name)
+            }
+        } else if cmd == "clear" {
+            let n = self.state.hooks.len();
+            self.state.hooks.clear();
+            self.state.hook_stats.clear();
+            format!("Cleared {} hooks.", n)
+        } else {
+            "Usage: !hooks list | !hooks disable NAME | !hooks clear".to_owned()
+        };
+        let id = self.db.save_outbound_message(chat_id, &reply, &[]).unwrap_or(0);
+        self.broadcast(crate::http_server::BroadcastMsg::Message {
+            chat_id: chat_id.clone(), content: reply, attachments: Vec::new(),
+            id, created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            react_to: None,
+        });
+    }
+
+    /// Emit a SystemAlert summarizing hook activity since the last wake,
+    /// then reset counters. Call on idle→active transition. Skipped if no
+    /// hooks fired — avoids noise and unnecessary history entries.
+    fn flush_hook_telemetry(&mut self) {
+        if self.state.hook_stats.values().all(|s| s.fired == 0) {
+            return;
+        }
+        let mut lines: Vec<String> = self.state.hook_stats.iter()
+            .filter(|(_, s)| s.fired > 0)
+            .map(|(name, s)| {
+                let mut parts = vec![format!("{}: {}× fired", name, s.fired)];
+                if s.consumed > 0 { parts.push(format!("{} consumed", s.consumed)); }
+                if s.passed > 0 { parts.push(format!("{} passed", s.passed)); }
+                if s.raised > 0 { parts.push(format!("{} RAISED", s.raised)); }
+                parts.join(", ")
+            })
+            .collect();
+        lines.sort();
+        let id = self.state.id_generator.next();
+        self.state.event_history.push(HistoryEntry::SystemAlert {
+            id, time: Utc::now(),
+            message: format!("Hook activity since last wake:\n{}", lines.join("\n")),
+        });
+        for s in self.state.hook_stats.values_mut() { *s = Default::default(); }
     }
 
     fn apply_event(&mut self, event: HarnessEvent) {
@@ -477,16 +937,19 @@ impl AgentLoop {
                 chat_id,
                 user,
                 content,
+                attachments,
+                message_ref,
             } => {
                 let id = self.state.id_generator.next();
                 dimlog!(
-                   "[{}] User message from {}: {} (id={})",
+                   "[{}] User message from {}: {} (id={}){}",
                     self.name,
                     user,
-                    &content[..content.len().min(50)],
-                    id
+                    crate::renderer::trunc(&content, 50),
+                    id,
+                    if attachments.is_empty() { String::new() } else { format!(" [{} attachments]", attachments.len()) }
                 );
-                self.state.work_queue.push(WorkItem {
+                self.push_item(WorkItem {
                     id,
                     priority: 9,
                     time: Utc::now(),
@@ -494,23 +957,25 @@ impl AgentLoop {
                         chat_id,
                         user,
                         content,
+                        message_ref,
                     },
+                    attachments,
                 });
             }
             HarnessEvent::Process(pe) => match pe {
                 ProcessEvent::Completed { pid, exit_code } => {
-                    let prio = self
+                    let (prio, description) = self
                         .state
                         .process_manager
                         .get(&pid)
-                        .map(|p| p.success_prio)
-                        .unwrap_or(5);
+                        .map(|p| (p.success_prio, p.description.clone()))
+                        .unwrap_or((5, String::new()));
                     if let Some(p) = self.state.process_manager.get_mut(&pid) {
                         p.status = ProcessStatus::Completed { exit_code };
                     }
                     let output_preview = self.load_output_preview(&pid.0);
                     let id = self.state.id_generator.next();
-                    self.state.work_queue.push(WorkItem {
+                    self.push_item(WorkItem {
                         id,
                         priority: prio,
                         time: Utc::now(),
@@ -518,16 +983,18 @@ impl AgentLoop {
                             pid,
                             exit_code,
                             output_preview,
+                            description,
                         },
+                        attachments: Vec::new(),
                     });
                 }
                 ProcessEvent::Failed { pid, error } => {
-                    let prio = self
+                    let (prio, description) = self
                         .state
                         .process_manager
                         .get(&pid)
-                        .map(|p| p.fail_prio)
-                        .unwrap_or(7);
+                        .map(|p| (p.fail_prio, p.description.clone()))
+                        .unwrap_or((7, String::new()));
                     if let Some(p) = self.state.process_manager.get_mut(&pid) {
                         p.status = ProcessStatus::Failed {
                             error: error.clone(),
@@ -535,7 +1002,7 @@ impl AgentLoop {
                     }
                     let output_preview = self.load_output_preview(&pid.0);
                     let id = self.state.id_generator.next();
-                    self.state.work_queue.push(WorkItem {
+                    self.push_item(WorkItem {
                         id,
                         priority: prio,
                         time: Utc::now(),
@@ -543,7 +1010,9 @@ impl AgentLoop {
                             pid,
                             error,
                             output_preview,
+                            description,
                         },
+                        attachments: Vec::new(),
                     });
                 }
                 ProcessEvent::Timeout { pid } => {
@@ -554,11 +1023,12 @@ impl AgentLoop {
                         .map(|p| p.fail_prio)
                         .unwrap_or(7);
                     let id = self.state.id_generator.next();
-                    self.state.work_queue.push(WorkItem {
+                    self.push_item(WorkItem {
                         id,
                         priority: prio,
                         time: Utc::now(),
                         item_type: WorkItemType::ProcessTimeout { pid },
+                        attachments: Vec::new(),
                     });
                 }
             },
@@ -590,7 +1060,19 @@ impl AgentLoop {
                     acc.cache_read_tokens += child_cache_read_tokens;
                 }
 
-                self.state.work_queue.push(WorkItem {
+                let cost_usd = (child_input_tokens as f64 * self.config.cost_per_m_input
+                    + child_output_tokens as f64 * self.config.cost_per_m_output
+                    + child_cache_creation_tokens as f64 * self.config.cost_per_m_cache_write
+                    + child_cache_read_tokens as f64 * self.config.cost_per_m_cache_read)
+                    / 1_000_000.0;
+                let total_in = child_input_tokens + child_cache_read_tokens;
+                let cache_hit_pct = if total_in > 0 {
+                    (child_cache_read_tokens * 100 / total_in) as u8
+                } else {
+                    0
+                };
+
+                self.push_item(WorkItem {
                     id,
                     priority,
                     time: Utc::now(),
@@ -600,7 +1082,10 @@ impl AgentLoop {
                         turns_used,
                         success,
                         summary,
+                        cost_usd,
+                        cache_hit_pct,
                     },
+                    attachments: Vec::new(),
                 });
             }
             HarnessEvent::AgentMessage {
@@ -613,13 +1098,14 @@ impl AgentLoop {
                    "[{}] Agent message from {}: {}",
                     self.name,
                     from,
-                    &content[..content.len().min(50)]
+                    crate::renderer::trunc(&content, 50)
                 );
-                self.state.work_queue.push(WorkItem {
+                self.push_item(WorkItem {
                     id,
                     priority,
                     time: Utc::now(),
                     item_type: WorkItemType::AgentMessage { from, content },
+                    attachments: Vec::new(),
                 });
             }
             HarnessEvent::ExternalEvent {
@@ -633,7 +1119,7 @@ impl AgentLoop {
                    "[{}] External event from {}: {} (id={})",
                     self.name, source, event_type, id
                 );
-                self.state.work_queue.push(WorkItem {
+                self.push_item(WorkItem {
                     id,
                     priority,
                     time: Utc::now(),
@@ -642,9 +1128,12 @@ impl AgentLoop {
                         event_type,
                         data,
                     },
+                    attachments: Vec::new(),
                 });
             }
-            HarnessEvent::Shutdown => {} // handled in run()
+            HarnessEvent::KillSignal => {
+                self.killed = true;
+            }
         }
     }
 
@@ -670,9 +1159,11 @@ impl AgentLoop {
     /// case NO side effects have been applied (atomic rollback).
     fn apply_side_effects(
         &mut self,
-        effects: python::SideEffectCollector,
+        effects: python::ExternalEffects,
+        committed: HarnessState,
     ) -> Result<DeferredOps, String> {
-        // Validate all agent message recipients BEFORE applying anything
+        // Validate all agent message recipients BEFORE committing anything —
+        // this is the one case where a returned-Err rolls back the whole turn.
         for msg in &effects.agent_messages {
             if !self.registry.exists(&msg.recipient) {
                 return Err(format!(
@@ -682,113 +1173,29 @@ impl AgentLoop {
             }
         }
 
+        // Commit the mutated clone. Memory, work_queue, timers, hooks,
+        // history, process bookkeeping, id_generator — all already mutated
+        // in place inside the pyclass Mutex<T> fields during execution.
+        // hook_stats is preserved from the pre-turn state (the script can't
+        // touch it), but we need to drop stats for hooks the script removed.
+        let old_hook_names: std::collections::HashSet<String> =
+            self.state.hooks.iter().map(|h| h.name.clone()).collect();
+        self.state = committed;
+        let new_hook_names: std::collections::HashSet<&str> =
+            self.state.hooks.iter().map(|h| h.name.as_str()).collect();
+        for gone in old_hook_names.difference(
+            &new_hook_names.iter().map(|s| s.to_string()).collect()
+        ) {
+            self.state.hook_stats.remove(gone);
+        }
+
         let mut deferred = DeferredOps::default();
 
-        // Update ID generator
-        self.state.id_generator = effects.id_gen;
-
-        // Memory operations
-        for (key, value) in effects.memory_sets {
-            self.state.memory.insert(key, value);
-        }
-        for key in effects.memory_deletes {
-            self.state.memory.remove(&key);
-            self.state.memory_priorities.remove(&key);
-        }
-        for (key, priority) in effects.memory_priority_sets {
-            self.state.memory_priorities.insert(key, priority);
-        }
-
-        // Queue removes
-        for id in effects.queue_removes {
-            self.state.work_queue.remove(&AgentId(id));
-        }
-
-        // Timer operations
-        for req in effects.timer_adds {
-            let schedule = if let Some(secs) = req.every_secs {
-                TimerSchedule::Recurring {
-                    every: Duration::from_secs(secs),
-                    next_fire: Utc::now()
-                        + chrono::Duration::from_std(Duration::from_secs(secs))
-                            .unwrap_or(chrono::Duration::seconds(1)),
-                }
-            } else if let Some(epoch) = req.at_epoch {
-                let at = chrono::DateTime::from_timestamp(epoch as i64, 0)
-                    .unwrap_or_else(|| Utc::now() + chrono::Duration::minutes(1));
-                TimerSchedule::OneShot { at }
-            } else {
-                let at = Utc::now() + chrono::Duration::minutes(1);
-                TimerSchedule::OneShot { at }
-            };
-
-            let timer = Timer {
-                id: req.id,
-                description: req.description,
-                priority: req.priority,
-                schedule,
-                created_at: Utc::now(),
-                pending_ack: false,
-            };
-            self.state.timer_manager.add(timer);
-        }
-        for id in effects.timer_cancels {
-            self.state.timer_manager.cancel(&AgentId(id));
-        }
-
-        // Timer acknowledgments
-        for id in effects.timer_acks {
-            self.state.timer_manager.acknowledge(&AgentId(id));
-        }
-
-        // Filter operations
-        for filter in effects.filter_adds {
-            self.state.work_queue.add_filter(filter);
-        }
-        for name in effects.filter_removes {
-            self.state.work_queue.remove_filter(&name);
-        }
-
-        // History operations
-        for id in effects.history_removes {
-            let aid = AgentId(id);
-            if self.state.event_history.is_modifiable(&aid) || self.compaction.active {
-                self.state.event_history.remove(&aid);
-            }
-        }
-        for (id, desc) in effects.history_replaces {
-            let aid = AgentId(id);
-            if self.state.event_history.is_modifiable(&aid) || self.compaction.active {
-                self.state.event_history.replace_with_summary(&aid, desc);
-            }
-        }
-        for text in effects.history_adds {
-            if self.compaction.active {
-                let id = self.state.id_generator.next();
-                self.state.event_history.push(HistoryEntry::Summary {
-                    id,
-                    time: Utc::now(),
-                    description: text,
-                });
-            }
-        }
-
-        // Process starts
+        // Process starts: the ManagedProcess bookkeeping entries are already
+        // in state.process_manager (shell_exec added them same-turn). Here we
+        // do the actual OS spawn — the part that can fail and can't be rolled
+        // back by dropping a clone.
         for req in effects.process_starts {
-            let managed = ManagedProcess {
-                id: req.id.clone(),
-                cmd: req.cmd.clone(),
-                args: req.args.clone(),
-                env: req.env.clone(),
-                description: req.description.clone(),
-                status: ProcessStatus::Running,
-                success_prio: req.success_prio,
-                fail_prio: req.fail_prio,
-                started_at: Utc::now(),
-                os_pid: None,
-            };
-            self.state.process_manager.add(managed);
-
             let block_for_ms = req.block_for_ms;
             match self.process_supervisor.spawn(req.clone()) {
                 Ok(completion_rx) => {
@@ -804,7 +1211,7 @@ impl AgentLoop {
                         };
                     }
                     let wid = self.state.id_generator.next();
-                    self.state.work_queue.push(WorkItem {
+                    self.push_item(WorkItem {
                         id: wid,
                         priority: req.fail_prio,
                         time: Utc::now(),
@@ -812,7 +1219,9 @@ impl AgentLoop {
                             pid: req.id,
                             error: format!("spawn failed: {}", e),
                             output_preview: None,
+                            description: req.description,
                         },
+                        attachments: Vec::new(),
                     });
                 }
             }
@@ -820,9 +1229,30 @@ impl AgentLoop {
 
         // Process kills
         deferred.process_kills = effects.process_kills;
+        deferred.stdin_writes = effects.stdin_writes;
+        deferred.stdin_closes = effects.stdin_closes;
 
-        // Attachments for next turn's context (ephemeral)
-        self.pending_attachments.extend(effects.attachments);
+        // Child agent kills: send KillSignal via registry. Unknown names are
+        // logged but don't fail the turn — the child may have already exited.
+        for name in effects.child_kills {
+            match self.registry.send_to(&name, HarnessEvent::KillSignal) {
+                Ok(true) => dimlog!("[{}] Sent kill signal to child '{}'", self.name, name),
+                Ok(false) => dimlog!("[{}] kill_child('{}'): already completed", self.name, name),
+                Err(e) => eprintln!("[{}] kill_child('{}') failed: {}", self.name, name, e),
+            }
+        }
+
+        // view() calls → one View work item (priority 10, lands at head)
+        if !effects.view_paths.is_empty() {
+            let id = self.state.id_generator.next();
+            self.push_item(WorkItem {
+                id,
+                priority: 10,
+                time: Utc::now(),
+                item_type: WorkItemType::View { paths: effects.view_paths },
+                attachments: Vec::new(),
+            });
+        }
 
         // Fork requests (child agent spawns)
         for req in effects.fork_requests {
@@ -844,7 +1274,7 @@ impl AgentLoop {
                 eprintln!("[{}] Fork failed: {}", self.name, e);
                 // Push a single error work item
                 let wid = self.state.id_generator.next();
-                self.state.work_queue.push(WorkItem {
+                self.push_item(WorkItem {
                     id: wid,
                     priority: 7,
                     time: Utc::now(),
@@ -854,7 +1284,10 @@ impl AgentLoop {
                         turns_used: 0,
                         success: false,
                         summary: format!("Fork failed: {}", e),
+                        cost_usd: 0.0,
+                        cache_hit_pct: 0,
                     },
+                    attachments: Vec::new(),
                 });
                 continue;
             }
@@ -877,7 +1310,7 @@ impl AgentLoop {
                     );
                     self.registry.deregister(&child_settings.name);
                     let wid = self.state.id_generator.next();
-                    self.state.work_queue.push(WorkItem {
+                    self.push_item(WorkItem {
                         id: wid,
                         priority: 7,
                         time: Utc::now(),
@@ -890,7 +1323,10 @@ impl AgentLoop {
                                 "Could not spawn: max {} concurrent children reached",
                                 self.max_children
                             ),
+                            cost_usd: 0.0,
+                            cache_hit_pct: 0,
                         },
+                        attachments: Vec::new(),
                     });
                     continue;
                 }
@@ -904,7 +1340,7 @@ impl AgentLoop {
                 let model = child_settings.model.unwrap_or_else(|| self.config.model.clone());
 
                 dimlog!(
-                   "[{}] Forking child '{}' (model={}, max_turns={}, depth_remaining={})",
+                   "[{}] Forking child '{}' (model={}, max_turns={:?}, depth_remaining={})",
                     self.name, child_name_str, model, max_turns, child_depth
                 );
 
@@ -938,7 +1374,22 @@ impl AgentLoop {
                 child_state.process_manager = ProcessManager::new();
                 child_state.last_input_tokens = 0;
 
-                // Add task as work item
+                if !child_settings.inherit_history {
+                    child_state.event_history = EventHistory::new();
+                    let alert_id = child_state.id_generator.next();
+                    child_state.event_history.push(HistoryEntry::SystemAlert {
+                        id: alert_id,
+                        time: Utc::now(),
+                        message: format!(
+                            "Forked from '{}' with fresh history. Task: {}",
+                            self.permissions.agent_name, child_settings.task
+                        ),
+                    });
+                }
+
+                // Add task as work item. Attach paths go on this item as
+                // metadata; if present, also push a View item at head so the
+                // child sees the files on turn 1.
                 let task_id = child_state.id_generator.next();
                 child_state.work_queue.push(WorkItem {
                     id: task_id,
@@ -946,15 +1397,27 @@ impl AgentLoop {
                     time: Utc::now(),
                     item_type: WorkItemType::UserMessage {
                         chat_id: "child-agent".to_string(),
-                        user: self.permissions.agent_name.clone(),
+                        user: self.permissions.agent_name.to_string(),
                         content: child_settings.task,
+                        message_ref: None,
                     },
+                    attachments: child_settings.attach.clone(),
                 });
+                if !child_settings.attach.is_empty() {
+                    let view_id = child_state.id_generator.next();
+                    child_state.work_queue.push(WorkItem {
+                        id: view_id,
+                        priority: 10,
+                        time: Utc::now(),
+                        item_type: WorkItemType::View { paths: child_settings.attach },
+                        attachments: Vec::new(),
+                    });
+                }
 
                 // Create child API client
                 let child_config = Arc::new(Config {
                     model: model.clone(),
-                    api_key: self.config.api_key.clone(),
+                    auth: self.config.auth.clone(),
                     api_base_url: self.config.api_base_url.clone(),
                     max_tokens: self.config.max_tokens,
                     context_window: self.config.context_window,
@@ -984,7 +1447,7 @@ impl AgentLoop {
                             self.active_children = self.active_children.saturating_sub(1);
                             self.registry.deregister(&child_name_str);
                             let wid = self.state.id_generator.next();
-                            self.state.work_queue.push(WorkItem {
+                            self.push_item(WorkItem {
                                 id: wid,
                                 priority: 7,
                                 time: Utc::now(),
@@ -994,7 +1457,10 @@ impl AgentLoop {
                                     turns_used: 0,
                                     success: false,
                                     summary: format!("Failed to create API client: {}", e),
+                                    cost_usd: 0.0,
+                                    cache_hit_pct: 0,
                                 },
+                                attachments: Vec::new(),
                             });
                             continue;
                         }
@@ -1002,9 +1468,10 @@ impl AgentLoop {
 
                 let child_permissions = AgentPermissions {
                     can_compact: child_settings.can_compact,
-                    max_turns: Some(max_turns),
+                    max_turns,
                     child_depth_remaining: child_depth,
-                    agent_name: child_name_str.clone(),
+                    agent_name: AgentName::new_child(&child_name_str)
+                        .expect("child name validated at registration"),
                     lineage: child_lineage,
                 };
 
@@ -1013,6 +1480,15 @@ impl AgentLoop {
                 let parent_tx = self.event_tx.clone();
                 let registry = self.registry.clone();
 
+                let child_role_prefix =
+                    if child_settings.prefix_context.is_some() || !child_settings.prefix_attach.is_empty() {
+                        Some(renderer::RolePrefix {
+                            context: child_settings.prefix_context.unwrap_or_default(),
+                            attach: child_settings.prefix_attach,
+                        })
+                    } else {
+                        None
+                    };
                 tokio::spawn(run_child_agent_loop(
                     child_name_str,
                     child_permissions,
@@ -1024,11 +1500,14 @@ impl AgentLoop {
                     child_event_rx,
                     child_event_tx,
                     self.deployment_context.clone(),
+                    child_role_prefix,
                     dump_dir,
                     7, // default priority for ChildAgentCompleted
                     parent_tx,
                     registry,
-                    child_settings.attachments,
+                    self.shutdown.clone(),
+                    self.subscribers.clone(),
+                    self.usage_log.clone(),
                 ));
             }
         }
@@ -1038,7 +1517,7 @@ impl AgentLoop {
             match self.registry.send_to(
                 &msg.recipient,
                 HarnessEvent::AgentMessage {
-                    from: self.permissions.agent_name.clone(),
+                    from: self.permissions.agent_name.to_string(),
                     content: msg.content,
                     priority: msg.priority,
                 },
@@ -1063,19 +1542,25 @@ impl AgentLoop {
                 msg.chat_id,
                 truncate_for_log(&msg.content, 60)
             );
-            if let Ok(id) = self.db.save_outbound_message(&msg.chat_id, &msg.content) {
-                self.broadcast(BroadcastMsg::Message {
-                    chat_id: msg.chat_id,
-                    content: msg.content,
-                    id,
-                    created_at: chrono::Utc::now()
-                        .format("%Y-%m-%d %H:%M:%S")
-                        .to_string(),
+            let id = self.db.save_outbound_message(&msg.chat_id, &msg.content, &msg.attachments)
+                .unwrap_or_else(|e| {
+                    eprintln!("[{}] save_outbound_message failed (schema mismatch? rm the .db): {}", self.name, e);
+                    0
                 });
-            }
+            self.broadcast(BroadcastMsg::Message {
+                chat_id: msg.chat_id,
+                content: msg.content,
+                attachments: msg.attachments,
+                id,
+                created_at: chrono::Utc::now()
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string(),
+                react_to: msg.react_to,
+            });
         }
 
-        // Pinned memory (shared, cached in system prompt)
+        // Pinned memory (shared, cached in system prompt) — SQLite writes,
+        // shared across agents, can't roll back by dropping a clone.
         for (key, content) in effects.memory_pins {
             if let Err(e) = self.db.save_pin(&key, &content) {
                 eprintln!("[{}] Failed to pin '{}': {}", self.name, key, e);
@@ -1110,9 +1595,10 @@ impl AgentLoop {
                 &HashMap::new(),
                 self.config.python_timeout_secs,
                 0, // compaction doesn't need to spawn children
-                &self.permissions.agent_name,
+                self.permissions.agent_name.as_str(),
                 &format_lineage(&self.permissions.lineage),
                 &HashMap::new(), // compaction doesn't need pinned memory
+                None, // compaction script shouldn't be sending messages
             );
 
             if compact_result.is_error {
@@ -1129,22 +1615,13 @@ impl AgentLoop {
                     is_error: true,
                 });
             } else {
-                for id in compact_result.side_effects.history_removes {
-                    self.state.event_history.remove(&AgentId(id));
-                }
-                for (id, desc) in compact_result.side_effects.history_replaces {
-                    self.state
-                        .event_history
-                        .replace_with_summary(&AgentId(id), desc);
-                }
-                for text in compact_result.side_effects.history_adds {
-                    let id = self.state.id_generator.next();
-                    self.state.event_history.push(HistoryEntry::Summary {
-                        id,
-                        time: Utc::now(),
-                        description: text,
-                    });
-                }
+                // The compaction script ran against a clone of self.state and
+                // mutated its event_history in place. Commit just that piece
+                // (plus the id_generator, which history.add advanced).
+                let c = compact_result.committed_state
+                    .expect("committed_state is Some when !is_error");
+                self.state.event_history = c.event_history;
+                self.state.id_generator = c.id_generator;
 
                 // Remove the Compaction work item
                 let compaction_items: Vec<AgentId> = self
@@ -1181,6 +1658,14 @@ impl AgentLoop {
                 eprintln!("[{}] Failed to kill process {}: {}", self.name, id, e);
             }
         }
+
+        // Interactive process stdin
+        for (pid, data) in deferred.stdin_writes {
+            self.process_supervisor.send_stdin(&pid, data).await;
+        }
+        for pid in deferred.stdin_closes {
+            self.process_supervisor.close_stdin(&pid).await;
+        }
     }
 }
 
@@ -1191,6 +1676,8 @@ struct DeferredOps {
     block_for_waiters: Vec<(u64, tokio::sync::oneshot::Receiver<()>)>,
     /// Process IDs to kill
     process_kills: Vec<String>,
+    stdin_writes: Vec<(String, Vec<u8>)>,
+    stdin_closes: Vec<String>,
 }
 
 /// Standalone async function to run a child agent loop.
@@ -1207,11 +1694,14 @@ async fn run_child_agent_loop(
     child_event_rx: mpsc::UnboundedReceiver<HarnessEvent>,
     child_event_tx: mpsc::UnboundedSender<HarnessEvent>,
     child_deployment: String,
+    child_role_prefix: Option<renderer::RolePrefix>,
     dump_dir: Option<PathBuf>,
     priority: u8,
     parent_tx: mpsc::UnboundedSender<HarnessEvent>,
     registry: Arc<AgentRegistry>,
-    initial_attachments: Vec<Attachment>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    subscribers: Arc<crate::http_server::SubscriberRegistry>,
+    usage_log: Arc<Mutex<crate::types::UsageLog>>,
 ) {
     let mut child_loop = AgentLoop::new(
         child_name.clone(),
@@ -1224,13 +1714,16 @@ async fn run_child_agent_loop(
         child_event_rx,
         child_event_tx,
         child_deployment,
+        child_role_prefix,
         None,  // children don't broadcast
         dump_dir,
         false, // children don't dump to stdout
         None,  // children track tokens locally
+        usage_log,
         registry.clone(),
+        shutdown,
+        subscribers,
     );
-    child_loop.set_initial_attachments(initial_attachments);
 
     let reason = child_loop.run().await;
     let turns_used = child_loop.turn_counter;
@@ -1239,6 +1732,7 @@ async fn run_child_agent_loop(
         FinishReason::Done => (true, "Called done()".to_string()),
         FinishReason::MaxTurns(max) => (false, format!("Max turns ({}) exceeded", max)),
         FinishReason::Shutdown => (false, "Shutdown".to_string()),
+        FinishReason::Killed => (false, "Killed by parent".to_string()),
         FinishReason::ChannelClosed => (false, "Parent disconnected".to_string()),
     };
 
@@ -1263,3 +1757,4 @@ async fn run_child_agent_loop(
         child_cache_read_tokens: child_loop.local_cache_read_tokens,
     });
 }
+

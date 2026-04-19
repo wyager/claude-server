@@ -7,6 +7,7 @@ use crate::types::HarnessState;
 
 pub struct Database {
     conn: Mutex<Connection>,
+    path: std::path::PathBuf,
 }
 
 impl Database {
@@ -19,6 +20,7 @@ impl Database {
 
         let db = Self {
             conn: Mutex::new(conn),
+            path: path.to_path_buf(),
         };
         db.init_schema()?;
         Ok(db)
@@ -43,6 +45,7 @@ impl Database {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id TEXT NOT NULL,
                 content TEXT NOT NULL,
+                attachments TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
@@ -63,6 +66,25 @@ impl Database {
             );
             ",
         )?;
+        // Idempotent schema migrations for existing DBs. ALTER TABLE fails
+        // with "duplicate column" on DBs that already have it — that's fine.
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "ALTER TABLE outbound_messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+
+        // Hard-fail if the schema is still wrong after migration. Better to
+        // blow up here than silently drop messages at runtime.
+        conn.prepare(
+            "SELECT id, chat_id, content, attachments, created_at \
+             FROM outbound_messages LIMIT 0",
+        )
+        .map_err(|e| anyhow::anyhow!(
+            "DB schema check failed — delete {} and restart: {}",
+            self.path.display(), e
+        ))?;
+
         Ok(())
     }
 
@@ -133,11 +155,12 @@ impl Database {
 
     // ---- Outbound Messages ----
 
-    pub fn save_outbound_message(&self, chat_id: &str, content: &str) -> Result<i64> {
+    pub fn save_outbound_message(&self, chat_id: &str, content: &str, attachments: &[String]) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
+        let att = serde_json::to_string(attachments)?;
         conn.execute(
-            "INSERT INTO outbound_messages (chat_id, content) VALUES (?1, ?2)",
-            rusqlite::params![chat_id, content],
+            "INSERT INTO outbound_messages (chat_id, content, attachments) VALUES (?1, ?2, ?3)",
+            rusqlite::params![chat_id, content, att],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -145,18 +168,20 @@ impl Database {
     pub fn load_outbound_messages(&self, chat_id: &str) -> Result<Vec<OutboundMessage>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, content, created_at
+            "SELECT id, chat_id, content, attachments, created_at
              FROM outbound_messages WHERE chat_id = ?1
              ORDER BY created_at ASC",
         )?;
         let mut messages = Vec::new();
         let mut rows = stmt.query([chat_id])?;
         while let Some(row) = rows.next()? {
+            let att_json: String = row.get(3)?;
             messages.push(OutboundMessage {
                 id: row.get(0)?,
                 chat_id: row.get(1)?,
                 content: row.get(2)?,
-                created_at: row.get(3)?,
+                attachments: serde_json::from_str(&att_json).unwrap_or_default(),
+                created_at: row.get(4)?,
             });
         }
         Ok(messages)
@@ -203,5 +228,6 @@ pub struct OutboundMessage {
     pub id: i64,
     pub chat_id: String,
     pub content: String,
+    pub attachments: Vec<String>,
     pub created_at: String,
 }

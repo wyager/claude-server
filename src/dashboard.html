@@ -1,0 +1,277 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>claude-server dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --text: #c9d1d9; --dim: #8b949e; --accent: #58a6ff;
+    --ok: #3fb950; --warn: #d29922; --err: #f85149;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+    font: 13px/1.5 var(--mono);
+  }
+  h1 { margin: 0 0 12px; font-size: 18px; font-weight: 600; display: flex; align-items: baseline; gap: 12px; }
+  h1 small { color: var(--dim); font-weight: normal; }
+  h1 button { margin-left: auto; }
+
+  button {
+    background: var(--panel); color: var(--dim); border: 1px solid var(--border);
+    border-radius: 4px; padding: 3px 10px; font: inherit; cursor: pointer;
+  }
+  button:hover { color: var(--text); border-color: var(--dim); }
+  .dismiss {
+    margin-left: 8px; padding: 0 6px; line-height: 1.4; font-size: 14px;
+    border: none; background: transparent; color: var(--dim);
+  }
+  .dismiss:hover { color: var(--err); }
+
+  #agents { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(480px, 1fr)); }
+
+  .agent {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 12px;
+  }
+  .agent.status-thinking { border-color: var(--accent); }
+  .agent.status-executing { border-color: var(--warn); }
+  .agent.status-idle { opacity: 0.85; }
+  /* Terminal states — agent has exited. Grayed out, but still inspectable
+     for post-mortem. 'done' is normal; the others are worth a glance. */
+  .agent.status-done, .agent.status-shutdown { opacity: 0.5; }
+  .agent.status-killed, .agent.status-max_turns,
+  .agent.status-channel_closed { opacity: 0.6; border-color: var(--err); }
+
+  .head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+  .name { font-size: 15px; font-weight: 600; color: var(--accent); }
+  .status { padding: 1px 8px; border-radius: 10px; font-size: 11px; text-transform: uppercase; }
+  .status.idle { background: #21262d; color: var(--dim); }
+  .status.thinking { background: #1f3a5f; color: var(--accent); }
+  .status.executing { background: #4a3a10; color: var(--warn); }
+  .status.done, .status.shutdown { background: #21262d; color: var(--ok); }
+  .status.killed, .status.max_turns,
+  .status.channel_closed { background: #3d1a1a; color: var(--err); }
+  .turn { color: var(--dim); margin-left: auto; }
+  .lineage { color: var(--dim); font-size: 11px; margin-bottom: 8px; }
+
+  .usage { display: flex; gap: 12px; font-size: 11px; color: var(--dim);
+           padding: 6px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+           margin-bottom: 8px; }
+  .usage b { color: var(--text); }
+
+  details { margin: 4px 0; }
+  details > summary {
+    cursor: pointer; padding: 4px 0; color: var(--dim);
+    user-select: none; list-style: none;
+  }
+  details > summary::before { content: "▸ "; color: var(--dim); }
+  details[open] > summary::before { content: "▾ "; }
+  details > summary:hover { color: var(--text); }
+  details > summary .count { color: var(--accent); }
+  details > summary .badge {
+    background: var(--err); color: #fff; padding: 0 5px; border-radius: 8px;
+    font-size: 10px; margin-left: 6px;
+  }
+
+  .rows { margin: 4px 0 0 14px; }
+  .row {
+    display: grid; grid-template-columns: auto 1fr; gap: 8px;
+    padding: 3px 0; border-bottom: 1px solid #21262d; align-items: start;
+  }
+  .row:last-child { border-bottom: none; }
+  .row .k { color: var(--dim); white-space: nowrap; }
+  .row .v { word-break: break-word; }
+  .row.err .v { color: var(--err); }
+
+  /* memory entries collapsed by default, <details> per-key */
+  .mem { margin: 2px 0 2px 14px; }
+  .mem summary { padding: 2px 0; font-size: 12px; }
+  .mem .prio { display: inline-block; width: 18px; text-align: right;
+               color: var(--dim); margin-right: 4px; }
+  .mem .sz { color: var(--dim); font-size: 10px; margin-left: 6px; }
+  .mem .sens { color: var(--warn); }
+  .mem pre {
+    margin: 2px 0 4px 22px; padding: 6px; background: #0d1117;
+    border: 1px solid var(--border); border-radius: 4px; font-size: 11px;
+    white-space: pre-wrap; word-break: break-word; max-height: 200px; overflow-y: auto;
+  }
+
+  pre.code, pre.out {
+    margin: 2px 0; padding: 4px 6px; background: #0d1117; border-radius: 3px;
+    font-size: 11px; white-space: pre-wrap; word-break: break-word;
+    max-height: 80px; overflow-y: auto;
+  }
+  pre.out { color: var(--dim); }
+  pre.out.err { color: var(--err); }
+
+  #empty { color: var(--dim); padding: 40px; text-align: center; }
+</style>
+</head>
+<body>
+
+<h1>claude-server <small id="updated">connecting…</small>
+  <button id="dismiss-all" style="display:none" onclick="dismiss('*')">dismiss done</button>
+</h1>
+<div id="agents"></div>
+<div id="empty" style="display:none">No agents yet — daemon may still be starting.</div>
+
+<script>
+// Poll cadence: snapshots update once per turn (~seconds), so 2s is plenty.
+// SSE would be overkill for this update rate.
+const POLL_MS = 2000;
+
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
+
+const fmtBytes = n => n < 1024 ? `${n}B` : n < 1048576 ? `${(n/1024).toFixed(1)}K` : `${(n/1048576).toFixed(1)}M`;
+const ago = iso => {
+  const s = Math.max(0, (Date.now() - new Date(iso)) / 1000);
+  return s < 60 ? `${s|0}s` : s < 3600 ? `${(s/60)|0}m` : `${(s/3600)|0}h`;
+};
+
+const TERMINAL = new Set(['done', 'shutdown', 'killed', 'max_turns', 'channel_closed']);
+
+async function dismiss(name) {
+  await fetch(`dashboard/state/${encodeURIComponent(name)}`, {method: 'DELETE'});
+  poll();  // refresh immediately rather than waiting for the next tick
+}
+
+// Preserve open/closed state across re-renders — otherwise expanding a
+// section would snap shut on the next poll, which is maddening.
+const openSections = new Set();
+document.addEventListener('toggle', e => {
+  const d = e.target;
+  if (!d.dataset.key) return;
+  d.open ? openSections.add(d.dataset.key) : openSections.delete(d.dataset.key);
+}, true);
+
+function section(key, title, count, body, badge) {
+  const open = openSections.has(key) ? ' open' : '';
+  const b = badge ? `<span class="badge">${esc(badge)}</span>` : '';
+  return `<details data-key="${esc(key)}"${open}>
+    <summary>${esc(title)} <span class="count">${count}</span>${b}</summary>
+    ${body}
+  </details>`;
+}
+
+function renderAgent(a) {
+  const turnMax = a.max_turns ? `/${a.max_turns}` : '';
+  const usage = a.last_usage ? `
+    <div class="usage">
+      <span>in <b>${a.last_usage.input_tokens}</b></span>
+      <span>out <b>${a.last_usage.output_tokens}</b></span>
+      <span>cache <b>${a.last_usage.cache_hit_pct}%</b></span>
+      <span>$<b>${a.last_usage.cost_usd.toFixed(4)}</b>/turn</span>
+    </div>` : '';
+
+  const queueBody = a.queue.length ? `<div class="rows">${
+    a.queue.map(q => `<div class="row">
+      <span class="k">[${q.priority}] ${esc(q.item_type)} ${esc(q.id)}</span>
+      <span class="v">${esc(q.preview)}</span>
+    </div>`).join('')
+  }</div>` : '<div class="rows"><em>empty</em></div>';
+
+  const histBody = a.history_tail.length ? `<div class="rows">${
+    a.history_tail.map(h => `<div class="row${h.is_error?' err':''}">
+      <span class="k">${esc(h.id)} ${esc(h.kind)}</span>
+      <span class="v">
+        ${h.code ? `<pre class="code">${esc(h.code)}</pre>` : ''}
+        ${h.output ? `<pre class="out${h.is_error?' err':''}">${esc(h.output)}</pre>` : ''}
+      </span>
+    </div>`).join('')
+  }</div>` : '<div class="rows"><em>empty</em></div>';
+
+  // Memory: each entry is its own <details>, collapsed by default.
+  // The summary shows key + priority + size; expanding reveals the value.
+  const memBody = a.memory.length ? a.memory.map(m => {
+    const k = `${a.name}:mem:${m.key}`;
+    const open = openSections.has(k) ? ' open' : '';
+    const sens = m.sensitive ? ' <span class="sens">🔒</span>' : '';
+    return `<details class="mem" data-key="${esc(k)}"${open}>
+      <summary><span class="prio">[${m.priority}]</span> ${esc(m.key)}${sens}
+        <span class="sz">${fmtBytes(m.value_len)}</span></summary>
+      <pre>${esc(m.value)}${m.value_len > m.value.length ? '\n…(truncated)' : ''}</pre>
+    </details>`;
+  }).join('') : '<div class="rows"><em>empty</em></div>';
+
+  const timerBody = a.timers.length ? `<div class="rows">${
+    a.timers.map(t => `<div class="row">
+      <span class="k">${esc(t.id)}${t.recurring?' ⟳':''}</span>
+      <span class="v">${esc(t.description)} <span style="color:var(--dim)">→ ${ago(t.next_fire)}</span></span>
+    </div>`).join('')
+  }</div>` : '<div class="rows"><em>none</em></div>';
+
+  const procBody = a.processes.length ? `<div class="rows">${
+    a.processes.map(p => `<div class="row">
+      <span class="k">${esc(p.id)}</span>
+      <span class="v">${esc(p.cmd)} — ${esc(p.description)} <span style="color:var(--dim)">${esc(p.status)}</span></span>
+    </div>`).join('')
+  }</div>` : '<div class="rows"><em>none</em></div>';
+
+  const hookStatsBadge = Object.values(a.hook_stats).reduce((s,h)=>s+h.raised,0);
+  const hookBody = a.hooks.length ? `<div class="rows">${
+    a.hooks.map(([name,prio,match]) => {
+      const s = a.hook_stats[name] || {fired:0,consumed:0,passed:0,raised:0};
+      return `<div class="row${s.raised?' err':''}">
+        <span class="k">[${prio}] ${esc(name)}</span>
+        <span class="v">${esc(match)}<br>
+          <span style="color:var(--dim)">fired ${s.fired} · consumed ${s.consumed} · passed ${s.passed}${s.raised?` · <span style="color:var(--err)">raised ${s.raised}</span>`:''}</span>
+        </span>
+      </div>`;
+    }).join('')
+  }</div>` : '<div class="rows"><em>none</em></div>';
+
+  const errCount = a.history_tail.filter(h=>h.is_error).length;
+
+  // × button only on terminal-state cards — dismissing a live agent would
+  // just have it pop back on the next poll, which is confusing.
+  const dismissBtn = TERMINAL.has(a.status)
+    ? `<button class="dismiss" title="dismiss" onclick="dismiss('${esc(a.name)}')">×</button>`
+    : '';
+
+  return `<div class="agent status-${esc(a.status)}">
+    <div class="head">
+      <span class="name">${esc(a.name)}</span>
+      <span class="status ${esc(a.status)}">${esc(a.status)}</span>
+      <span class="turn">turn ${a.turn}${turnMax} · ${ago(a.updated_at)} ago</span>
+      ${dismissBtn}
+    </div>
+    <div class="lineage">${esc(a.lineage)}</div>
+    ${usage}
+    ${section(`${a.name}:q`, 'work queue', a.queue.length, queueBody)}
+    ${section(`${a.name}:h`, 'history', `${a.history_tail.length}/${a.history_len}`, histBody, errCount?`${errCount} err`:null)}
+    ${section(`${a.name}:m`, 'memory', a.memory.length, memBody)}
+    ${section(`${a.name}:t`, 'timers', a.timers.length, timerBody)}
+    ${section(`${a.name}:p`, 'processes', a.processes.length, procBody)}
+    ${section(`${a.name}:k`, 'hooks', a.hooks.length, hookBody, hookStatsBadge?`${hookStatsBadge} raised`:null)}
+  </div>`;
+}
+
+async function poll() {
+  try {
+    const r = await fetch('dashboard/state');
+    const state = await r.json();
+    // Root first, then children alphabetically.
+    const agents = Object.values(state).sort((a,b) =>
+      a.name === 'root' ? -1 : b.name === 'root' ? 1 : a.name.localeCompare(b.name));
+    const terminalCount = agents.filter(a => TERMINAL.has(a.status)).length;
+    document.getElementById('agents').innerHTML = agents.map(renderAgent).join('');
+    document.getElementById('empty').style.display = agents.length ? 'none' : 'block';
+    document.getElementById('dismiss-all').style.display = terminalCount ? '' : 'none';
+    document.getElementById('dismiss-all').textContent = `dismiss ${terminalCount} done`;
+    document.getElementById('updated').textContent =
+      `${agents.length} agent${agents.length===1?'':'s'} · ${new Date().toLocaleTimeString()}`;
+  } catch (e) {
+    document.getElementById('updated').textContent = `error: ${e.message}`;
+  }
+}
+
+poll();
+setInterval(poll, POLL_MS);
+</script>
+
+</body>
+</html>

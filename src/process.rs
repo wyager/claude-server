@@ -29,6 +29,8 @@ pub struct ProcessSupervisor {
     /// Owning agent's name. Injected as CLAUDE_SERVER_AGENT_NAME so spawned
     /// subcommands (e.g. `feedback`) can auto-tag which agent invoked them.
     agent_name: String,
+    /// Stdin channels for interactive processes. Sending None closes the pipe.
+    stdins: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Option<Vec<u8>>>>>>,
 }
 
 impl ProcessSupervisor {
@@ -44,6 +46,22 @@ impl ProcessSupervisor {
             running: Arc::new(Mutex::new(HashMap::new())),
             event_url,
             agent_name,
+            stdins: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Queue bytes to an interactive process's stdin. No-op if the process
+    /// wasn't spawned with interactive=true or has already exited.
+    pub async fn send_stdin(&self, pid: &str, data: Vec<u8>) {
+        if let Some(tx) = self.stdins.lock().await.get(pid) {
+            let _ = tx.send(Some(data));
+        }
+    }
+
+    /// Close an interactive process's stdin (sends EOF).
+    pub async fn close_stdin(&self, pid: &str) {
+        if let Some(tx) = self.stdins.lock().await.remove(pid) {
+            let _ = tx.send(None);
         }
     }
 
@@ -63,6 +81,11 @@ impl ProcessSupervisor {
         }
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        cmd.stdin(if request.interactive {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        });
         // Kill the child if the daemon exits. Long-running watchers would
         // otherwise orphan and keep POSTing to a dead endpoint.
         cmd.kill_on_drop(true);
@@ -79,6 +102,29 @@ impl ProcessSupervisor {
             tokio::spawn(async move {
                 running.lock().await.insert(pid_str, os_pid);
             });
+        }
+
+        // For interactive processes, spawn a stdin writer task fed by an
+        // unbounded channel. send_stdin() queues bytes; None closes the pipe.
+        if request.interactive {
+            if let Some(mut stdin) = child.stdin.take() {
+                let (tx, mut rx) = mpsc::unbounded_channel::<Option<Vec<u8>>>();
+                let stdins = self.stdins.clone();
+                let pid = pid_str.clone();
+                tokio::spawn(async move {
+                    stdins.lock().await.insert(pid.clone(), tx);
+                    while let Some(Some(bytes)) = rx.recv().await {
+                        use tokio::io::AsyncWriteExt;
+                        if stdin.write_all(&bytes).await.is_err()
+                            || stdin.flush().await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    drop(stdin); // closes the pipe → child sees EOF
+                    stdins.lock().await.remove(&pid);
+                });
+            }
         }
 
         // Spawn output reader — capture its JoinHandle so the completion

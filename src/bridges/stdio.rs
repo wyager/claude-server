@@ -88,6 +88,11 @@ async fn run_async(api_url: String) -> Result<()> {
                         if let Some(content) = v["content"].as_str() {
                             println!("\n\x1b[1;36m── claude ──────────────────────\x1b[0m");
                             println!("{}", content);
+                            if let Some(atts) = v["attachments"].as_array() {
+                                for a in atts.iter().filter_map(|a| a.as_str()) {
+                                    println!("\x1b[2m  [attachment: {}]\x1b[0m", a);
+                                }
+                            }
                             println!("\x1b[1;36m────────────────────────────────\x1b[0m");
                         }
                     }

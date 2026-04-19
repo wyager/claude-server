@@ -2,6 +2,17 @@ use chrono::{DateTime, Local, Utc};
 
 use crate::types::*;
 
+/// Byte-length truncation that snaps back to the nearest char boundary.
+/// Bare `&s[..n]` panics if n lands mid-UTF-8-codepoint (e.g. inside a
+/// 3-byte '→'). Found via a crash loop on a memory value containing
+/// arrow characters at exactly the truncation point.
+pub fn trunc(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes { return s; }
+    let mut cut = max_bytes;
+    while !s.is_char_boundary(cut) { cut -= 1; }
+    &s[..cut]
+}
+
 /// State tracked during compaction for rendering into the context block.
 pub struct CompactionState {
     pub current_usage: u64,
@@ -10,12 +21,27 @@ pub struct CompactionState {
     pub estimated_post_compaction: u64,
 }
 
+/// Stable per-child prefix that renders before event_history. Same bytes
+/// across repeated forks → cache hits even when task/attach vary.
+#[derive(Debug, Clone, Default)]
+pub struct RolePrefix {
+    pub context: String,
+    pub attach: Vec<String>,
+}
+
 /// The rendered context ready for the API call.
 pub struct RenderedContext {
-    /// The main text content (the user message).
+    /// Text before prefix_attachments: deploy + role_context. No cache_control
+    /// on this block — the breakpoint comes after the prefix images on seg1.
+    pub prefix_text: String,
+    /// Attachments that render in the cached region (reference images).
+    pub prefix_attachments: Vec<Attachment>,
+    /// Cached segments after the prefix: event_history content with
+    /// cache_control breakpoints. Stride-aligned for stable caching.
+    pub cached_segments: Vec<String>,
+    /// Full concatenated text (prefix + segments + tail) for dumps/char counts.
     pub text: String,
-    /// File-path attachments to include as additional content blocks.
-    /// Resolved to image/text blocks at API-call time.
+    /// Tail attachments from the head View work item.
     pub attachments: Vec<Attachment>,
 }
 
@@ -34,32 +60,107 @@ pub type PinnedSummary = Option<(usize, usize)>;
 pub fn render_context(
     state: &HarnessState,
     deployment_context: &str,
+    role_prefix: Option<&RolePrefix>,
     compaction: Option<&CompactionState>,
     config: &RenderConfig,
     compact_at: u64,
     agent: Option<&AgentIdentity>,
     pinned_summary: PinnedSummary,
-    attachments: Vec<Attachment>,
 ) -> RenderedContext {
-    let mut out = String::with_capacity(8192);
+    // Tail attachments: only when a View item is at the head of the queue.
+    let attachments: Vec<Attachment> = match state.work_queue.items().first() {
+        Some(WorkItem { item_type: WorkItemType::View { paths }, .. }) => {
+            paths.iter().map(Attachment::new).collect()
+        }
+        _ => Vec::new(),
+    };
 
-    // Deployment context (stable prefix for KV cache)
-    render_deployment_context(&mut out, deployment_context);
+    // Build deploy + role_context text and collect prefix attachments.
+    let mut head = String::with_capacity(4096);
+    render_deployment_context(&mut head, deployment_context);
+    let prefix_attachments: Vec<Attachment> = if let Some(rp) = role_prefix {
+        if !rp.context.is_empty() {
+            head.push_str("<role_context>\n");
+            head.push_str(&rp.context);
+            if !head.ends_with('\n') { head.push('\n'); }
+            head.push_str("</role_context>\n");
+        }
+        rp.attach.iter().map(Attachment::new).collect()
+    } else {
+        Vec::new()
+    };
 
-    // Event history
-    render_event_history(&mut out, &state.event_history, config);
+    // Block layout depends on prefix attachments. With images, we MUST split
+    // so they can sit between text blocks. Without images, splitting hurts:
+    // Anthropic's cache prefix-matches per-block, so a separate static block
+    // followed by a growing seg1 means seg1 never hashes to a prior entry.
+    // (Regression caught via feedback #22: root hit rate dropped from 46% to
+    // 17% after the unconditional split.) No images → merge head into seg1.
+    //
+    // Tier budget: Anthropic allows 4 breakpoints. System takes 1; prefix
+    // image (if any) takes 1. The rest go to history tiers.
+    let tier_budget = if prefix_attachments.is_empty() { 3 } else { 2 };
+    let tiers = config.cache_tiers.min(tier_budget);
+    let splits = state.event_history.cache_splits(config.cache_stride, tiers);
+    let total = state.event_history.entries().len();
 
-    // Agent state (memory, timers, processes)
-    render_agent_state(&mut out, state, config);
+    // Build segments: seg[0] = head + <event_history> + entries[0..splits[0]],
+    // seg[i] = entries[splits[i-1]..splits[i]]. Head goes into seg[0] unless
+    // prefix attachments force a split.
+    let mut segs: Vec<String> = Vec::with_capacity(splits.len());
+    let (prefix_text, mut first) = if prefix_attachments.is_empty() {
+        let mut s = head;
+        s.push_str("<event_history>\n");
+        (String::new(), s)
+    } else {
+        (head, String::from("<event_history>\n"))
+    };
+    let mut prev_split = 0usize;
+    for (i, &split) in splits.iter().enumerate() {
+        let target = if i == 0 { &mut first } else {
+            segs.push(String::new());
+            segs.last_mut().unwrap()
+        };
+        render_history_range(target, &state.event_history, config, prev_split..split);
+        prev_split = split;
+    }
+    segs.insert(0, first);
 
-    // Context metadata
-    render_context_metadata(&mut out, state, compaction, compact_at, agent, pinned_summary, attachments.len());
+    // Volatile tail: post-tier history + modifiable window + state/meta/queue.
+    let mut tail = String::with_capacity(2048);
+    render_history_range(&mut tail, &state.event_history, config, prev_split..total);
+    tail.push_str("</event_history>\n");
+    render_agent_state(&mut tail, state, config);
+    render_context_metadata(&mut tail, state, compaction, compact_at, agent, pinned_summary, attachments.len());
+    render_work_queue(&mut tail, &state.work_queue, config);
 
-    // Work queue (last — changes every turn, so placing it at the end
-    // maximizes KV cache reuse for the stable prefix above)
-    render_work_queue(&mut out, &state.work_queue, config);
+    // Full text for dumps/char counts.
+    let seg_len: usize = segs.iter().map(String::len).sum();
+    let mut text = String::with_capacity(prefix_text.len() + seg_len + tail.len());
+    text.push_str(&prefix_text);
+    for s in &segs { text.push_str(s); }
+    text.push_str(&tail);
 
-    RenderedContext { text: out, attachments }
+    // Anthropic ignores cache_control on segments under ~1024 tokens. Merge
+    // small segments forward into the next so we don't waste a breakpoint.
+    // seg[0]'s threshold counts prefix content (shared breakpoint).
+    const MIN_CACHE_CHARS: usize = 8192;
+    let mut cached_segments: Vec<String> = Vec::new();
+    let prefix_boost = prefix_text.len() + prefix_attachments.len() * 4096;
+    let mut acc = String::new();
+    let mut acc_effective = prefix_boost;
+    for seg in segs {
+        acc.push_str(&seg);
+        acc_effective += seg.len();
+        if acc_effective >= MIN_CACHE_CHARS {
+            cached_segments.push(std::mem::take(&mut acc));
+            acc_effective = 0;
+        }
+    }
+    // Residual acc (didn't clear threshold) falls into tail via the
+    // text-slicing in api_client (tail = text[prefix+cached_len..]).
+
+    RenderedContext { prefix_text, prefix_attachments, cached_segments, text, attachments }
 }
 
 fn render_deployment_context(out: &mut String, deployment_context: &str) {
@@ -73,14 +174,15 @@ fn render_deployment_context(out: &mut String, deployment_context: &str) {
     out.push_str("</deployment_context>\n");
 }
 
-fn render_event_history(out: &mut String, history: &EventHistory, config: &RenderConfig) {
-    out.push_str("<event_history>\n");
-
-    for entry in history.entries() {
+fn render_history_range(
+    out: &mut String,
+    history: &EventHistory,
+    config: &RenderConfig,
+    range: std::ops::Range<usize>,
+) {
+    for entry in &history.entries()[range] {
         render_history_entry(out, entry, config);
     }
-
-    out.push_str("</event_history>\n");
 }
 
 fn render_history_entry(out: &mut String, entry: &HistoryEntry, config: &RenderConfig) {
@@ -92,19 +194,24 @@ fn render_history_entry(out: &mut String, entry: &HistoryEntry, config: &RenderC
             output,
             is_error,
         } => {
-            out.push_str(&format!("<entry id=\"{}\">\n", id));
-            out.push_str(&format!("time: {}\n", format_time(time)));
-            out.push_str("code:\n");
-            out.push_str(&indent_and_truncate(code, 2, config));
+            // Render body first so we can annotate the opening tag with its
+            // size. Token estimate stays byte-stable since entry content is
+            // immutable — doesn't bust the cache prefix.
+            let mut body = String::new();
+            body.push_str(&format!("time: {}\n", format_time(time)));
+            body.push_str("code:\n");
+            body.push_str(&indent_and_truncate(code, 2, config));
             if *is_error {
-                out.push_str("output: [ERROR]\n");
+                body.push_str("output: [ERROR]\n");
             } else {
-                out.push_str("output:\n");
+                body.push_str("output:\n");
             }
             if !output.is_empty() {
-                out.push_str(&indent_and_truncate(output, 2, config));
+                body.push_str(&indent_and_truncate(output, 2, config));
             }
-            out.push_str(&format!("</entry>\n"));
+            out.push_str(&format!("<entry id=\"{}\" est_tokens=\"{}\">\n", id, body.len() / 4));
+            out.push_str(&body);
+            out.push_str("</entry>\n");
         }
         HistoryEntry::Summary {
             id, description, ..
@@ -158,9 +265,13 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
             chat_id,
             user,
             content,
+            message_ref,
         } => {
             out.push_str("type: UserMessage\n");
             out.push_str(&format!("chat_id: {}\n", chat_id));
+            if let Some(r) = message_ref {
+                out.push_str(&format!("message_ref: {}\n", r));
+            }
             out.push_str(&format!("user: {}\n", user));
             out.push_str(&format!(
                 "content: {}\n",
@@ -183,10 +294,14 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
             pid,
             exit_code,
             output_preview,
+            description,
         } => {
             out.push_str("type: ProcessCompleted\n");
             out.push_str(&format!("pid: {}\n", pid));
             out.push_str(&format!("exit_code: {}\n", exit_code));
+            if !description.is_empty() {
+                out.push_str(&format!("description: \"{}\"\n", description));
+            }
             if let Some(preview) = output_preview {
                 out.push_str("output_preview:\n");
                 for line in preview.lines() {
@@ -198,6 +313,7 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
             pid,
             error,
             output_preview,
+            description,
         } => {
             out.push_str("type: ProcessFailed\n");
             out.push_str(&format!("pid: {}\n", pid));
@@ -205,6 +321,9 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
                 "error: {}\n",
                 truncate_with_note(error, content_limit)
             ));
+            if !description.is_empty() {
+                out.push_str(&format!("description: \"{}\"\n", description));
+            }
             if let Some(preview) = output_preview {
                 out.push_str("output_preview:\n");
                 for line in preview.lines() {
@@ -222,11 +341,14 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
             success,
             summary,
             result,
+            cost_usd,
+            cache_hit_pct,
         } => {
             out.push_str("type: ChildAgentCompleted\n");
             out.push_str(&format!("child_name: {}\n", child_name));
             out.push_str(&format!("success: {}\n", success));
             out.push_str(&format!("turns_used: {}\n", turns_used));
+            out.push_str(&format!("cost: ${:.4} ({}% cache hit)\n", cost_usd, cache_hit_pct));
 
             if result.is_empty() {
                 out.push_str("result: (empty)\n");
@@ -244,7 +366,7 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
                     let val_str = serde_json::to_string(&result[*key])
                         .unwrap_or_else(|_| "?".to_string());
                     let truncated = if val_str.len() > 80 {
-                        format!("{}...", &val_str[..80])
+                        format!("{}...", trunc(&val_str, 80))
                     } else {
                         val_str
                     };
@@ -282,10 +404,46 @@ fn render_work_item(out: &mut String, item: &WorkItem, content_limit: usize) {
                 truncate_with_note(content, content_limit)
             ));
         }
+        WorkItemType::View { paths } => {
+            out.push_str("type: View\n");
+            out.push_str(&format!("paths: {} files\n", paths.len()));
+            for p in paths.iter().take(5) {
+                out.push_str(&format!("  {}\n", p));
+            }
+            if paths.len() > 5 {
+                out.push_str(&format!("  ... +{} more\n", paths.len() - 5));
+            }
+            out.push_str("(content rendered as blocks below when this item is at head)\n");
+        }
         WorkItemType::Compaction => {
             out.push_str("type: Compaction\n");
             out.push_str("description: \"You must compact your context.\"\n");
         }
+        WorkItemType::AgentStartup { changelog } => {
+            out.push_str("type: AgentStartup\n");
+            out.push_str("description: \"Harness restarted. Any processes/bridges you were managing are dead — inspect memory and reconnect as needed.\"\n");
+            if let Some(c) = changelog {
+                out.push_str("changelog: |\n");
+                for line in c.lines() {
+                    out.push_str("  ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+        WorkItemType::HookException { hook_name, error, original } => {
+            out.push_str("type: HookException\n");
+            out.push_str(&format!("hook_name: {}\n", hook_name));
+            out.push_str(&format!("error: {}\n", truncate_with_note(error, content_limit)));
+            // Original shown compact — agent can access full via item.original
+            if let Ok(s) = serde_json::to_string(original) {
+                out.push_str(&format!("original: {}\n", truncate_with_note(&s, content_limit)));
+            }
+        }
+    }
+
+    if !item.attachments.is_empty() {
+        out.push_str(&format!("attachments: [{}]\n", item.attachments.join(", ")));
     }
 
     out.push_str("</work_item>\n");
@@ -331,10 +489,7 @@ fn render_agent_state(out: &mut String, state: &HarnessState, config: &RenderCon
             let prio = priorities.get(*key).copied().unwrap_or(5);
             let val_str = serde_json::to_string(value).unwrap_or_else(|_| "?".to_string());
             let truncated = if val_str.len() > config.agent_state_memory_value_max_chars {
-                format!(
-                    "{}...",
-                    &val_str[..config.agent_state_memory_value_max_chars]
-                )
+                format!("{}...", trunc(&val_str, config.agent_state_memory_value_max_chars))
             } else {
                 val_str
             };
@@ -570,11 +725,7 @@ fn indent_and_truncate(text: &str, indent: usize, config: &RenderConfig) -> Stri
             break;
         }
 
-        let line_to_add = if line.len() > remaining_chars {
-            &line[..remaining_chars]
-        } else {
-            line
-        };
+        let line_to_add = trunc(line, remaining_chars);
 
         result.push_str(&prefix);
         result.push_str(line_to_add);
@@ -613,7 +764,9 @@ mod tests {
                 chat_id: "81d4".to_string(),
                 user: "steve@example.com".to_string(),
                 content: "Hello Claude, could you please keep an eye out for any vehicles coming up the driveway today and let me know if you see a contractor van?".to_string(),
+                message_ref: None,
             },
+            attachments: Vec::new(),
         });
 
         state
@@ -623,14 +776,14 @@ mod tests {
     fn test_render_produces_expected_structure() {
         let state = make_test_state();
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "Test deployment.", None, &config, 150_000, None, None, Vec::new());
+        let rendered = render_context(&state, "Test deployment.", None, None, &config, 150_000, None, None);
 
         assert!(rendered.text.contains("<deployment_context>"));
         assert!(rendered.text.contains("Test deployment."));
         assert!(rendered.text.contains("</deployment_context>"));
 
         assert!(rendered.text.contains("<event_history>"));
-        assert!(rendered.text.contains("<entry id=\"3a6f\">"));
+        assert!(rendered.text.contains("<entry id=\"3a6f\" est_tokens="));
         assert!(rendered.text.contains("print(work_queue[0].content)"));
         assert!(rendered.text.contains("</event_history>"));
 
@@ -658,11 +811,83 @@ mod tests {
     fn test_render_empty_state() {
         let state = HarnessState::new(200_000, 16384);
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000, None, None, Vec::new());
+        let rendered = render_context(&state, "", None, None, &config, 150_000, None, None);
 
         assert!(rendered.text.contains("<deployment_context>\n</deployment_context>"));
         assert!(rendered.text.contains("<event_history>\n</event_history>"));
         assert!(rendered.text.contains("<work_queue>\n</work_queue>"));
+    }
+
+    #[test]
+    fn test_cache_stride_segments() {
+        let mut state = HarnessState::new(200_000, 16384);
+        // Push 30 entries, each ~1000 chars so segments clear the 8192-char minimum.
+        let big_output = "x".repeat(900);
+        for i in 0..30 {
+            state.event_history.push(HistoryEntry::Execution {
+                id: AgentId(format!("{:04x}", i)),
+                time: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, i as u32).unwrap(),
+                code: format!("# turn {}", i),
+                output: big_output.clone(),
+                is_error: false,
+            });
+        }
+        // stride=5, tiers=2: cold tier advances every 25, hot tier every 5
+        let config = RenderConfig { cache_stride: 5, cache_tiers: 2, ..RenderConfig::default() };
+
+        // immutable = 30-5 = 25; splits = [floor(25/25)*25, floor(25/5)*5] = [25, 25]
+        let splits = state.event_history.cache_splits(5, 2);
+        assert_eq!(splits, vec![25, 25]);
+
+        let r1 = render_context(&state, "", None, None, &config, 150_000, None, None);
+        // Concatenation invariant: text = prefix_text ++ cached_segments ++ tail
+        let cached_len: usize = r1.cached_segments.iter().map(String::len).sum();
+        let p = r1.prefix_text.len();
+        assert_eq!(&r1.text[..p], r1.prefix_text);
+        assert_eq!(&r1.text[p..p + cached_len], r1.cached_segments.concat());
+
+        // Add 4 entries → immutable=29, splits=[25,25] still → segments byte-identical
+        for i in 30..34 {
+            state.event_history.push(HistoryEntry::Execution {
+                id: AgentId(format!("{:04x}", i)),
+                time: Utc.with_ymd_and_hms(2026, 1, 1, 0, 1, i as u32).unwrap(),
+                code: format!("# turn {}", i), output: big_output.clone(), is_error: false,
+            });
+        }
+        let r2 = render_context(&state, "", None, None, &config, 150_000, None, None);
+        assert_eq!(r1.cached_segments, r2.cached_segments,
+            "segments must be byte-identical within a tier period (this is the cache-hit guarantee)");
+
+        // One more → immutable=30, hot tier advances: splits=[25,30]
+        state.event_history.push(HistoryEntry::Execution {
+            id: AgentId("0022".into()),
+            time: Utc.with_ymd_and_hms(2026, 1, 1, 0, 2, 0).unwrap(),
+            code: "# turn 34".into(), output: big_output.clone(), is_error: false,
+        });
+        assert_eq!(state.event_history.cache_splits(5, 2), vec![25, 30]);
+        let r3 = render_context(&state, "", None, None, &config, 150_000, None, None);
+        // Cold tier unchanged (still at 25), only hot tier moved
+        assert_eq!(r3.cached_segments[0], r1.cached_segments[0],
+            "cold tier must survive hot-tier advance unchanged");
+    }
+
+    #[test]
+    fn test_cache_small_entries_merge() {
+        let mut state = HarnessState::new(200_000, 16384);
+        // 20 tiny entries — segments under 4096 chars should not get cache_control
+        for i in 0..20 {
+            state.event_history.push(HistoryEntry::Execution {
+                id: AgentId(format!("{:04x}", i)),
+                time: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, i as u32).unwrap(),
+                code: "x".into(),
+                output: "y".into(),
+                is_error: false,
+            });
+        }
+        let config = RenderConfig::default();
+        let r = render_context(&state, "", None, None, &config, 150_000, None, None);
+        // Tiny segments should be merged/dropped — no wasted breakpoints
+        assert!(r.cached_segments.is_empty(), "tiny segments should not get cache breakpoints");
     }
 
     #[test]
@@ -675,7 +900,7 @@ mod tests {
             compaction_script: String::new(),
             estimated_post_compaction: 142000,
         };
-        let rendered = render_context(&state, "", Some(&compaction), &config, 150_000, None, None, Vec::new());
+        let rendered = render_context(&state, "", None, Some(&compaction), &config, 150_000, None, None);
 
         assert!(rendered.text.contains("COMPACTION MODE:"));
         assert!(rendered.text.contains("Current usage: 142000 tokens"));
@@ -717,7 +942,7 @@ mod tests {
         });
 
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000, None, None, Vec::new());
+        let rendered = render_context(&state, "", None, None, &config, 150_000, None, None);
 
         // Agent state should appear
         assert!(rendered.text.contains("<agent_state>"), "Missing agent_state block");
@@ -740,7 +965,7 @@ mod tests {
     fn test_render_no_agent_state_when_empty() {
         let state = HarnessState::new(200_000, 16384);
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000, None, None, Vec::new());
+        let rendered = render_context(&state, "", None, None, &config, 150_000, None, None);
 
         // No agent_state block when nothing to show
         assert!(!rendered.text.contains("<agent_state>"));
@@ -748,16 +973,23 @@ mod tests {
 
     #[test]
     fn test_render_with_attachments() {
-        let state = HarnessState::new(200_000, 16384);
+        let mut state = HarnessState::new(200_000, 16384);
+        // View item at head → its paths become rendered attachments
+        state.work_queue.push(WorkItem {
+            id: AgentId("0001".into()),
+            priority: 10,
+            time: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            item_type: WorkItemType::View {
+                paths: vec!["/tmp/camera.jpg".into(), "/tmp/meta.json".into()],
+            },
+            attachments: Vec::new(),
+        });
         let config = RenderConfig::default();
-        let attachments = vec![
-            Attachment::new("/tmp/camera.jpg"),
-            Attachment::new("/tmp/meta.json"),
-        ];
-        let rendered = render_context(&state, "", None, &config, 150_000, None, None, attachments);
+        let rendered = render_context(&state, "", None, None, &config, 150_000, None, None);
 
         assert_eq!(rendered.attachments.len(), 2);
-        assert!(rendered.text.contains("Attachments this turn: 2"));
+        assert!(rendered.text.contains("type: View"));
+        assert!(rendered.text.contains("paths: 2 files"));
         assert!(rendered.text.contains("ephemeral"));
     }
 
@@ -765,7 +997,7 @@ mod tests {
     fn test_render_no_attachment_line_when_empty() {
         let state = HarnessState::new(200_000, 16384);
         let config = RenderConfig::default();
-        let rendered = render_context(&state, "", None, &config, 150_000, None, None, Vec::new());
+        let rendered = render_context(&state, "", None, None, &config, 150_000, None, None);
 
         assert!(!rendered.text.contains("Attachments this turn"));
     }
@@ -780,7 +1012,7 @@ mod tests {
             turn_counter: 3,
             max_turns: Some(10),
         };
-        let rendered = render_context(&state, "", None, &config, 150_000, Some(&agent), None, Vec::new());
+        let rendered = render_context(&state, "", None, None, &config, 150_000, Some(&agent), None);
 
         assert!(rendered.text.contains("Agent: api-checker"));
         assert!(rendered.text.contains("Lineage: api-checker, child of plan-builder, child of root"));
@@ -797,9 +1029,36 @@ mod tests {
             turn_counter: 5,
             max_turns: None,
         };
-        let rendered = render_context(&state, "", None, &config, 150_000, Some(&agent), None, Vec::new());
+        let rendered = render_context(&state, "", None, None, &config, 150_000, Some(&agent), None);
 
         assert!(rendered.text.contains("Agent: root"));
         assert!(rendered.text.contains("Turns: 5 (no limit)"));
+    }
+
+    #[test]
+    fn test_trunc_multibyte_boundary() {
+        // Regression: crash loop on debian 2026-03-25. Memory value with '→'
+        // (3 bytes) at exactly the truncation point panicked with
+        // "byte index 120 is not a char boundary".
+        let s = "a".repeat(118) + "→bbb"; // '→' spans bytes 118..121
+        assert_eq!(trunc(&s, 120).len(), 118); // snaps back past the arrow
+        assert_eq!(trunc(&s, 119).len(), 118);
+        assert_eq!(trunc(&s, 118).len(), 118);
+        assert_eq!(trunc(&s, 121).len(), 121); // lands exactly after → : ok
+        assert_eq!(trunc("short", 100), "short"); // no-op when under
+        assert_eq!(trunc("", 0), "");
+
+        // End-to-end: memory render with multibyte at the cut point.
+        let mut state = HarnessState::new(200_000, 16384);
+        state.memory.insert(
+            "arch".into(),
+            serde_json::json!("Camera → MQTT → receiver → root"),
+        );
+        let config = RenderConfig {
+            agent_state_memory_value_max_chars: 10,
+            ..RenderConfig::default()
+        };
+        // Would previously panic on the byte slice.
+        let _ = render_context(&state, "", None, None, &config, 150_000, None, None);
     }
 }

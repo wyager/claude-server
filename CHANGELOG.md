@@ -1,5 +1,480 @@
 # Changelog
 
+## 2026-04-02
+
+### Web dashboard (`GET /dashboard`)
+- Single-file HTML embedded via `include_str!` (like `chat.html`). No
+  build step, no frameworks — vanilla JS, 2s poll.
+- `GET /dashboard/state` returns `HashMap<String, AgentSnapshot>` for all
+  agents in the registry. Each `AgentLoop` pushes a full snapshot at two
+  points: (1) "thinking" — the pre-API state the model sees; (2) "idle" —
+  post-execution with side effects applied and usage numbers populated.
+  Status transitions ("executing") patch the existing snapshot.
+- Snapshot fields: queue items, history tail (last 10, truncated), memory
+  (values included, sensitive keys redacted per `mark_sensitive`), timers,
+  processes, hooks + stats, last-turn usage (tokens/cost/cache-hit).
+- `AgentSnapshot` and friends in `types.rs`; builder at
+  `agent_loop.rs:build_snapshot`. Bounded truncation throughout so
+  serialization stays cheap for long-running agents.
+- UI: per-agent cards, root first. Memory entries are `<details>` —
+  collapsed by default, expand to see the value. Open/closed state
+  survives re-renders (tracked in a Set keyed on agent+section).
+
+### System prompt — behavioral guidance (ported from Claude Code)
+- **Honest Status Reporting**: lead with failures, distinguish "started"
+  from "confirmed working", don't collapse uncertainty into checkmarks.
+- **Irreversible Actions**: recovery-cost framing before destructive
+  shell_exec, "unfamiliar state is not garbage."
+- **Error Recovery** expanded: stop respawning after 3 failed restarts,
+  diagnose instead.
+- **Memory** expanded: what to pin vs what to skip, verify-before-acting
+  on stale beliefs.
+
+## 2026-03-30 (v0.2.5)
+
+### Clone-and-mutate: read-after-write works everywhere
+- **Architecture change**: per-turn, clone `HarnessState`, move components
+  into pyclass `Mutex<T>` fields, mutate directly, extract on commit.
+  External effects (OS spawn, broadcast, fork, SQLite pin) still deferred —
+  can't roll back by dropping a clone.
+- `SideEffectCollector` → `ExternalEffects` (external-only).
+  `apply_side_effects` shrinks ~180→60 lines. All the in-state replay
+  loops (`memory_sets`, `timer_adds`, `hook_adds`, etc.) deleted.
+- **`list_hooks()` reads the same Mutex `register_hook()` writes to** — the
+  merge logic that faked this is gone. Same for `processes_list()`,
+  `memory.get()`, `timers.list()`. Live-agent trial: agent expected empty
+  (old behavior), got all 3 hooks. Surprised by correctness.
+- `IdGenerator` shared via `Arc<Mutex<>>` between PyTimers and PyHarness.
+  `TimerManager` too (acknowledge_timer lives on PyHarness).
+- `shell_exec`: adds `ManagedProcess` to txn's process_manager same-turn
+  (so `processes_list()` shows it), defers only the OS spawn.
+  `ProcessStartRequest.success_prio` dead code — removed.
+- Commit: `1e2497b`, net -117 LOC in agent_loop.rs. 63/63 tests.
+
+### ProcessCompleted/Failed carry `description` — chain pattern unblocked
+- `WorkItemType::ProcessCompleted` and `ProcessFailed` gain `description`:
+  the string passed to `shell_exec(description=...)`. Looked up from
+  `process_manager` by pid when the completion event arrives.
+- **`HookCommit.process_manager`**: hook's shell_exec adds a ManagedProcess
+  entry to its txn's process_manager. Now committed back on success so the
+  later description lookup works. Without this, chain was dead — trial
+  agent independently diagnosed it: *"shell_exec() called from within a
+  hook may not be preserving the description parameter."*
+- Live-agent trial confirms: probe-spawn → ProcessCompleted carries
+  `description: "chain:echo FAIL happened"` → probe-triage matched →
+  hook_note landed as `attachments: [hook:probe-triage:FAIL detected in output]`.
+  OK result consumed (never appeared in any queue). Zero API calls for the
+  happy path.
+
+## 2026-03-30 (v0.2.4)
+
+### Event hooks — API-free local handling (feedback #32 part 2)
+- **`register_hook(name, priority, match_expr, process, timeout_ms)`** —
+  agent-registered Python scripts that run before a WorkItem enters the
+  queue. First matching hook (priority-descending, first-match-wins) runs
+  its `process()`. Returns `None` → event consumed (no API call);
+  returns `e` → event passes (optionally with `e['priority']`/`e['hook_note']`
+  mutated); raises → `HookException` WorkItem wrapping the original.
+  Both `match_expr` and `process` are source strings — syntax-validated
+  at registration via `compile()`, no closures.
+- **Execution model** (`python::run_hooks`): single interpreter-enter per
+  event, all match expressions evaluated in one pass. `e` is a plain dict
+  built from the WorkItem. Hook-mode `PyHarness`: `shell_exec` allowed
+  but `block_for` raises ("chain a second hook for ProcessCompleted"),
+  `fork`/`done`/`compact`/`wait_for_message_channel` raise. Watchdog
+  thread + `PyErr_SetInterrupt` bounds each hook to its `timeout_ms`.
+- **Integration** (`agent_loop::push_item`): all `work_queue.push` calls
+  in `apply_event` go through the hook pipeline. `apply_hook_effects`
+  applies the restricted side-effect subset (memory, timers, fire-and-forget
+  processes, messages). Hook-emitted side effects from a partial run
+  (before a raise) still apply.
+- **`!hooks list|disable NAME|clear`** safety hatch — handled in Rust
+  before hook matching, so a buggy hook can't intercept the rescue command.
+- **Telemetry**: `HarnessState.hook_stats` tracks `(fired, consumed,
+  passed, raised)` per hook. NOT rendered in `<agent_state>` (would thrash
+  cache). `flush_hook_telemetry()` pushes a `SystemAlert` to history on
+  idle→active, then resets.
+- **`QueueFilter` removed** — `work_queue.add_filter`/`remove_filter`
+  deleted. Hooks subsume: `register_hook('spam', 0, "'BUY' in e.get('content','')", 'return None')`.
+- **`--agent-personal-name`** on `feedback` subcommand — per-deployment
+  identifier stored alongside `agent_name` so triage can tell which
+  `root` is which.
+
+## 2026-03-30 (v0.2.3)
+
+### Message routing overhaul (feedback #30, #31)
+- **`SubscriberRegistry`** (`http_server.rs`): tracks active SSE subscription
+  patterns (exact + prefix). Guard-based — register returns a guard, drop
+  decrements. `would_reach(chat_id)` is a sync HashMap check;
+  `wait_for(chat_id, timeout)` is an async arm-then-check-then-wait loop
+  using `tokio::sync::Notify`.
+- **`send_message` fails fast**: raises `RuntimeError` if
+  `subscribers.would_reach(chat_id)` is false. No more silent drops to
+  typo'd chat_ids or not-yet-connected bridges. Error message suggests
+  `wait_for_message_channel`.
+- **`wait_for_message_channel(chat_id, timeout_ms=3000)`**: new Python
+  builtin. Blocks until a subscriber for `chat_id` exists, or raises
+  `TimeoutError`. Captures the tokio `Handle` before the Python thread
+  spawn so `block_on` works from the dedicated thread. Closes the startup
+  race where `shell_exec(bridge...); send_message(...)` in the same turn
+  fired before the bridge finished its SSE handshake.
+- **Bridges subscribe by prefix**: `signal:*`, `telegram:*`, `discord:*`,
+  `slack:*`, `email:*`. One bridge instance handles all peers in its
+  namespace. `--peer`/`--channel` is now an optional allowlist (`Vec<String>`)
+  — omit to accept from anyone. Outbound recipient parsed from
+  `out.chat_id.strip_prefix(...)`. `Inbound` and `Outbound` structs gained
+  `chat_id` fields; `relay_loop` takes `sse_pattern` instead of `chat_id`.
+- **Telegram 4096-char chunking** (feedback #31): `chunk_for_telegram()`
+  splits at line boundaries, falls back to char-boundary-safe hard splits
+  for single lines exceeding the limit. Previously messages >4096 chars
+  got a 400 from Telegram and were silently dropped.
+- Local stdio chat registers `"local"` so `send_message("local", ...)` passes
+  the routability check.
+
+## 2026-03-28 (v0.2.2)
+
+### Information Stewardship guidance
+- New `### Information Stewardship` section in system_prompt.txt (before
+  "Before Sending Messages"). Frames the agent as a fiduciary for client
+  data — credentials, location, surveillance observations, and anything
+  derivable from them. Four principles: outbound discipline (the
+  locate/impersonate/surveil/defraud test), scoped standing authorizations
+  (pin to memory with who/what/until-when), inbound skepticism (channel
+  configured ≠ data-sharing authorized), and the asymmetry rule (cost of
+  asking is one message, cost of leaking is unbounded).
+- Driven by a field incident: deployed agent shared camera observations
+  and location-revealing details with a peer agent over agentchat without
+  explicit authorization. The client had configured the channel; the agent
+  inferred blanket sharing permission.
+- AGENT_CHANGELOG nudges deployed agents to audit recent cross-agent
+  messages and pin any existing standing authorizations.
+
+## 2026-03-26 (v0.2.1)
+
+### `docs recipe` subcommand (feedback #29)
+- `claude-server docs recipe [NAME]` — bundled deployment recipes embedded in
+  the binary. First recipe: `camera-monitor` (persistent Sonnet daemon owning
+  an MQTT watcher, Opus escalation only). Adapted from the debian agent's
+  feedback #29 writeup, updated for 0.2.1 (`watch mqtt --payload=structured`
+  instead of the Python receiver). Agents fetch on-demand via
+  `shell_exec(cmd=harness_bin, args=["docs", "recipe", NAME])` — keeps the
+  system prompt lean while making detailed patterns discoverable.
+
+### Per-version agent changelog
+- `AGENT_CHANGELOG` changed from flat `&str` to `&[(&str version, &str entry)]`.
+  `changelog_since(prev, current)` filters entries where `prev < v <= current`
+  using numeric tuple comparison (so `0.10.0 > 0.2.0` correctly). A 0.2→0.5
+  jump now shows exactly the 0.3/0.4/0.5 entries. Unparseable `prev` (e.g.
+  "unknown" from pre-tracking DBs) sorts as (0,0,0) → agent sees everything.
+  Tests: `test_parse_ver`, `test_changelog_since`.
+
+### `watch mqtt` payload modes (feedback #28 part 2)
+- `--payload=text` (default) — current behavior, inline as UTF-8
+- `--payload=raw` — write every payload to `--attach-dir/{random}/{topic-slug}.bin`,
+  send `{topic, attachments:[path], size}`
+- `--payload=structured` — parse `{"attachments":[{"name","base64"}],"data":{...}}`,
+  decode to `--attach-dir/{random}/{name}`, send `{topic, data, attachments:[paths]}`
+- Per-message random-named subdir prevents collisions across messages.
+  `--attach-retain=N` (default 50) deletes oldest subdirs when exceeded.
+  Publisher-supplied names sanitized (path separators, leading dots stripped)
+  so `name:"../../etc/passwd"` can't escape the per-message dir.
+- Camera pipeline no longer needs a Python MQTT receiver: publisher speaks
+  the structured schema, `watch mqtt --payload=structured` decodes, agent
+  `view()`s the paths.
+
+### OpenSSL removed (feedback #28)
+- `async-native-tls` (IMAP in email bridge + watcher) pulled in `native-tls`
+  → OpenSSL. Replaced with `feedback::rustls_connect()` using `tokio-rustls`
+  + `rustls-native-certs` for trust. async-imap's `runtime-tokio` feature
+  accepts tokio streams directly. Binary now has zero libssl linkage —
+  `cargo install` works on a fresh Linux box without `apt install libssl-dev`.
+
+### More UTF-8 truncation fixes (feedback #27)
+- `core_loop.rs::snip()` had the same byte-slice pattern — fixed to use
+  `trunc()` for the head and forward-snapping for the tail.
+- `api_client.rs:438` — error-message preview also used `&text[..200]`. Swept
+  the codebase for `&foo[..N]` on strings; these were the last two.
+
+## 2026-03-26
+
+### Agent-facing changelog on version upgrade
+- `HarnessState.last_harness_version: Option<String>` tracked in persisted
+  state. On resume, if it differs from `CARGO_PKG_VERSION`, the `AgentStartup`
+  work item includes a `changelog` field with a terse, action-oriented summary
+  of new capabilities (from `AGENT_CHANGELOG` const in main.rs). Agent sees it
+  once, then the version is updated. Fresh state initializes to current version
+  (no changelog on first-ever run). Bumped to 0.2.0 so existing deploys trigger.
+
+### Sensitive memory redaction
+- `memory.mark_sensitive(key)` / `memory.unmark_sensitive(key)` — values of
+  marked keys are scrubbed from the API trace ring buffer at store time
+  (replaced with `<SENSITIVE, REDACTED>`). Agent's live context unchanged;
+  only the trace and thus `feedback --with-api-trace` uploads are scrubbed.
+  `HarnessState.sensitive_keys: HashSet<String>` persisted. Scrub replaces
+  both raw and JSON-escaped forms; skips values <8 chars (false-positive
+  guard). Driven by feedback #26 exposing a wallet seed in an API trace.
+
+### System prompt — memory & event routing docs
+- Pinned tier: explicit that values render **in full** (no 120-char truncation),
+  survive restarts, and show size in context metadata. New "which tier to use"
+  guidance: pin anything needed for routine operational success.
+- External events: documented `$CLAUDE_SERVER_AGENT_NAME` env var and the
+  `agent` field in POST /event body for per-agent routing. Example updated.
+  Fixes feedback #26's root cause — agent couldn't discover the routing
+  mechanism from docs, kept re-deriving the wrong (root-forwarding) architecture.
+
+## 2026-03-25 (fixes)
+
+### UTF-8 truncation crash loop
+- `renderer.rs` byte-sliced strings at fixed offsets (`&s[..120]`), panicking
+  when the cut landed mid-UTF-8-codepoint. Triggered on the debian deploy
+  by a memory value with `→` at byte 118. Added `trunc()` helper that snaps
+  to `is_char_boundary()`; replaced all 5 instances (3 in renderer, 2 in
+  agent_loop log previews). Regression test added.
+
+### Agentchat stale-connection fix
+- SIGKILL'd client left a zombie server-side session (no FIN, no ping, OS
+  TCP keepalive is hours). Re-auth was rejected with "already connected
+  elsewhere" for 37+ min. Two fixes:
+  - **Kick-on-reauth**: new auth with same username replaces the old entry.
+    Old session's `rx` closes → it exits. Session-ID guard on cleanup so
+    the old session doesn't remove the new one's map entry. Auth response
+    now includes `kicked_prior_session: bool`.
+  - **Server-side ping every 30s**: forces a write that surfaces dead
+    peers via RST, keeping the map clean even without a re-auth attempt.
+
+## 2026-03-25 (agentchat)
+
+### Cross-deployment agent chat (WS over feedback server)
+- **Server** (`feedback.rs`): `GET /chat/ws` websocket endpoint. Auth via
+  first frame `{"user","pass"}` — upsert (register if new, verify if exists).
+  Creds persisted in `chat_users` table (salted SHA256); messages RAM-only.
+  One connection per username. Bounded per-recipient queue (cap 32) —
+  `try_send` failure returns `{"error":"recipient overloaded"}` to sender.
+  Offline recipient returns `{"error":"recipient offline"}`. Per-connection
+  rate limit 10 msgs/min, max 10kB/msg.
+- **Client** (`src/bridges/agentchat.rs`): `bridge agentchat --user U --pass P`.
+  WSS connect to feedback.yager.io with embedded self-signed cert + native
+  roots. Inbound messages debounced (default 500ms) and POSTed as one batch
+  `ExternalEvent{source="agentchat", data={"messages":[...]}}`. Outbound:
+  subscribes SSE `agentchat:*` (new prefix-match support), parses recipient
+  from chat_id suffix, sends WS frame.
+- **SSE prefix match** (`http_server.rs`): chat_id ending in `*` matches
+  prefix. `chat_id` field now included in SSE data so bridges can route.
+- **Agent usage**: `send_message(chat_id="agentchat:remote-user", content=...)`.
+  Zero new Python builtins.
+
+## 2026-03-25
+
+### Signal reactions + message_ref (feedback #24)
+- `UserMessage` work items carry `message_ref: Option<String>` — the
+  bridge-native message identifier (Signal timestamp, Discord snowflake,
+  Slack ts, Telegram message_id). Threaded through `Inbound`,
+  `MessageRequest`, `HarnessEvent::UserMessage`.
+- `send_message(chat_id, content, react_to=ref)` — when `react_to` is set,
+  bridges send a reaction (content is the emoji) instead of a regular message.
+  Threaded through `OutboundMessageRequest`, `BroadcastMsg::Message`, the SSE
+  stream, and `relay_loop`'s outbound closure (now takes `Outbound` struct).
+- Signal bridge: extracts `envelope.timestamp` for message_ref; outbound
+  branches to `sendReaction` jsonRpc method (targetAuthor=peer,
+  targetTimestamp=ref, emoji=content) when react_to is set.
+- Other bridges accept Outbound but ignore react_to for now (can wire up
+  per-protocol later).
+
+
+## 2026-03-24
+
+### Persistent children + event routing + kill_child
+- `ChildSettings.max_turns=None` → persistent child that idle-waits like
+  root. `AgentPermissions.max_turns` was already `Option<u32>` — just exposed
+  `None` to the fork path. State-persistence gate changed from
+  `max_turns.is_none()` to `agent_name == "root"` so persistent children
+  don't accidentally save to SQLite.
+- `POST /event` accepts optional `agent` field — routes via `AgentRegistry`
+  to that agent's channel. Unknown/completed agents fall back to root with a
+  synthetic `agent-not-found` event so nothing is silently dropped. Watchers
+  auto-include `CLAUDE_SERVER_AGENT_NAME` (already in their env from
+  ProcessSupervisor) so events route back to the spawning agent.
+- `kill_child(name)` Python builtin → `HarnessEvent::KillSignal` via
+  `registry.send_to()`. Child's `apply_event` sets `killed=true`, checked at
+  turn boundary → `FinishReason::Killed` → parent gets `ChildAgentCompleted
+  {summary: "Killed by parent"}`.
+- Feedback server: `DELETE /feedback/:id` (admin-only) for triage cleanup.
+  Extracted `check_admin()` helper shared with GET.
+- `AgentName` enum (`Root | Child(String)`) replaces `agent_name: String`.
+  Closes the injection vector where a child named `"root"` could pass the
+  `== "root"` state-persistence check. `new_child()` rejects the reserved
+  name; fork() validates via this before registration.
+
+
+### Cached role-prefix for repeated child agents
+- `ChildSettings.prefix_context` (str) and `prefix_attach` (list[str]) render
+  between `<deployment_context>` and `<event_history>`, inside the cached
+  region. Byte-identical across repeated forks → 500 camera-inspector spawns
+  pay the reference-image cost once.
+- `RenderedContext` restructured: `prefix_text` + `prefix_attachments` +
+  `cached_segments` + tail.
+- **Block layout is conditional on prefix_attachments** (cache regression
+  fix, feedback #22): with images, split `[prefix_text][imgs][seg1+cc]`;
+  without, merge deploy+history into one growing `[seg1+cc]` block. The
+  unconditional split broke root's cache (hit rate 46%→17%) because the
+  API prefix-matches per-block — a static block followed by a growing block
+  never hash-matches. Verified: root back to 82-90% hit, `cache_write=0`.
+- **cache_control on last prefix image**: guarantees the static region
+  (system + prefix_text + all images) caches even if seg1's growth doesn't
+  prefix-match across the image→text boundary. Defense-in-depth for
+  persistent children with prefix images.
+- **CACHE BLOCKS dump section** (`--dump-dir`): per-turn FNV-1a hash +
+  length + head/tail snippet for prefix_text, each cached_segment, and tail,
+  plus the API usage numbers and block-order summary. Diffing hashes across
+  consecutive turns pinpoints which block's content is drifting.
+- **API trace ring buffer + `--with-api-trace`**: daemon keeps the last N
+  (default 10, `CLAUDE_SERVER_API_TRACE_SIZE`) API request/response pairs
+  in RAM as exact JSON (images included). `GET /api-trace` exposes it; the
+  `feedback --with-api-trace` flag fetches and attaches to the report.
+  Server stores in an `api_trace` column, fetched via `GET /feedback/:id/trace`
+  (admin-only). Eliminates the redeploy-with-debug-flags cycle — agents can
+  self-report with wire-level data when they notice cache anomalies.
+- **Geometric cache tiers (the actual fix)**: trace #23 proved Anthropic's
+  cache requires 100%-identical content — no prefix matching. A breakpoint
+  that moves every turn never hits. `cache_splits()` now returns N tier
+  boundaries where tier i advances every `stride^(tiers-i)` turns. Default
+  `stride=5, tiers=2`: cold tier advances every 25 turns, hot tier every 5.
+  Most content stays in cache_read (10% cost); uncached tail bounded to
+  ~stride entries. ~38% cheaper than flat stride=25 because tail re-ingest
+  dominates. Tier budget clamped to 4 minus (system + prefix-image
+  breakpoints). Config: `CLAUDE_SERVER_CACHE_STRIDE`, `CLAUDE_SERVER_CACHE_TIERS`.
+- **Determinism**: child's id_generator state, timestamps, and task string all
+  land in the tail (immutable_count=0 for fresh history with mod_window=5). No
+  RNG leaks into the cached prefix.
+- `ChildAgentCompleted` gains `cost_usd` and `cache_hit_pct` — computed from
+  the child's token counts at completion. Parent can track per-role spend.
+
+
+## 2026-03-23
+
+### Watchers (`watch fs|mqtt|imap`)
+- New `src/watchers/` subcommand family. Long-lived daemons that POST batched
+  `ExternalEvent` items to `/event`.
+- **Shared debounce loop** (`watchers/mod.rs::debounce_loop`): events are
+  collected with a reset-on-event debounce (default 3s) and a force-flush cap
+  (default 10s) so a steady stream can't stall indefinitely. Each batch is one
+  work item with `data = {count, events: [...]}`. Both timers configurable
+  per-watcher via `--debounce-ms`/`--force-ms`.
+- `watch fs` — filesystem events via the `notify` crate. Native backend by
+  default; `--poll-interval-ms N` switches to `PollWatcher` for NFS/SMB/sshfs
+  where inotify/FSEvents miss remote writes.
+- `watch mqtt` — MQTT subscriber via `rumqttc`. Topic wildcards, auth, retain.
+- `watch imap` — IMAP IDLE via `async-imap`. Push-based, reconnects, fetches
+  `{from, subject, uid}` for new messages.
+
+### Webhook proxy
+- `claude-server webhook-proxy` — authenticated public ingress. Routes:
+  `/github` (X-Hub-Signature-256 HMAC), `/slack` (X-Slack-Signature with 5-min
+  replay protection, handles URL verification challenge), `/generic` (Bearer
+  token passthrough). Optional TLS via the same `TlsListener` as
+  feedback-server (now `pub`).
+- New deps: `hmac`, `sha2`, `hex`, `notify`, `rumqttc`, `async-imap`,
+  `async-native-tls`.
+
+### Attachments refactor: `view()` + View work items
+- **Replaces** `attach()` and `AgentLoop.pending_attachments`. `view(*paths)`
+  now pushes a `WorkItemType::View` work item (priority 10). Renderer emits
+  its paths as content blocks only when the View item is at queue head.
+  Content persists until popped — no magic one-turn expiry.
+- **Idle invariant restored**: idle check is back to pure `queue.is_empty()`.
+  The `&& pending_attachments.is_empty()` hack is gone.
+- `WorkItem.attachments: Vec<String>` is new metadata field — paths shown as
+  text in queue view, never auto-rendered. Bridges populate it (e.g. Signal
+  images); agent calls `view()` to promote to content blocks.
+- `ChildSettings.attach` now pushes a View item to the child's queue.
+- `POST /message` accepts `attachments: [...]`; `HarnessEvent::UserMessage`
+  and `relay_loop` thread it through via `Inbound{text, attachments}`.
+- **#14a**: Signal bridge now parses `dataMessage.attachments[].id` and sets
+  the structured `attachments` field instead of appending text.
+
+### Outbound attachments + email bridge
+- `send_message(chat_id, content, attach=[...])` — paths delivered by bridges.
+  Pipeline: `OutboundMessageRequest.attachments` → `outbound_messages.attachments`
+  (JSON TEXT column) → `BroadcastMsg::Message.attachments` → SSE → `relay_loop`
+  outbound closure `Fn(String, Vec<String>)`.
+- Per-bridge delivery: Signal (JSON-RPC `attachments` param), Telegram
+  (`sendPhoto`/`sendDocument` multipart), Discord (`files[n]` multipart),
+  Slack (`files.getUploadURLExternal` → POST → `completeUploadExternal`),
+  stdio (prints paths), email (lettre MIME multipart).
+- **New `bridge email`** — IMAP IDLE inbound (via `async-imap`, filters by
+  `--peer`, `mailparse` for MIME body + attachment extraction to
+  `--attach-dir`) + SMTP outbound (via `lettre`, STARTTLS). chat_id is
+  `email:<peer-address>`.
+- New deps: `lettre`, `mailparse`; `reqwest` gains `multipart` feature.
+- **#13**: `ChildSettings.inherit_history` (default `True`). When `False`,
+  child starts with fresh history containing only a fork SystemAlert. Memory,
+  `task`, and `attach` still flow. Avoids cross-model re-ingest cost.
+
+### Agent QoL (feedback #15-20)
+- `shell_output(pid, lines=N)` — optional tail of last N lines. Works on
+  running processes (output is streamed to DB as it arrives).
+- `<entry id="..." est_tokens="N">` — history entries now show their
+  estimated token cost (chars/4) in the tag. Byte-stable since entry
+  content is immutable, so doesn't bust cache prefix. Helps compaction
+  decisions.
+- `http(method, url, headers, body, block_for)` — pure-Python PREAMBLE
+  helper that wraps `shell_exec("curl", ...)` with proper arg construction.
+  Dict body auto-JSON-encoded. No new Rust code.
+- Docs: args-list goes to exec() (no shell escaping), `shlex.quote()` for
+  bash -c, text files can be `open().read()` directly, inbound attachments
+  are opt-in via `view()` (spam protection).
+
+### Interactive processes (`shell_input`)
+- `shell_exec(..., interactive=True)` pipes stdin and keeps it open.
+- `shell_input(pid, data)` writes bytes to the process's stdin via an
+  unbounded channel → dedicated writer task (non-blocking from Python).
+- `shell_close_stdin(pid)` sends EOF by dropping the writer.
+- Enables SSH sessions, REPLs, interactive CLIs across turns. Plain pipe,
+  not PTY — programs requiring a terminal may misbehave.
+
+### Cache stride default: 10 → 1
+- Head-to-head test (25 turns each, same workload): stride=1 at 79% hit /
+  $0.38 vs stride=10 at 62% / $0.55 — **31% cheaper**.
+- Anthropic's cache does prefix matching: when seg1 grows by one entry per
+  turn, `cache_read` climbs smoothly at 1024-chunk boundaries (8192 → 10240
+  → 12288). The conservative stride=10 was unnecessary.
+- stride=10 was actually *worse* with small entries: seg2 (10 entries ≈
+  5500 chars) stayed under the 8192-char threshold and got dropped entirely,
+  leaving 10 entries uncached.
+- Configurable via `CLAUDE_SERVER_CACHE_STRIDE` (default 1).
+
+### Prompt caching fix (two-breakpoint stride scheme)
+- Previously only the system prompt was cached; the rendered context (event_history
+  etc.) paid full input price every turn. First attempt put a breakpoint at the
+  immutable-history boundary, but field telemetry showed it never hit — the boundary
+  moves every turn so the breakpoint content is never byte-identical to the prior
+  cache entry.
+- Fixed: `RenderedContext.cached_segments` holds two stride-aligned segments
+  (default `cache_stride=10` entries). Both segments keep byte-identical content
+  for `stride` turns → guaranteed hits. On stride advance, segment 1 moves to
+  segment 2's old position (still hits its cache entry), segment 2 moves forward
+  (cache-write on just one stride's worth). `EventHistory::cache_splits()` computes
+  the boundaries.
+- Per-turn cost + cache hit % logged: `$0.0421/turn, 92% cache hit`. Watch this —
+  if hit % stays near the system-prompt-only baseline (~15-20%), something regressed.
+
+### AgentStartup work item (from field feedback #9)
+- On daemon restart with resumed state, inject a priority-9 `AgentStartup` work
+  item so the agent gets a turn to reconnect dead bridges/processes it tracked
+  in memory. Not injected on fresh state.
+
+### Signal bridge rewrite (from field feedback #5-6)
+- Switched from `receive` + spawn-per-`send` (broken by signal-cli's file lock)
+  to single `jsonRpc` daemon over stdin/stdout. One process, no lock contention.
+
+### Feedback server fixes
+- TlsListener now spawns handshakes into background tasks with 10s timeout —
+  slow clients can't block the accept loop. Added `ClientAddr` newtype to
+  satisfy axum's `Connected` trait for both TCP and TLS paths.
+- Embedded cert updated to match the live server (was stale, causing
+  `BadSignature`). Error chain now printed so future TLS failures are diagnosable.
+
 ## 2026-03-22
 
 ### CLI chat over HTTP + `request_compaction()`

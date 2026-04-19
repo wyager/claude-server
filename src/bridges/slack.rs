@@ -13,9 +13,10 @@ pub struct SlackArgs {
     /// Bot user token (xoxb-..., needs chat:write + channels:history)
     #[arg(long)]
     pub bot_token: String,
-    /// Channel ID (e.g. C0123456789)
+    /// Optional allowlist of channel IDs (e.g. C0123456789). Omit to accept
+    /// from any channel the bot is in.
     #[arg(long)]
-    pub channel: String,
+    pub channel: Vec<String>,
     #[command(flatten)]
     pub api: super::ApiUrl,
 }
@@ -28,17 +29,16 @@ pub fn run(args: SlackArgs) {
     }
 }
 
-async fn run_async(api_url: String, app_token: String, bot_token: String, channel: String) -> Result<()> {
+async fn run_async(api_url: String, app_token: String, bot_token: String, channel_allowlist: Vec<String>) -> Result<()> {
     let http = reqwest::Client::new();
-    let chat_id = format!("slack:{}", channel);
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::unbounded_channel::<super::Inbound>();
 
     // Inbound: Socket Mode websocket with reconnect loop
     let inbound_http = http.clone();
-    let inbound_channel = channel.clone();
+    let inbound_allow = channel_allowlist.clone();
     tokio::spawn(async move {
         loop {
-            if let Err(e) = socket_mode_loop(&inbound_http, &app_token, &inbound_channel, &tx).await {
+            if let Err(e) = socket_mode_loop(&inbound_http, &app_token, &inbound_allow, &tx).await {
                 eprintln!("[slack bridge] socket mode error: {:#}, reconnecting in 5s", e);
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
@@ -48,23 +48,30 @@ async fn run_async(api_url: String, app_token: String, bot_token: String, channe
         }
     });
 
-    // Outbound: chat.postMessage
-    let out_channel = channel.clone();
-    super::relay_loop(&api_url, &chat_id, &format!("slack:{}", channel), rx, move |content| {
+    // Outbound: chat.postMessage. Channel parsed from out.chat_id.
+    super::relay_loop(&api_url, "slack:*", "slack", rx, move |out: super::Outbound| {
         let http = http.clone();
         let bot_token = bot_token.clone();
-        let channel = out_channel.clone();
         async move {
-            let resp: Value = http
-                .post("https://slack.com/api/chat.postMessage")
-                .bearer_auth(&bot_token)
-                .json(&json!({"channel": channel, "text": content}))
-                .send()
-                .await?
-                .json()
-                .await?;
-            if resp["ok"].as_bool() != Some(true) {
-                anyhow::bail!("chat.postMessage failed: {}", resp["error"].as_str().unwrap_or("?"));
+            let channel = out.chat_id.strip_prefix("slack:")
+                .with_context(|| format!("bad slack chat_id: {}", out.chat_id))?
+                .to_owned();
+            if !out.content.is_empty() {
+                let resp: Value = http
+                    .post("https://slack.com/api/chat.postMessage")
+                    .bearer_auth(&bot_token)
+                    .json(&json!({"channel": channel, "text": out.content}))
+                    .send()
+                    .await?
+                    .json()
+                    .await?;
+                if resp["ok"].as_bool() != Some(true) {
+                    anyhow::bail!("chat.postMessage failed: {}", resp["error"].as_str().unwrap_or("?"));
+                }
+            }
+            for path in out.attachments {
+                slack_upload_file(&http, &bot_token, &channel, &path).await
+                    .with_context(|| format!("uploading {}", path))?;
             }
             Ok(())
         }
@@ -72,11 +79,41 @@ async fn run_async(api_url: String, app_token: String, bot_token: String, channe
     .await
 }
 
+/// Slack's files.uploadV2 three-step dance: get URL → POST bytes → complete.
+async fn slack_upload_file(http: &reqwest::Client, token: &str, channel: &str, path: &str) -> Result<()> {
+    let bytes = tokio::fs::read(path).await?;
+    let name = std::path::Path::new(path).file_name()
+        .map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
+
+    let meta: Value = http
+        .post("https://slack.com/api/files.getUploadURLExternal")
+        .bearer_auth(token)
+        .form(&[("filename", name.as_str()), ("length", &bytes.len().to_string())])
+        .send().await?.json().await?;
+    if meta["ok"].as_bool() != Some(true) {
+        anyhow::bail!("getUploadURLExternal failed: {}", meta["error"].as_str().unwrap_or("?"));
+    }
+    let upload_url = meta["upload_url"].as_str().context("no upload_url")?;
+    let file_id = meta["file_id"].as_str().context("no file_id")?;
+
+    http.post(upload_url).body(bytes).send().await?.error_for_status()?;
+
+    let done: Value = http
+        .post("https://slack.com/api/files.completeUploadExternal")
+        .bearer_auth(token)
+        .json(&json!({"files": [{"id": file_id, "title": name}], "channel_id": channel}))
+        .send().await?.json().await?;
+    if done["ok"].as_bool() != Some(true) {
+        anyhow::bail!("completeUploadExternal failed: {}", done["error"].as_str().unwrap_or("?"));
+    }
+    Ok(())
+}
+
 async fn socket_mode_loop(
     http: &reqwest::Client,
     app_token: &str,
-    channel: &str,
-    tx: &mpsc::UnboundedSender<String>,
+    allowlist: &[String],
+    tx: &mpsc::UnboundedSender<super::Inbound>,
 ) -> Result<()> {
     // Get WSS URL
     let open: Value = http
@@ -123,12 +160,18 @@ async fn socket_mode_loop(
                 }
                 let event = &v["payload"]["event"];
                 if event["type"].as_str() == Some("message")
-                    && event["channel"].as_str() == Some(channel)
                     && event["bot_id"].is_null()
                     && event["subtype"].is_null()
                 {
+                    let Some(ch) = event["channel"].as_str() else { continue };
+                    if !allowlist.is_empty() && !allowlist.iter().any(|c| c == ch) { continue; }
                     if let Some(text) = event["text"].as_str() {
-                        tx.send(text.to_string()).ok();
+                        tx.send(super::Inbound {
+                            chat_id: format!("slack:{}", ch),
+                            text: text.to_owned(),
+                            attachments: Vec::new(),
+                            message_ref: event["ts"].as_str().map(String::from),
+                        }).ok();
                     }
                 }
             }

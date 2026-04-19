@@ -111,12 +111,22 @@ body {
 <div id="messages"></div>
 <div id="input-area">
     <textarea id="input" rows="1" placeholder="Type a message..." autofocus></textarea>
-    <button id="send" onclick="sendMessage()">Send</button>
+    <button id="send">Send</button>
 </div>
 
 <script>
 const API_URL = "{{API_URL}}";
-const CHAT_ID = crypto.randomUUID();
+// crypto.randomUUID is only available in secure contexts (HTTPS / localhost).
+// getRandomValues works over plain HTTP too, so build a v4 UUID manually.
+function uuidv4() {
+    if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+    const b = crypto.getRandomValues(new Uint8Array(16));
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    const h = Array.from(b, x => x.toString(16).padStart(2, "0")).join("");
+    return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20,32)}`;
+}
+const CHAT_ID = uuidv4();
 const seenIds = new Set();
 let eventSource = null;
 let typingEl = null;
@@ -124,6 +134,9 @@ let typingEl = null;
 const messagesEl = document.getElementById("messages");
 const inputEl = document.getElementById("input");
 const statusEl = document.getElementById("status");
+const sendBtn = document.getElementById("send");
+
+sendBtn.addEventListener("click", () => { sendMessage(); });
 
 // Auto-resize textarea
 inputEl.addEventListener("input", () => {

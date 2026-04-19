@@ -1,6 +1,10 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use clap::Args;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
@@ -9,9 +13,10 @@ pub struct SignalArgs {
     /// Your linked Signal account (E.164, e.g. +15551234567)
     #[arg(long)]
     pub account: String,
-    /// The peer to relay with (E.164)
+    /// Optional allowlist: only relay messages from these numbers (E.164).
+    /// Omit to accept from anyone who messages your account.
     #[arg(long)]
-    pub peer: String,
+    pub peer: Vec<String>,
     /// Path to signal-cli binary
     #[arg(long, default_value = "signal-cli")]
     pub signal_cli: String,
@@ -30,10 +35,9 @@ pub fn run(args: SignalArgs) {
 async fn run_async(
     api_url: String,
     account: String,
-    peer: String,
+    peer_allowlist: Vec<String>,
     signal_cli: String,
 ) -> Result<()> {
-    // Startup check
     let ver = Command::new(&signal_cli)
         .arg("--version")
         .output()
@@ -52,92 +56,128 @@ async fn run_async(
         );
     }
     eprintln!(
-        "[signal bridge] using {}",
+        "[signal bridge] using {} (jsonRpc mode)",
         String::from_utf8_lossy(&ver.stdout).trim()
     );
 
-    let chat_id = format!("signal:{}", peer);
-    let (tx, rx) = mpsc::unbounded_channel();
+    // Single daemon process handles both receive and send via JSON-RPC over
+    // stdin/stdout. Avoids the file-lock contention that made the old
+    // receive-process + spawn-per-send design unable to deliver outbound.
+    let mut child = Command::new(&signal_cli)
+        .args(["-a", &account, "jsonRpc"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawning signal-cli jsonRpc daemon")?;
 
-    // Inbound: signal-cli receive → parse JSON → filter by peer → channel
-    let recv_account = account.clone();
-    let recv_peer = peer.clone();
-    let recv_cli = signal_cli.clone();
+    let stdin = child.stdin.take().context("no stdin to signal-cli")?;
+    let stdout = child.stdout.take().context("no stdout from signal-cli")?;
+
+    let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+
+    // signal-cli saves received attachments here; we include the full path in
+    // the forwarded message so the agent can attach() them.
+    let attach_dir = std::env::var("XDG_DATA_HOME")
+        .map(|d| format!("{}/signal-cli/attachments", d))
+        .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.local/share/signal-cli/attachments", h)))
+        .unwrap_or_else(|_| "~/.local/share/signal-cli/attachments".into());
+
+    // Reader: parse JSON-RPC lines from daemon stdout
+    let allowlist = peer_allowlist.clone();
     tokio::spawn(async move {
-        if let Err(e) = receive_loop(&recv_cli, &recv_account, &recv_peer, tx).await {
-            eprintln!("[signal bridge] receive loop ended: {:#}", e);
+        let mut lines = BufReader::new(stdout).lines();
+        eprintln!("[signal bridge] daemon connected, listening for messages");
+        while let Ok(Some(line)) = lines.next_line().await {
+            let v: Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if let Some(err) = v.get("error") {
+                eprintln!("[signal bridge] jsonrpc error: {}", err);
+                continue;
+            }
+            // Incoming message notification
+            if v["method"].as_str() == Some("receive") {
+                let env = &v["params"]["envelope"];
+                let Some(src) = env["sourceNumber"].as_str().or_else(|| env["source"].as_str()) else {
+                    continue;
+                };
+                if !allowlist.is_empty() && !allowlist.iter().any(|p| p == src) {
+                    continue;
+                }
+                let dm = &env["dataMessage"];
+                let text = dm["message"].as_str().unwrap_or("").to_string();
+                let attachments: Vec<String> = dm["attachments"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|a| a["id"].as_str())
+                    .map(|id| format!("{}/{}", attach_dir, id))
+                    .collect();
+                if text.is_empty() && attachments.is_empty() {
+                    continue;
+                }
+                // Signal's message timestamp is the reaction/reply target.
+                let message_ref = env["timestamp"].as_i64().map(|t| t.to_string());
+                let inbound = super::Inbound {
+                    chat_id: format!("signal:{}", src),
+                    text, attachments, message_ref,
+                };
+                if inbound_tx.send(inbound).is_err() {
+                    return;
+                }
+            }
+        }
+        eprintln!("[signal bridge] daemon stdout closed");
+    });
+
+    // Writer: serialize send/sendReaction requests to daemon stdin.
+    // Recipient parsed from out.chat_id (e.g. "signal:+15551234567" → "+15551234567").
+    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<super::Outbound>();
+    let req_id = Arc::new(AtomicU64::new(1));
+    tokio::spawn(async move {
+        let mut stdin = stdin;
+        while let Some(out) = outbound_rx.recv().await {
+            let Some(recipient) = out.chat_id.strip_prefix("signal:") else {
+                eprintln!("[signal bridge] outbound chat_id not signal-prefixed: {}", out.chat_id);
+                continue;
+            };
+            let id = req_id.fetch_add(1, Ordering::Relaxed);
+            let req = if let Some(ts) = out.react_to {
+                // react_to is the Signal message timestamp; content is the emoji.
+                json!({
+                    "jsonrpc": "2.0", "id": id, "method": "sendReaction",
+                    "params": {
+                        "recipient": [recipient],
+                        "targetAuthor": recipient,
+                        "targetTimestamp": ts.parse::<i64>().unwrap_or(0),
+                        "emoji": out.content,
+                    }
+                })
+            } else {
+                let mut params = json!({ "recipient": [recipient], "message": out.content });
+                if !out.attachments.is_empty() {
+                    params["attachments"] = json!(out.attachments);
+                }
+                json!({ "jsonrpc": "2.0", "id": id, "method": "send", "params": params })
+            };
+            let line = format!("{}\n", req);
+            if let Err(e) = stdin.write_all(line.as_bytes()).await {
+                eprintln!("[signal bridge] write to daemon failed: {}", e);
+                return;
+            }
         }
     });
 
-    // Outbound: agent message → signal-cli send
-    let send_cli = signal_cli.clone();
-    let send_account = account.clone();
-    let send_peer = peer.clone();
-    super::relay_loop(&api_url, &chat_id, &peer, rx, move |content| {
-        let cli = send_cli.clone();
-        let acct = send_account.clone();
-        let to = send_peer.clone();
+    // Subscribe to signal:* — one bridge handles all Signal peers.
+    super::relay_loop(&api_url, "signal:*", &account, inbound_rx, move |out| {
+        let tx = outbound_tx.clone();
         async move {
-            let out = Command::new(&cli)
-                .args(["-a", &acct, "send", "-m", &content, &to])
-                .output()
-                .await
-                .context("spawning signal-cli send")?;
-            if !out.status.success() {
-                anyhow::bail!(
-                    "signal-cli send failed: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                );
-            }
+            tx.send(out).context("outbound channel closed")?;
             Ok(())
         }
     })
     .await
-}
-
-async fn receive_loop(
-    signal_cli: &str,
-    account: &str,
-    peer: &str,
-    tx: mpsc::UnboundedSender<String>,
-) -> Result<()> {
-    let mut child = Command::new(signal_cli)
-        .args(["-a", account, "-o", "json", "receive", "--timeout", "-1"])
-        .stdout(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("spawning signal-cli receive")?;
-
-    let stdout = child.stdout.take().context("no stdout from signal-cli")?;
-    let mut lines = BufReader::new(stdout).lines();
-
-    while let Some(line) = lines.next_line().await? {
-        let v: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let envelope = match v.get("envelope") {
-            Some(e) => e,
-            None => continue,
-        };
-        let source = envelope
-            .get("sourceNumber")
-            .or_else(|| envelope.get("source"))
-            .and_then(|s| s.as_str());
-        if source != Some(peer) {
-            continue;
-        }
-        let msg = envelope
-            .get("dataMessage")
-            .and_then(|d| d.get("message"))
-            .and_then(|m| m.as_str());
-        if let Some(text) = msg {
-            if !text.is_empty() {
-                tx.send(text.to_string()).ok();
-            }
-        }
-    }
-
-    let status = child.wait().await?;
-    anyhow::bail!("signal-cli receive exited with {}", status);
 }

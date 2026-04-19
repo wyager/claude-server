@@ -29,6 +29,22 @@ fn sniff_image_media_type(path: &Path) -> Option<&'static str> {
 /// Images → base64-encoded image block. Everything else → text block.
 /// File-not-found or read errors → text block with an error message
 /// (don't fail the turn — the agent gets feedback and moves on).
+/// Exponential backoff with cap and ±25% jitter. Base 2s, doubles each attempt.
+fn backoff(attempt: u32, cap_secs: u64) -> Duration {
+    let base = 2u64.saturating_pow(attempt).min(cap_secs);
+    let jitter = (base as f64 * 0.25 * (fastrand_ish() * 2.0 - 1.0)) as i64;
+    Duration::from_secs((base as i64 + jitter).max(1) as u64)
+}
+
+fn fastrand_ish() -> f64 {
+    use std::time::SystemTime;
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    (nanos % 1000) as f64 / 1000.0
+}
+
 fn resolve_attachment(att: &Attachment) -> ContentBlock {
     let path = &att.path;
     let display = path.display();
@@ -41,9 +57,11 @@ fn resolve_attachment(att: &Attachment) -> ContentBlock {
                     media_type: media_type.to_string(),
                     data: base64::engine::general_purpose::STANDARD.encode(&bytes),
                 },
+                cache_control: None,
             },
             Err(e) => ContentBlock::Text {
                 text: format!("[attachment read error: {} — {}]", display, e),
+                cache_control: None,
             },
         },
         None => match std::fs::read_to_string(path) {
@@ -58,12 +76,46 @@ fn resolve_attachment(att: &Attachment) -> ContentBlock {
                 }
                 ContentBlock::Text {
                     text: format!("<attachment path=\"{}\">\n{}\n</attachment>", display, text),
+                    cache_control: None,
                 }
             }
             Err(e) => ContentBlock::Text {
                 text: format!("[attachment read error: {} — {}]", display, e),
+                cache_control: None,
             },
         },
+    }
+}
+
+/// Ring buffer of recent API exchanges for self-service diagnostics. Agents
+/// can attach this to feedback reports via --with-api-trace so we don't
+/// need a separate debug build + redeploy cycle to see wire-level data.
+#[derive(Debug, serde::Serialize)]
+pub struct TraceEntry {
+    pub agent: String,
+    pub turn: u32,
+    pub request: serde_json::Value,
+    pub response: serde_json::Value,
+}
+
+pub struct ApiTrace {
+    entries: std::collections::VecDeque<TraceEntry>,
+    capacity: usize,
+}
+
+impl ApiTrace {
+    pub fn new(capacity: usize) -> Self {
+        Self { entries: std::collections::VecDeque::with_capacity(capacity), capacity }
+    }
+    fn push(&mut self, entry: TraceEntry) {
+        if self.capacity == 0 { return; }
+        while self.entries.len() >= self.capacity {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(entry);
+    }
+    pub fn snapshot(&self) -> &std::collections::VecDeque<TraceEntry> {
+        &self.entries
     }
 }
 
@@ -71,6 +123,7 @@ pub struct ApiClient {
     client: reqwest::Client,
     config: Arc<Config>,
     base_system_prompt: String,
+    trace: Option<Arc<std::sync::Mutex<ApiTrace>>>,
 }
 
 pub struct ApiTurnResult {
@@ -94,6 +147,7 @@ impl ApiClient {
             client,
             config,
             base_system_prompt,
+            trace: None,
         })
     }
 
@@ -107,55 +161,132 @@ impl ApiClient {
             client,
             config,
             base_system_prompt: system_prompt.to_string(),
+            trace: None,
         })
+    }
+
+    pub fn with_trace(mut self, trace: Arc<std::sync::Mutex<ApiTrace>>) -> Self {
+        self.trace = Some(trace);
+        self
     }
 
     pub async fn call(
         &self,
         rendered: &RenderedContext,
         pinned_memory: &[(String, String)],
+        agent_name: &str,
+        turn: u32,
+        sensitive_values: &[String],
     ) -> Result<ApiTurnResult> {
         let request = self.build_request(rendered, pinned_memory);
-        let mut retries = 0;
-        let max_retries = 3;
+        if let Ok(path) = std::env::var("CLAUDE_SERVER_DUMP_REQUEST") {
+            let json = serde_json::to_string(&request).unwrap_or_default();
+            if path == "1" {
+                eprintln!("=== API REQUEST JSON ===\n{}\n=== END ===",
+                    serde_json::to_string_pretty(&request).unwrap_or_default());
+            } else {
+                // Treat as directory: write one file per agent-turn for diffing.
+                let _ = std::fs::create_dir_all(&path);
+                let file = format!("{}/{}-{:03}.json", path, agent_name, turn);
+                let _ = std::fs::write(&file, &json);
+                eprintln!("[{}] Request JSON dumped to {}", agent_name, file);
+            }
+        }
+        let mut attempt = 0u32;
 
         loop {
-            let response = self
+            attempt += 1;
+            let mut req_builder = self
                 .client
                 .post(format!("{}/v1/messages", self.config.api_base_url))
-                .header("x-api-key", &self.config.api_key)
                 .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
-                .json(&request)
-                .send()
-                .await
-                .context("Failed to send API request")?;
-
-            let status = response.status();
-
-            if status.is_success() {
-                let api_response: ApiResponse = response
-                    .json()
-                    .await
-                    .context("Failed to parse API response")?;
-                return self.extract_code(api_response);
+                .header("content-type", "application/json");
+            match &self.config.auth {
+                crate::config::AuthCredential::ApiKey(k) => {
+                    req_builder = req_builder.header("x-api-key", k);
+                }
+                crate::config::AuthCredential::Bearer { token, .. } => {
+                    req_builder = req_builder
+                        .header("authorization", format!("Bearer {}", token))
+                        .header("anthropic-beta", "oauth-2025-04-20");
+                }
             }
+            let send_result = req_builder.json(&request).send().await;
 
-            // Retry on rate limit (429) or overloaded (529)
-            if (status.as_u16() == 429 || status.as_u16() == 529) && retries < max_retries {
-                retries += 1;
-                let body = response.text().await.unwrap_or_default();
-                eprintln!(
-                    "[api] {} (attempt {}/{}): {}",
-                    status, retries, max_retries, body
-                );
-                let backoff = Duration::from_secs(2u64.pow(retries as u32));
-                tokio::time::sleep(backoff).await;
-                continue;
+            let (kind, max, wait, detail) = match send_result {
+                Ok(resp) if resp.status().is_success() => {
+                    let raw: serde_json::Value = resp
+                        .json()
+                        .await
+                        .context("Failed to parse API response")?;
+                    if let Some(trace) = &self.trace {
+                        let (req, resp) = if sensitive_values.is_empty() {
+                            (serde_json::to_value(&request).unwrap_or_default(), raw.clone())
+                        } else {
+                            // Scrub at store time so the ring buffer never holds
+                            // the real values — feedback uploads are then safe.
+                            let scrub = |v: &serde_json::Value| {
+                                let mut s = serde_json::to_string(v).unwrap_or_default();
+                                for val in sensitive_values {
+                                    // Replace both the raw value and its
+                                    // JSON-escaped form (covers values
+                                    // embedded in text blocks vs. as JSON
+                                    // string literals).
+                                    s = s.replace(val, "<SENSITIVE, REDACTED>");
+                                    if let Ok(esc) = serde_json::to_string(val) {
+                                        let esc = esc.trim_matches('"');
+                                        if esc != val {
+                                            s = s.replace(esc, "<SENSITIVE, REDACTED>");
+                                        }
+                                    }
+                                }
+                                serde_json::from_str(&s).unwrap_or(serde_json::Value::Null)
+                            };
+                            (scrub(&serde_json::to_value(&request).unwrap_or_default()), scrub(&raw))
+                        };
+                        trace.lock().unwrap().push(TraceEntry {
+                            agent: agent_name.to_string(),
+                            turn,
+                            request: req,
+                            response: resp,
+                        });
+                    }
+                    let api_response: ApiResponse = serde_json::from_value(raw)
+                        .context("Failed to decode API response")?;
+                    return self.extract_code(api_response);
+                }
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let retry_after = resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .map(Duration::from_secs);
+                    let body = resp.text().await.unwrap_or_default();
+                    match status {
+                        401 if self.config.auth.is_bearer() => bail!(
+                            "API returned 401 in bearer mode — token likely expired or revoked. \
+                             Restart with a fresh CLAUDE_SERVER_BEARER_TOKEN. Body: {}",
+                            body
+                        ),
+                        529 => ("overloaded", 20, backoff(attempt, 60), body),
+                        429 => ("rate-limited", 8, retry_after.unwrap_or_else(|| backoff(attempt, 60)), body),
+                        500..=599 => ("server error", 5, backoff(attempt, 30), body),
+                        s => bail!("API returned {}: {}", s, body),
+                    }
+                }
+                Err(e) => ("network", 8, backoff(attempt, 30), e.to_string()),
+            };
+
+            if attempt >= max {
+                bail!("API {} after {} attempts: {}", kind, attempt, detail);
             }
-
-            let body = response.text().await.unwrap_or_default();
-            bail!("API returned {}: {}", status, body);
+            eprintln!(
+                "[api] {} (attempt {}/{}), retrying in {:?}: {}",
+                kind, attempt, max, wait, detail
+            );
+            tokio::time::sleep(wait).await;
         }
     }
 
@@ -199,21 +330,48 @@ impl ApiClient {
             }),
         }];
 
-        // Build message content. If there are attachments, use block form with
-        // the rendered text first (preserves KV cache prefix) then attachments.
-        // Otherwise, plain text — byte-identical to before, no cache churn.
-        let content = if rendered.attachments.is_empty() {
-            MessageContent::Text(rendered.text.clone())
-        } else {
-            let mut blocks: Vec<ContentBlock> = Vec::with_capacity(rendered.attachments.len() + 1);
+        // Block order: [prefix_text, prefix_images..., seg1+cc, seg2+cc, tail, tail_images...].
+        // The first cache_control breakpoint (on seg1) caches everything before it
+        // — including prefix_text and prefix_images. That's the stable per-role
+        // content for templated child agents.
+        let prefix_len = rendered.prefix_text.len();
+        let cached_len: usize = rendered.cached_segments.iter().map(String::len).sum();
+        let tail = &rendered.text[prefix_len + cached_len..];
+        let mut blocks: Vec<ContentBlock> = Vec::new();
+
+        if !rendered.prefix_text.is_empty() {
             blocks.push(ContentBlock::Text {
-                text: rendered.text.clone(),
+                text: rendered.prefix_text.clone(),
+                cache_control: None,
             });
-            for att in &rendered.attachments {
-                blocks.push(resolve_attachment(att));
+        }
+        let n_prefix = rendered.prefix_attachments.len();
+        for (i, att) in rendered.prefix_attachments.iter().enumerate() {
+            let mut block = resolve_attachment(att);
+            // Breakpoint on the last prefix attachment guarantees the static
+            // region (system + prefix_text + all images) caches even if seg1's
+            // growing content doesn't prefix-match across block boundaries.
+            if i == n_prefix - 1 {
+                block.set_cache_control(CacheControl { control_type: "ephemeral".to_string() });
             }
-            MessageContent::Blocks(blocks)
-        };
+            blocks.push(block);
+        }
+        for seg in &rendered.cached_segments {
+            blocks.push(ContentBlock::Text {
+                text: seg.clone(),
+                cache_control: Some(CacheControl {
+                    control_type: "ephemeral".to_string(),
+                }),
+            });
+        }
+        blocks.push(ContentBlock::Text {
+            text: tail.to_string(),
+            cache_control: None,
+        });
+        for att in &rendered.attachments {
+            blocks.push(resolve_attachment(att));
+        }
+        let content = MessageContent::Blocks(blocks);
 
         let messages = vec![Message {
             role: "user".to_string(),
@@ -279,20 +437,16 @@ impl ApiClient {
             .content
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
             .join("\n");
 
         bail!(
-            "No execute tool_use in response (stop_reason={}). Text: {}",
+            "No execute tool_use in response (stop_reason={}). Text: {}...",
             response.stop_reason,
-            if text.len() > 200 {
-                format!("{}...", &text[..200])
-            } else {
-                text
-            }
+            crate::renderer::trunc(&text, 200),
         );
     }
 }
@@ -320,7 +474,7 @@ mod tests {
 
         let block = resolve_attachment(&Attachment::new(&tmp));
         match block {
-            ContentBlock::Text { text } => {
+            ContentBlock::Text { text, .. } => {
                 assert!(text.contains("<attachment path="));
                 assert!(text.contains(r#"{"camera": "front", "confidence": 0.92}"#));
             }
@@ -348,7 +502,7 @@ mod tests {
 
         let block = resolve_attachment(&Attachment::new(&tmp));
         match block {
-            ContentBlock::Image { source } => {
+            ContentBlock::Image { source, .. } => {
                 assert_eq!(source.source_type, "base64");
                 assert_eq!(source.media_type, "image/png");
                 // Decode and verify it's the same bytes
@@ -364,7 +518,7 @@ mod tests {
     fn test_resolve_attachment_not_found() {
         let block = resolve_attachment(&Attachment::new("/nonexistent/xyz.jpg"));
         match block {
-            ContentBlock::Text { text } => {
+            ContentBlock::Text { text, .. } => {
                 assert!(text.contains("[attachment read error"));
                 assert!(text.contains("/nonexistent/xyz.jpg"));
             }

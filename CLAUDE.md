@@ -54,7 +54,7 @@ See `INTERPRETER.md` for details on the Python integration.
 | `config.rs` | Config from env vars (`ANTHROPIC_API_KEY`, model, ports, paths) |
 | `types.rs` | Core types: WorkQueue, EventHistory, TimerManager, ProcessManager, Memory, HarnessState, API request/response types |
 | `core_loop.rs` | Thin wrapper: creates an `AgentLoop` with parent permissions and runs it |
-| `python.rs` | PyO3 executor: #[pyclass] wrappers for work_queue, memory, timers, history, harness functions. SideEffectCollector pattern. |
+| `python.rs` | PyO3 executor: #[pyclass] wrappers owning `Mutex<T>` of cloned state components. Clone-and-mutate for transactional semantics; ExternalEffects for irreversible ops. Hook executor. |
 | `renderer.rs` | Serialize HarnessState into XML-formatted context text for the API call |
 | `api_client.rs` | Claude Messages API client (reqwest, retry logic, tool_use extraction) |
 | `db.rs` | SQLite persistence (state as JSON blob, process output, outbound messages) |
@@ -64,9 +64,12 @@ See `INTERPRETER.md` for details on the Python integration.
 | `http_server.rs` | Axum HTTP API: POST /message, POST /event, GET /status, GET /messages/:chat_id, GET /messages/:chat_id/stream (SSE), POST /shutdown |
 | `chat.rs` | Chat UI subcommand: serves embedded HTML with API URL injection |
 | `chat.html` | Single-file HTML/CSS/JS chat interface (embedded via include_str!) |
+| `tls.rs` | HTTPS for the chat UI: static PEM files, or ACME (Let's Encrypt) with HTTP-01 / DNS-01 verification. Deadline-driven renewal, hot cert reload. |
 | `source_dump.rs` | `source` subcommand: dumps/extracts the embedded source tarball |
-| `bridges/` | `bridge` subcommand: messaging relay daemons (stdio, signal, telegram, slack, discord). Shared `relay_loop` in mod.rs. |
-| `feedback.rs` | `feedback` (client) and `feedback-server` subcommands. Agents POST bug reports to a central server (default feedback.yager.io). |
+| `bridges/` | `bridge` subcommand: messaging relay daemons (stdio, signal, telegram, slack, discord, email, agentchat). Shared `relay_loop` in mod.rs with bidirectional attachment support. |
+| `feedback.rs` | `feedback`/`feedback-server` subcommands. Agents POST bug reports to feedback.yager.io. Also hosts `/chat/ws` — cross-deployment agent chat (salted-SHA256 auth, bounded queues, kick-on-reauth, 30s server ping). |
+| `watchers/` | `watch` subcommand: one-directional event sources (fs, mqtt, imap). Shared `post_event` helper in mod.rs. |
+| `webhook_proxy.rs` | `webhook-proxy` subcommand: HMAC-validated public ingress (GitHub, Slack, generic bearer) that forwards to `/event`. |
 | `system_prompt.txt` | System prompt sent to Claude on every API call |
 | `build.rs` | Discovers Python LIBDIR at build time, bakes rpath into binary |
 | `INTERPRETER.md` | How the Python interpreter integration works (PyO3, side effects, etc.) |
@@ -79,16 +82,24 @@ and return results via work queue items. Built-in Python tools must execute in
 microseconds. This is why there's no `http_get()` — use `shell_exec("curl", ...)`
 with `block_for` instead.
 
-**Side effect collection**: Python scripts don't execute side effects directly.
-All mutations (memory writes, timer creates, message sends, process spawns) are
-collected into a `SideEffectCollector` during execution. If the script crashes,
-nothing is applied. On success, `core_loop::apply_side_effects()` applies them
-atomically to the authoritative state.
+**Clone-and-mutate**: Per-turn, clone `HarnessState`, move components into
+pyclass `Mutex<T>` fields (PyMemory owns the HashMap, PyWorkQueue owns the
+WorkQueue, etc.). Mutations happen directly on the clone — `memory[k]=v` locks
+and inserts, `list_hooks()` reads the same Mutex `register_hook()` wrote to.
+Read-after-write works without any snapshot/collector divergence. On commit,
+`Py::borrow()` + `mem::take()` extract the mutated components back into state.
+On error, clone drops — original untouched.
 
-**Synchronous ID assignment**: The `SideEffectCollector` owns the `IdGenerator`
-during Python execution. When Claude calls `timers.add()` or `shell_exec()`,
-the #[pyclass] method calls `id_gen.next()` synchronously and returns the ID.
-After execution, the updated generator is moved back into HarnessState.
+**External effects deferred**: Operations that can't be un-done by dropping a
+clone (OS process spawn, message broadcast, child fork, SQLite pin) go into
+`ExternalEffects`, applied after commit. `shell_exec` adds the `ManagedProcess`
+bookkeeping entry to the txn's process_manager same-turn (so `processes_list()`
+shows it) but defers the actual `tokio::process::Command::spawn()`.
+
+**Synchronous ID assignment**: `IdGenerator` wrapped in `Arc<Mutex<>>`, shared
+between PyTimers and PyHarness. `.next()` called synchronously during script
+execution. On commit the advanced generator swaps in; on error it rolls back
+with the clone.
 
 **Single-message context rebuild**: Each API call is a fresh conversation with
 one user message containing the full rendered context. No multi-turn replay.
@@ -123,8 +134,10 @@ globally unique name and lineage (e.g., `"api-checker, child of plan-builder,
 child of root"`). The root agent is always named `"root"`. Names are registered
 atomically via `AgentRegistry` — if any name collides, the entire fork fails.
 `ChildSettings` fields: `name`, `task`, `model` (Optional, inherits parent),
-`max_turns` (default 20), `can_compact` (default True), `attach` (list
-of file paths to attach on the child's first turn — see Attachments below).
+`max_turns` (default 20), `can_compact` (default True), `attach` (list of
+file paths → View item on child's queue), `prefix_context` + `prefix_attach`
+(stable role definition — renders before event_history in the cached region;
+use for repeated spawns of the same role so the prefix caches across forks).
 Children can compact their own context. `message_agent(name, content, priority=6)`
 enables inter-agent messaging (parent↔child, sibling↔sibling). If any message
 targets a nonexistent agent, the entire turn's side effects roll back. Children
@@ -133,20 +146,29 @@ with `child_name`, `result` (the kwargs dict), `turns_used`, `success`, and `sum
 Max 3 concurrent children.
 `child_depth_remaining: u32` controls recursion depth.
 
-**Attachments (vision + large-file injection)**: `attach(path)` queues a
-file to appear as a content block on the agent's *next* turn. Images (`.jpg`,
-`.jpeg`, `.png`, `.gif`, `.webp`) become vision blocks the model can see; any
-other file becomes a text block. Attachments are ephemeral: visible exactly once,
-not in `HarnessState`, not persisted, not in history. Storage lives in
-`AgentLoop.pending_attachments` which is `std::mem::take`'d into each turn's
-render. File paths (not bytes) are stored in `SideEffectCollector` — encoding
-is deferred to `api_client::resolve_attachment()`. `ChildSettings.attach`
-seeds a child's first-turn attachments via the same mechanism.
+**Attachments (vision + large-file injection)**: `view(*paths)` pushes a
+`WorkItemType::View` item at priority 10. When a View item is at queue head,
+`renderer::render_context` emits its paths as content blocks (images →
+vision, else text; encoding via `api_client::resolve_attachment()`). Content
+stays visible until the item is popped — no separate loop state, so the idle
+check is simply `queue.is_empty()`. `WorkItem.attachments: Vec<String>` is
+metadata-only (rendered as queue text); bridges populate it (e.g. Signal
+images) and the agent promotes paths via `view()`. `ChildSettings.attach`
+pushes a View item to the child's queue.
 
 **Auto-injected process env**: Every process spawned via `shell_exec()` gets
-`CLAUDE_SERVER_EVENT_URL` in its environment (computed from `Config.listen_addr`).
-Watcher scripts can `curl -X POST "$CLAUDE_SERVER_EVENT_URL" ...` to send events
-back to the agent without hardcoding the listen address.
+`CLAUDE_SERVER_EVENT_URL` (the `/event` endpoint) and `CLAUDE_SERVER_AGENT_NAME`
+(the spawning agent's name). POST `/event` with `"agent":"<name>"` in the body
+routes to that agent via the registry; omit it to route to root. Watchers spawned
+by a child should include `"agent":"$CLAUDE_SERVER_AGENT_NAME"` so events go
+straight to the child — root never wakes.
+
+**Message references + reactions**: `UserMessage` work items carry an optional
+`message_ref` (bridge-native ID: Signal timestamp, Discord snowflake, Slack ts).
+`send_message(chat_id, content, react_to=ref)` sends a reaction instead of a
+message. Threaded through `Inbound`/`Outbound` structs in bridges, `BroadcastMsg`,
+SSE. Signal bridge maps to `sendReaction` jsonRpc; other bridges can wire up
+their native reaction APIs.
 
 **Harness subcommands + `harness_bin`**: The binary bundles helper subcommands
 (`source`, `bridge`) that the agent invokes via `shell_exec(cmd=harness_bin, ...)`.
@@ -158,24 +180,48 @@ stdio, ...) to the existing `/message` + SSE endpoints — one `chat_id` per bri
 **Pinned memory (self-improving system prompt)**: `memory.pin(key, content)` writes
 to a shared SQLite tier (`pinned_memory` table) and injects into the system prompt
 (cached via `cache_control: ephemeral`). Shared across all agents and sessions.
-`memory.get(k)` checks local first, then pinned. `memory.unpin(k)`, `memory.list_pinned()`.
-Pinned entries are strings (render as markdown in the system prompt). Pinned size is
-shown in context metadata for self-regulation.
+Renders in full as markdown — unlike local memory's ~120-char truncation in
+`<agent_state>`. `memory.get(k)` checks local first, then pinned. Size shown in
+context metadata for self-regulation.
+
+**Sensitive memory redaction**: `memory.mark_sensitive(key)` adds the key to
+`HarnessState.sensitive_keys`. At API-trace store time, the value is string-replaced
+with `<SENSITIVE, REDACTED>` across request and response JSON (both raw and
+JSON-escaped forms; skips values <8 chars). Agent's live context unchanged — only
+the ring buffer, and thus `feedback --with-api-trace` uploads, are scrubbed.
+
+**Agent-facing changelog**: `HarnessState.last_harness_version` compared against
+`CARGO_PKG_VERSION` on resume. `AGENT_CHANGELOG: &[(&str, &str)]` in `main.rs`
+keys entries by the version that introduced them; `changelog_since()` range-selects
+so a 0.2→0.5 jump shows exactly the 0.3/0.4/0.5 entries. Result goes into
+`AgentStartup { changelog: Some(...) }`. Lets deployed agents self-discover new
+capabilities without operator intervention. Entries are action-oriented; bump the
+Cargo version and add an entry when shipping agent-facing features.
+
+**UTF-8-safe truncation**: `renderer::trunc(s, max_bytes)` snaps back to the
+nearest `is_char_boundary` before slicing. Bare `&s[..n]` panics mid-codepoint —
+found via a crash loop on a memory value with `→` at exactly the cut point.
 
 **Streaming responses (SSE)**: A `tokio::sync::broadcast` channel delivers
 messages in real time. The SSE endpoint (`GET /messages/:chat_id/stream`)
-pushes `message` and `status` events to connected clients. The chat UI uses
-`EventSource` instead of polling.
+pushes `message` and `status` events to connected clients. A chat_id ending in
+`*` matches by prefix (e.g. `agentchat:*` for bridge routing); the full
+chat_id is included in the SSE data.
 
 ## HTTP API
 
 ```
-POST /message                    { chat_id?, user, content } → { status, chat_id }
-POST /event                      { source, type, data, priority? } → { status }
+POST /message                    { chat_id?, user, content, attachments?, message_ref? } → { status, chat_id }
+POST /event                      { source, type, data, agent?, priority? } → { status }
 GET  /status                     → { status, model }
 GET  /messages/:chat_id          → { messages: [...] }
-GET  /messages/:chat_id/stream   SSE stream (message + status events)
+GET  /messages/:chat_id/stream   SSE stream (prefix match if chat_id ends in *)
+GET  /api-trace                  → last N request/response pairs (sensitive values pre-scrubbed)
 GET  /cost                       → { input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, estimated_cost_usd }
+GET  /metrics/turns?limit=N      → { entries: [{ts, agent, input/output/cache tokens, cost_usd}, ...], total_in_log, capacity }
+GET  /metrics/rate               → { last_5m, last_1h, last_24h } — rolling sums; window_covered_secs shows buffer coverage
+GET  /dashboard                  → embedded HTML UI (live view of all agents)
+GET  /dashboard/state            → { agent_name: AgentSnapshot, ... } — queue, history tail, memory, timers, processes, hooks, usage
 POST /shutdown                   → { status }
 ```
 
@@ -185,7 +231,10 @@ All endpoints have CORS enabled (permissive). The chat UI uses these directly.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | (required) | Anthropic API key |
+| `ANTHROPIC_API_KEY` | (one of these required) | Console API key — `x-api-key` auth, production path |
+| `CLAUDE_SERVER_BEARER_TOKEN` | (one of these required) | OAuth bearer token — dev-only, `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20`. Mutually exclusive with `ANTHROPIC_API_KEY`. Requires TTY + typed "I AGREE" at startup unless `CLAUDE_SERVER_AUTH_ACK=1`. On 401 the daemon exits rather than retry (assumes token expired). |
+| `CLAUDE_SERVER_AUTH_ACK` | (unset) | Set to `1` to bypass the Bearer-mode TTY + acknowledgment prompt (for scripted test harnesses only). |
+| `CLAUDE_SERVER_USAGE_LOG_CAPACITY` | `1000` | Ring buffer size for per-turn usage entries exposed via `/metrics/turns` and `/metrics/rate`. |
 | `CLAUDE_SERVER_MODEL` | `claude-opus-4-6` | Model to use |
 | `CLAUDE_SERVER_LISTEN` | `127.0.0.1:3000` | API listen address |
 | `CLAUDE_SERVER_DB` | `claude-server.db` | SQLite database path |
@@ -199,3 +248,12 @@ All endpoints have CORS enabled (permissive). The chat UI uses these directly.
 | `CLAUDE_SERVER_COST_OUTPUT` | `15.0` | Output token cost per million tokens (USD) |
 | `CLAUDE_SERVER_COST_CACHE_READ` | `0.30` | Cache read token cost per million tokens (USD) |
 | `CLAUDE_SERVER_COST_CACHE_WRITE` | `3.75` | Cache write token cost per million tokens (USD) |
+| `CLAUDE_SERVER_CACHE_STRIDE` | `5` | Base stride for geometric cache-tier alignment |
+| `CLAUDE_SERVER_CACHE_TIERS` | `2` | Number of geometric cache tiers (capped by 4-breakpoint limit) |
+| `CLAUDE_SERVER_API_TRACE_SIZE` | `10` | Ring buffer size for /api-trace (0 disables) |
+| `CLAUDE_SERVER_FEEDBACK_URL` | `https://feedback.yager.io:3001/feedback` | Where `feedback` subcommand POSTs |
+| `CLAUDE_SERVER_FEEDBACK_ADMIN_TOKEN` | (none) | Bearer token for feedback-server GET/DELETE |
+
+Auto-injected into spawned process env (not daemon config):
+- `CLAUDE_SERVER_EVENT_URL` — the `/event` endpoint
+- `CLAUDE_SERVER_AGENT_NAME` — name of the agent that spawned the process

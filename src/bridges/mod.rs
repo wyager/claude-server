@@ -1,4 +1,6 @@
+mod agentchat;
 mod discord;
+mod email;
 mod signal;
 mod slack;
 mod stdio;
@@ -15,7 +17,7 @@ fn default_api_url() -> String {
         .unwrap_or_else(|_| "http://127.0.0.1:3000".into())
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct ApiUrl {
     /// Claude Server API URL (env: CLAUDE_SERVER_BRIDGE_API)
     #[arg(long, default_value_t = default_api_url())]
@@ -34,6 +36,10 @@ pub enum BridgeCmd {
     Slack(slack::SlackArgs),
     /// Relay via Discord Gateway websocket
     Discord(discord::DiscordArgs),
+    /// Relay via IMAP IDLE (receive) + SMTP (send)
+    Email(email::EmailArgs),
+    /// Cross-deployment agent-to-agent chat via the feedback server
+    Agentchat(agentchat::AgentChatArgs),
 }
 
 pub fn run(cmd: BridgeCmd) {
@@ -43,31 +49,62 @@ pub fn run(cmd: BridgeCmd) {
         BridgeCmd::Telegram(a) => telegram::run(a),
         BridgeCmd::Slack(a) => slack::run(a),
         BridgeCmd::Discord(a) => discord::run(a),
+        BridgeCmd::Email(a) => email::run(a),
+        BridgeCmd::Agentchat(a) => agentchat::run(a),
     }
 }
 
 /// Core relay loop shared by all bridges.
 ///
-/// - `inbound_rx`: text messages received from the external service
-/// - `outbound`: called for each agent message pulled from the SSE stream
+pub struct Inbound {
+    /// Full chat_id including the bridge prefix (e.g. "signal:+15551234567").
+    /// Bridges construct this from the message source so a single bridge
+    /// instance can handle multiple peers.
+    pub chat_id: String,
+    pub text: String,
+    pub attachments: Vec<String>,
+    /// Bridge-native message ID (Signal timestamp, Discord snowflake, etc.)
+    /// for the agent to reference in reactions/replies.
+    pub message_ref: Option<String>,
+}
+
+/// Outbound message from agent to bridge. When `react_to` is set, the bridge
+/// sends a reaction (emoji in `content`) to the referenced message instead
+/// of a regular message. `chat_id` carries the full destination — bridges
+/// parse the recipient from the suffix (e.g. strip "signal:" to get the
+/// phone number).
+pub struct Outbound {
+    pub chat_id: String,
+    pub content: String,
+    pub attachments: Vec<String>,
+    pub react_to: Option<String>,
+}
+
+/// - `sse_pattern`: subscription pattern for the SSE stream. Use a prefix
+///   ending in `*` (e.g. `signal:*`) so one bridge handles all peers in its
+///   namespace. The outbound closure receives the full chat_id to parse the
+///   recipient from.
+/// - `inbound_rx`: messages received from the external service. Each carries
+///   its own chat_id (e.g. `signal:{src}`) so the agent knows who sent it.
+/// - `outbound`: called for each agent message pulled from the SSE stream.
 ///
 /// Runs until either side closes or errors.
 pub async fn relay_loop<F, Fut>(
     api_url: &str,
-    chat_id: &str,
+    sse_pattern: &str,
     user: &str,
-    mut inbound_rx: mpsc::UnboundedReceiver<String>,
+    mut inbound_rx: mpsc::UnboundedReceiver<Inbound>,
     outbound: F,
 ) -> Result<()>
 where
-    F: Fn(String) -> Fut,
+    F: Fn(Outbound) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
     let client = reqwest::Client::new();
     let msg_url = format!("{}/message", api_url);
-    let sse_url = format!("{}/messages/{}/stream", api_url, chat_id);
+    let sse_url = format!("{}/messages/{}/stream", api_url, sse_pattern);
 
-    eprintln!("[bridge] chat_id={} api_url={}", chat_id, api_url);
+    eprintln!("[bridge] sse_pattern={} api_url={}", sse_pattern, api_url);
 
     // Outbound: SSE → external service
     let resp = client
@@ -88,10 +125,16 @@ where
     loop {
         tokio::select! {
             // Inbound: external → POST /message
-            maybe_text = inbound_rx.recv() => {
-                match maybe_text {
-                    Some(text) => {
-                        let body = json!({ "chat_id": chat_id, "user": user, "content": text });
+            maybe_msg = inbound_rx.recv() => {
+                match maybe_msg {
+                    Some(msg) => {
+                        let body = json!({
+                            "chat_id": msg.chat_id,
+                            "user": user,
+                            "content": msg.text,
+                            "attachments": msg.attachments,
+                            "message_ref": msg.message_ref,
+                        });
                         match client.post(&msg_url).json(&body).send().await {
                             Ok(r) if r.status().is_success() => {}
                             Ok(r) => eprintln!("[bridge] POST /message returned {}", r.status()),
@@ -122,9 +165,25 @@ where
                             }
                             if pending_event == "message" && !pending_data.is_empty() {
                                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pending_data) {
-                                    if let Some(content) = v.get("content").and_then(|c| c.as_str()) {
-                                        if let Err(e) = outbound(content.to_string()).await {
-                                            eprintln!("[bridge] outbound send failed: {}", e);
+                                    if let (Some(content), Some(msg_chat_id)) = (
+                                        v.get("content").and_then(|c| c.as_str()),
+                                        v.get("chat_id").and_then(|c| c.as_str()),
+                                    ) {
+                                        let attachments: Vec<String> = v.get("attachments")
+                                            .and_then(|a| a.as_array())
+                                            .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+                                            .unwrap_or_default();
+                                        let react_to = v.get("react_to")
+                                            .and_then(|r| r.as_str())
+                                            .map(String::from);
+                                        let out = Outbound {
+                                            chat_id: msg_chat_id.to_string(),
+                                            content: content.to_string(),
+                                            attachments,
+                                            react_to,
+                                        };
+                                        if let Err(e) = outbound(out).await {
+                                            eprintln!("[bridge] outbound send failed: {:#}", e);
                                         }
                                     }
                                 }

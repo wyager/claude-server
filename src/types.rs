@@ -75,6 +75,11 @@ pub enum WorkItemType {
         chat_id: String,
         user: String,
         content: String,
+        /// Bridge-native message identifier for reactions/replies. Signal:
+        /// timestamp (ms), Discord: snowflake, Slack: ts, Telegram: message_id.
+        /// Agent passes this back via send_message(react_to=...).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_ref: Option<String>,
     },
     TimerFired {
         timer_id: AgentId,
@@ -87,12 +92,19 @@ pub enum WorkItemType {
         exit_code: i32,
         #[serde(skip_serializing_if = "Option::is_none")]
         output_preview: Option<String>,
+        /// The description set at shell_exec time. Looked up from
+        /// ProcessManager by pid when the completion event arrives, so
+        /// hooks can correlate a completion back to what spawned it.
+        #[serde(default)]
+        description: String,
     },
     ProcessFailed {
         pid: AgentId,
         error: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         output_preview: Option<String>,
+        #[serde(default)]
+        description: String,
     },
     ProcessTimeout {
         pid: AgentId,
@@ -103,6 +115,8 @@ pub enum WorkItemType {
         turns_used: u32,
         success: bool,
         summary: String,
+        cost_usd: f64,
+        cache_hit_pct: u8,
     },
     AgentMessage {
         from: String,
@@ -113,7 +127,29 @@ pub enum WorkItemType {
         event_type: String,
         data: serde_json::Value,
     },
+    /// Request to render file paths as content blocks. The only item type
+    /// whose attachments are emitted as vision/text blocks — and only when
+    /// this item is at the head of the queue. Created by `view()`.
+    View {
+        paths: Vec<String>,
+    },
     Compaction,
+    AgentStartup {
+        /// Agent-facing changelog shown when the harness version changed
+        /// since the last run. None if version unchanged or first run.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        changelog: Option<String>,
+    },
+    /// A hook's process() raised. The original event is preserved so the
+    /// agent can diagnose and the data isn't lost.
+    HookException {
+        hook_name: String,
+        error: String,
+        /// The WorkItem the hook was processing, serialized as JSON. Stored
+        /// as a Value rather than a Box<WorkItem> to avoid recursive type
+        /// issues and keep the rendered form compact.
+        original: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,42 +158,55 @@ pub struct WorkItem {
     pub priority: u8,
     pub time: DateTime<Utc>,
     pub item_type: WorkItemType,
+    /// File paths associated with this item — rendered as text metadata in
+    /// the queue view, never as content blocks. To actually see a file,
+    /// the agent calls `view(path)` which creates a View item.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
 }
 
+
+/// Agent-registered event hook. Runs before a WorkItem enters the queue.
+/// `match_expr` and `process` are Python source strings (not lambdas — no
+/// closures, trivially serializable). Both syntax-checked at registration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueueFilter {
+pub struct Hook {
     pub name: String,
-    pub regex: String,
+    pub priority: i32,
+    /// Python expression with `e` bound to the WorkItem. Evaluated for
+    /// every incoming event (in a single interpreter pass across all hooks).
+    pub match_expr: String,
+    /// Python script with `e` bound. Returns `None` (consume), `e` or a
+    /// modified dict (pass/modify), or raises (→ HookException). Runs with
+    /// a restricted API: fire-and-forget side effects only, no block_for.
+    pub process: String,
+    pub timeout_ms: u64,
+}
+
+/// Per-hook activity counters. NOT rendered in <agent_state> — that would
+/// thrash the cache on every event. Surfaced via a SystemAlert when the
+/// agent transitions idle→active, then reset.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HookStats {
+    pub fired: u64,
+    pub consumed: u64,
+    pub passed: u64,
+    pub raised: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkQueue {
     /// Sorted by (priority DESC, time ASC)
     items: Vec<WorkItem>,
-    filters: Vec<QueueFilter>,
 }
 
 impl WorkQueue {
     pub fn new() -> Self {
-        Self {
-            items: Vec::new(),
-            filters: Vec::new(),
-        }
+        Self { items: Vec::new() }
     }
 
     /// Insert a work item, maintaining sort order.
-    /// Returns false if the item was filtered out.
-    pub fn push(&mut self, item: WorkItem) -> bool {
-        if let WorkItemType::UserMessage { ref content, .. } = item.item_type {
-            for filter in &self.filters {
-                if let Ok(re) = regex::Regex::new(&filter.regex) {
-                    if re.is_match(content) {
-                        return false;
-                    }
-                }
-            }
-        }
-
+    pub fn push(&mut self, item: WorkItem) {
         let pos = self.items.partition_point(|existing| {
             if existing.priority != item.priority {
                 existing.priority > item.priority
@@ -166,7 +215,6 @@ impl WorkQueue {
             }
         });
         self.items.insert(pos, item);
-        true
     }
 
     pub fn remove(&mut self, id: &AgentId) -> Option<WorkItem> {
@@ -193,13 +241,6 @@ impl WorkQueue {
         self.items.get(index)
     }
 
-    pub fn add_filter(&mut self, filter: QueueFilter) {
-        self.filters.push(filter);
-    }
-
-    pub fn remove_filter(&mut self, name: &str) {
-        self.filters.retain(|f| f.name != name);
-    }
 }
 
 // ---- Event History ----
@@ -265,6 +306,40 @@ impl EventHistory {
         }
         let start = len.saturating_sub(self.modification_window);
         Some(self.entries[start].id())
+    }
+
+    /// Index of the first modifiable entry. Entries before this are immutable
+    /// and safe to include in the cached prefix.
+    pub fn immutable_count(&self) -> usize {
+        self.entries.len().saturating_sub(self.modification_window)
+    }
+
+    /// Geometric-tier split points for prompt-cache breakpoints.
+    ///
+    /// Anthropic's cache requires 100%-identical content (no prefix matching),
+    /// so a breakpoint that moves every turn never hits. Instead we align
+    /// breakpoints to positions that stay put for many turns, then advance
+    /// in batches. Tier `i` (0-indexed from coldest) advances every
+    /// `stride^(tiers-i)` turns:
+    ///
+    ///   tiers=2, stride=5: splits at [floor(n/25)*25, floor(n/5)*5]
+    ///     tier-0 advances every 25 turns, tier-1 every 5 turns
+    ///   tiers=3, stride=3: splits at [×27, ×9, ×3]
+    ///
+    /// The coldest tier holds most content in cache_read (10% cost); the
+    /// hottest tier keeps the uncached tail small (~stride entries). See
+    /// feedback #23 / the 2026-03-24 Opus trace that drove this design.
+    pub fn cache_splits(&self, stride: usize, tiers: usize) -> Vec<usize> {
+        let n = self.immutable_count();
+        if stride == 0 || tiers == 0 {
+            return vec![n];
+        }
+        let mut splits = Vec::with_capacity(tiers);
+        for i in 0..tiers {
+            let align = stride.pow((tiers - i) as u32);
+            splits.push((n / align) * align);
+        }
+        splits
     }
 
     pub fn is_modifiable(&self, id: &AgentId) -> bool {
@@ -373,6 +448,7 @@ impl TimerManager {
                                 every: None,
                                 description: timer.description.clone(),
                             },
+                            attachments: Vec::new(),
                         });
                         to_remove.push(timer.id.clone());
                     }
@@ -392,6 +468,7 @@ impl TimerManager {
                                 every: Some(*every),
                                 description: timer.description.clone(),
                             },
+                            attachments: Vec::new(),
                         });
                         // Don't advance next_fire — wait for acknowledge_timer()
                         timer.pending_ack = true;
@@ -464,7 +541,7 @@ pub struct ManagedProcess {
     pub os_pid: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProcessManager {
     processes: Vec<ManagedProcess>,
 }
@@ -491,6 +568,13 @@ impl ProcessManager {
     pub fn processes(&self) -> &[ManagedProcess] {
         &self.processes
     }
+
+    /// Consume and yield all entries. Used to merge a hook's process_manager
+    /// (which started empty, so contains only hook-created entries) into the
+    /// real state.
+    pub fn into_processes(self) -> Vec<ManagedProcess> {
+        self.processes
+    }
 }
 
 // ---- Memory ----
@@ -510,6 +594,25 @@ pub struct HarnessState {
     pub memory: Memory,
     #[serde(default)]
     pub memory_priorities: HashMap<String, u8>,
+    /// Keys whose values are scrubbed from the API trace ring buffer before
+    /// storage. The agent still sees real values in its live context; only
+    /// the trace (and thus `feedback --with-api-trace` uploads) is redacted.
+    #[serde(default)]
+    pub sensitive_keys: std::collections::HashSet<String>,
+    /// Harness version that last wrote this state. On mismatch at startup,
+    /// the AgentStartup item includes the agent-facing changelog so the
+    /// agent learns about new capabilities without operator intervention.
+    #[serde(default)]
+    pub last_harness_version: Option<String>,
+    /// Agent-registered event hooks. Checked before each WorkItem enters
+    /// the queue — first match (by priority) runs its process() script.
+    #[serde(default)]
+    pub hooks: Vec<Hook>,
+    /// Per-hook activity counters since the agent's last wake. Deliberately
+    /// NOT rendered in <agent_state> — that would thrash the cache every
+    /// event. Surfaced via SystemAlert on idle→active, then reset.
+    #[serde(default)]
+    pub hook_stats: HashMap<String, HookStats>,
     pub id_generator: IdGenerator,
     pub last_input_tokens: u64,
     pub context_window: u64,
@@ -525,6 +628,10 @@ impl HarnessState {
             process_manager: ProcessManager::new(),
             memory: HashMap::new(),
             memory_priorities: HashMap::new(),
+            sensitive_keys: std::collections::HashSet::new(),
+            last_harness_version: None,
+            hooks: Vec::new(),
+            hook_stats: HashMap::new(),
             id_generator: IdGenerator::new(),
             last_input_tokens: 0,
             context_window,
@@ -555,6 +662,13 @@ impl Attachment {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderConfig {
+    /// Base stride for cache breakpoint alignment. Tier i advances every
+    /// stride^(tiers-i) turns. See EventHistory::cache_splits.
+    pub cache_stride: usize,
+    /// Number of geometric cache tiers. Capped by Anthropic's 4-breakpoint
+    /// limit: system takes 1, prefix_attach takes 1 if present, rest go to
+    /// history tiers. Renderer clamps to available budget.
+    pub cache_tiers: usize,
     pub history_entry_max_chars: usize,
     pub history_entry_max_lines: usize,
     pub work_queue_content_limits: Vec<usize>,
@@ -568,7 +682,25 @@ pub struct RenderConfig {
 
 impl Default for RenderConfig {
     fn default() -> Self {
+        // Anthropic's cache requires 100%-identical content up to the
+        // breakpoint (no prefix matching — verified via API trace on Opus
+        // 2026-03-24, feedback #23). A breakpoint that moves every turn never
+        // hits. Geometric tiers keep breakpoints stable: with stride=5,
+        // tiers=2 the cold tier advances every 25 turns, hot tier every 5.
+        // Most content stays in cache_read (10% cost); uncached tail is
+        // bounded to ~stride entries. ~38% cheaper than flat stride=25 at
+        // Opus rates because tail re-ingestion dominates.
+        let cache_stride = std::env::var("CLAUDE_SERVER_CACHE_STRIDE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5);
+        let cache_tiers = std::env::var("CLAUDE_SERVER_CACHE_TIERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2);
         Self {
+            cache_stride,
+            cache_tiers,
             history_entry_max_chars: 2000,
             history_entry_max_lines: 50,
             work_queue_content_limits: vec![500, 500, 500, 200, 200, 200, 200, 200, 200, 200],
@@ -584,12 +716,52 @@ impl Default for RenderConfig {
 
 // ---- Agent Permissions ----
 
+/// Agent identity. `Root` is reserved for the single persistent daemon agent
+/// that owns SQLite state. Using an enum instead of `name == "root"` closes
+/// the injection vector where a child named "root" could masquerade as root.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AgentName {
+    Root,
+    Child(String),
+}
+
+impl AgentName {
+    /// Construct a child name. Rejects the reserved "root" string and empty names.
+    pub fn new_child(name: impl Into<String>) -> Result<Self, String> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err("agent name cannot be empty".into());
+        }
+        if name == "root" {
+            return Err("'root' is a reserved agent name".into());
+        }
+        Ok(Self::Child(name))
+    }
+
+    pub fn is_root(&self) -> bool {
+        matches!(self, Self::Root)
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Root => "root",
+            Self::Child(s) => s,
+        }
+    }
+}
+
+impl std::fmt::Display for AgentName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentPermissions {
     pub can_compact: bool,
-    pub max_turns: Option<u32>,      // None = unlimited (parent)
+    pub max_turns: Option<u32>,      // None = unlimited
     pub child_depth_remaining: u32,  // 0 = can't spawn children
-    pub agent_name: String,
+    pub agent_name: AgentName,
     pub lineage: Vec<String>,
 }
 
@@ -597,13 +769,85 @@ pub struct AgentPermissions {
 
 /// Tracks cumulative token usage across the daemon session.
 /// Shared between the core loop (writer) and the HTTP server (reader).
-#[derive(Debug, Default)]
+///
+/// `since` is the Unix timestamp at which this accumulator was created — exposed
+/// via `/cost` so callers can interpret the totals as "X tokens since <ts>"
+/// rather than mistaking them for a per-session or per-day figure. Counts persist
+/// across daemon restarts only if the accumulator does; today it's recreated
+/// fresh on each daemon start.
+#[derive(Debug)]
 pub struct TokenAccumulator {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
     pub turns: u32,
+    pub since: i64,
+}
+
+impl TokenAccumulator {
+    pub fn new() -> Self {
+        Self {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            turns: 0,
+            since: Utc::now().timestamp(),
+        }
+    }
+}
+
+impl Default for TokenAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---- Per-turn usage log ----
+
+/// One row per agent turn, written when we accumulate tokens.
+/// Timestamp is unix seconds to keep JSON serialization compact.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct UsageEntry {
+    pub ts: i64,
+    pub agent: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cost_usd: f64,
+}
+
+/// Bounded ring buffer of per-turn usage. Oldest entries drop once capacity
+/// fills — fine for a metric surface, not a billing record.
+pub struct UsageLog {
+    entries: std::collections::VecDeque<UsageEntry>,
+    capacity: usize,
+}
+
+impl UsageLog {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            entries: std::collections::VecDeque::with_capacity(capacity.max(1)),
+            capacity: capacity.max(1),
+        }
+    }
+
+    pub fn push(&mut self, entry: UsageEntry) {
+        while self.entries.len() >= self.capacity {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(entry);
+    }
+
+    pub fn snapshot(&self) -> &std::collections::VecDeque<UsageEntry> {
+        &self.entries
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
 }
 
 // ---- Agent Registry ----
@@ -615,6 +859,10 @@ use tokio::sync::mpsc;
 /// Shared across all agent loops for inter-agent messaging and fork validation.
 pub struct AgentRegistry {
     agents: Mutex<HashMap<String, AgentEntry>>,
+    /// Per-agent state snapshots for the web dashboard. Updated once per turn
+    /// by each AgentLoop. Separate mutex from `agents` so dashboard reads
+    /// don't contend with message routing.
+    snapshots: Mutex<HashMap<String, AgentSnapshot>>,
 }
 
 struct AgentEntry {
@@ -629,6 +877,7 @@ impl AgentRegistry {
     pub fn new() -> Self {
         Self {
             agents: Mutex::new(HashMap::new()),
+            snapshots: Mutex::new(HashMap::new()),
         }
     }
 
@@ -722,6 +971,129 @@ impl AgentRegistry {
     pub fn exists(&self, name: &str) -> bool {
         self.agents.lock().unwrap().contains_key(name)
     }
+
+    /// Replace this agent's snapshot. Called once per turn by each AgentLoop,
+    /// right after render (so the dashboard sees the same state the model does).
+    pub fn update_snapshot(&self, snapshot: AgentSnapshot) {
+        self.snapshots.lock().unwrap().insert(snapshot.name.clone(), snapshot);
+    }
+
+    /// Fast patch for status transitions (idle ↔ thinking ↔ executing) without
+    /// rebuilding the whole snapshot. No-op if the agent has no snapshot yet.
+    pub fn set_status(&self, name: &str, status: &str) {
+        if let Some(s) = self.snapshots.lock().unwrap().get_mut(name) {
+            s.status = status.into();
+            s.updated_at = chrono::Utc::now().to_rfc3339();
+        }
+    }
+
+    /// Full snapshot map for the dashboard JSON endpoint.
+    pub fn all_snapshots(&self) -> HashMap<String, AgentSnapshot> {
+        self.snapshots.lock().unwrap().clone()
+    }
+
+    /// Remove a snapshot (dashboard dismiss). Only meaningful for agents
+    /// that have exited — a live agent will re-populate on its next turn.
+    pub fn remove_snapshot(&self, name: &str) -> bool {
+        self.snapshots.lock().unwrap().remove(name).is_some()
+    }
+
+    /// Bulk-remove all snapshots whose status is terminal. Returns the
+    /// count removed. Used by the "dismiss all done" dashboard button.
+    pub fn prune_terminal_snapshots(&self) -> usize {
+        const TERMINAL: &[&str] = &["done", "shutdown", "killed", "max_turns", "channel_closed"];
+        let mut s = self.snapshots.lock().unwrap();
+        let before = s.len();
+        s.retain(|_, snap| !TERMINAL.contains(&snap.status.as_str()));
+        before - s.len()
+    }
+}
+
+// ---- Dashboard snapshot types ----
+//
+// Lightweight, serializable views of agent state for the web dashboard.
+// Deliberately truncated — full history/memory/output would make every
+// snapshot megabytes. The dashboard shows enough to spot problems; for
+// forensics use --dump-dir.
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentSnapshot {
+    pub name: String,
+    pub lineage: String,
+    pub turn: u32,
+    pub max_turns: Option<u32>,
+    /// "idle" | "thinking" | "executing" — mirrors BroadcastMsg::Status.
+    pub status: String,
+    pub queue: Vec<WorkItemSummary>,
+    pub history_len: usize,
+    /// Last N history entries (code + output truncated).
+    pub history_tail: Vec<HistorySummary>,
+    pub memory: Vec<MemoryEntry>,
+    pub timers: Vec<TimerSummary>,
+    pub processes: Vec<ProcessSummary>,
+    /// (name, priority, match_expr truncated)
+    pub hooks: Vec<(String, i32, String)>,
+    pub hook_stats: HashMap<String, HookStats>,
+    pub last_usage: Option<UsageSummary>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryEntry {
+    pub key: String,
+    pub priority: u8,
+    /// Serialized JSON, truncated. UI collapses by default; the size + a
+    /// peek is enough to decide if you want to expand. Sensitive keys
+    /// (per HarnessState.sensitive_keys) are redacted.
+    pub value: String,
+    /// Full size before truncation, so you can see "2.1KB" without expanding.
+    pub value_len: usize,
+    pub sensitive: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkItemSummary {
+    pub id: String,
+    pub priority: u8,
+    pub item_type: String,
+    /// First ~120 chars of content/output/error — enough to recognize the item.
+    pub preview: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HistorySummary {
+    pub id: String,
+    pub time: String,
+    pub kind: String,  // "Execution" | "Summary" | "SystemAlert"
+    pub code: String,  // truncated
+    pub output: String, // truncated
+    pub is_error: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TimerSummary {
+    pub id: String,
+    pub description: String,
+    pub next_fire: String,
+    pub recurring: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessSummary {
+    pub id: String,
+    pub cmd: String,
+    pub description: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageSummary {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub cost_usd: f64,
+    pub cache_hit_pct: u8,
 }
 
 // ---- API Types ----
@@ -753,7 +1125,7 @@ pub struct SystemBlock {
     pub cache_control: Option<CacheControl>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CacheControl {
     #[serde(rename = "type")]
     pub control_type: String,
@@ -785,7 +1157,11 @@ pub enum ContentBlock {
     #[serde(rename = "thinking")]
     Thinking { thinking: String },
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -800,7 +1176,22 @@ pub enum ContentBlock {
         is_error: Option<bool>,
     },
     #[serde(rename = "image")]
-    Image { source: ImageSource },
+    Image {
+        source: ImageSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
+}
+
+impl ContentBlock {
+    /// Set cache_control on Text or Image blocks. No-op on other variants.
+    pub fn set_cache_control(&mut self, cc: CacheControl) {
+        match self {
+            ContentBlock::Text { cache_control, .. }
+            | ContentBlock::Image { cache_control, .. } => *cache_control = Some(cc),
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -826,4 +1217,26 @@ pub struct Usage {
     pub cache_creation_input_tokens: u64,
     #[serde(default)]
     pub cache_read_input_tokens: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_content_block_cache_control_serialization() {
+        let with = ContentBlock::Text {
+            text: "hello".into(),
+            cache_control: Some(CacheControl { control_type: "ephemeral".into() }),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert_eq!(json, r#"{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}"#);
+
+        let without = ContentBlock::Text {
+            text: "hello".into(),
+            cache_control: None,
+        };
+        let json = serde_json::to_string(&without).unwrap();
+        assert_eq!(json, r#"{"type":"text","text":"hello"}"#);
+    }
 }

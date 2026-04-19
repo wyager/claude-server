@@ -13,9 +13,10 @@ pub struct DiscordArgs {
     /// Bot token (enable MESSAGE CONTENT intent in the developer portal)
     #[arg(long)]
     pub token: String,
-    /// Channel ID (enable Developer Mode, right-click channel)
+    /// Optional allowlist of channel IDs. Omit to accept from any channel
+    /// the bot can read.
     #[arg(long)]
-    pub channel: String,
+    pub channel: Vec<String>,
     #[command(flatten)]
     pub api: super::ApiUrl,
 }
@@ -28,18 +29,17 @@ pub fn run(args: DiscordArgs) {
     }
 }
 
-async fn run_async(api_url: String, token: String, channel: String) -> Result<()> {
+async fn run_async(api_url: String, token: String, channel_allowlist: Vec<String>) -> Result<()> {
     let http = reqwest::Client::new();
-    let chat_id = format!("discord:{}", channel);
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::unbounded_channel::<super::Inbound>();
 
     // Inbound: Gateway with reconnect loop
     let gw_token = token.clone();
-    let gw_channel = channel.clone();
+    let gw_allow = channel_allowlist.clone();
     let gw_http = http.clone();
     tokio::spawn(async move {
         loop {
-            if let Err(e) = gateway_loop(&gw_http, &gw_token, &gw_channel, &tx).await {
+            if let Err(e) = gateway_loop(&gw_http, &gw_token, &gw_allow, &tx).await {
                 eprintln!("[discord bridge] gateway error: {:#}, reconnecting in 5s", e);
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
@@ -49,20 +49,30 @@ async fn run_async(api_url: String, token: String, channel: String) -> Result<()
         }
     });
 
-    // Outbound: POST to channel
-    let out_channel = channel.clone();
+    // Outbound: POST to channel parsed from chat_id.
     let out_token = token.clone();
-    super::relay_loop(&api_url, &chat_id, &format!("discord:{}", channel), rx, move |content| {
+    super::relay_loop(&api_url, "discord:*", "discord", rx, move |out: super::Outbound| {
         let http = http.clone();
-        let url = format!("https://discord.com/api/v10/channels/{}/messages", out_channel);
         let token = out_token.clone();
         async move {
-            let resp = http
-                .post(&url)
-                .header("Authorization", format!("Bot {}", token))
-                .json(&json!({"content": content}))
-                .send()
-                .await?;
+            let channel = out.chat_id.strip_prefix("discord:")
+                .with_context(|| format!("bad discord chat_id: {}", out.chat_id))?;
+            let url = format!("https://discord.com/api/v10/channels/{}/messages", channel);
+            let req = http.post(&url).header("Authorization", format!("Bot {}", token));
+            let resp = if out.attachments.is_empty() {
+                req.json(&json!({"content": out.content})).send().await?
+            } else {
+                let mut form = reqwest::multipart::Form::new()
+                    .text("payload_json", json!({"content": out.content}).to_string());
+                for (i, path) in out.attachments.iter().enumerate() {
+                    let bytes = tokio::fs::read(path).await.with_context(|| format!("reading {}", path))?;
+                    let name = std::path::Path::new(path).file_name()
+                        .map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
+                    form = form.part(format!("files[{}]", i),
+                        reqwest::multipart::Part::bytes(bytes).file_name(name));
+                }
+                req.multipart(form).send().await?
+            };
             if !resp.status().is_success() {
                 anyhow::bail!("send returned {}: {}", resp.status(), resp.text().await.unwrap_or_default());
             }
@@ -75,8 +85,8 @@ async fn run_async(api_url: String, token: String, channel: String) -> Result<()
 async fn gateway_loop(
     http: &reqwest::Client,
     token: &str,
-    channel: &str,
-    tx: &mpsc::UnboundedSender<String>,
+    allowlist: &[String],
+    tx: &mpsc::UnboundedSender<super::Inbound>,
 ) -> Result<()> {
     let gw: Value = http
         .get("https://discord.com/api/v10/gateway")
@@ -127,13 +137,19 @@ async fn gateway_loop(
                     Some(0) => { // Dispatch
                         if v["t"].as_str() == Some("MESSAGE_CREATE") {
                             let d = &v["d"];
-                            if d["channel_id"].as_str() == Some(channel)
-                                && d["author"]["bot"].as_bool() != Some(true)
-                            {
-                                if let Some(text) = d["content"].as_str() {
-                                    if !text.is_empty() {
-                                        tx.send(text.to_string()).ok();
-                                    }
+                            let Some(ch) = d["channel_id"].as_str() else { continue };
+                            if d["author"]["bot"].as_bool() == Some(true) { continue; }
+                            if !allowlist.is_empty() && !allowlist.iter().any(|c| c == ch) {
+                                continue;
+                            }
+                            if let Some(text) = d["content"].as_str() {
+                                if !text.is_empty() {
+                                    tx.send(super::Inbound {
+                                        chat_id: format!("discord:{}", ch),
+                                        text: text.to_owned(),
+                                        attachments: Vec::new(),
+                                        message_ref: d["id"].as_str().map(String::from),
+                                    }).ok();
                                 }
                             }
                         } else if v["t"].as_str() == Some("READY") {

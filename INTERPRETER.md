@@ -18,28 +18,34 @@ The fresh-namespace approach is the practical substitute.
 ## Execution Flow
 
 ```
-1. Clone IdGenerator from HarnessState into a SideEffectCollector
-2. Create Arc<Mutex<SideEffectCollector>> shared across all #[pyclass] objects
-3. Create fresh PyDict globals/locals
-4. Redirect sys.stdout and sys.stderr to a StdoutCapture object
-5. Inject objects into locals: work_queue, memory, timers, history, _harness
-6. Run preamble (creates convenience functions like send_message, shell_exec)
-7. If compaction mode: inject compaction_script variable and compact() function
-8. Run the agent's code via py.run()
-9. If compaction mode: read back compaction_script from locals
-10. Extract SideEffectCollector, return ExecutionResult
+1. Clone HarnessState (the transaction, "txn")
+2. Move txn components into pyclass instances:
+     PyMemory owns Mutex<HashMap>, PyWorkQueue owns Mutex<WorkQueue>, etc.
+   Shared pieces (IdGenerator) wrapped in Arc<Mutex<>> across instances.
+3. Create Arc<Mutex<ExternalEffects>> — only for irreversible operations
+4. Create fresh PyDict globals/locals, inject pyclass instances + _harness
+5. Run preamble (aliases send_message = _harness.send_message, etc.)
+6. Run the agent's code via py.run(), bounded by timeout
+7. On success: Py::borrow() + mem::take() to extract mutated components
+   back into self.state. Then apply ExternalEffects (spawn OS processes,
+   broadcast messages, fork children, pin to SQLite).
+8. On error: drop txn, drop ExternalEffects. Original state untouched.
 ```
 
-Step 8 is bounded by a configurable timeout (`CLAUDE_SERVER_PYTHON_TIMEOUT`,
+Step 6 is bounded by a configurable timeout (`CLAUDE_SERVER_PYTHON_TIMEOUT`,
 default 5 seconds). If the script blocks beyond this limit, `PyErr_SetInterrupt`
-is called to raise a `KeyboardInterrupt` in the Python thread. The timeout
-prevents a misbehaving script (e.g., `time.sleep(60)` or an infinite loop)
-from blocking the entire core loop.
+is called to raise a `KeyboardInterrupt` in the Python thread.
 
-On error at step 8 (including timeout interrupts), the Python traceback is
-formatted and returned. The `SideEffectCollector` is replaced with an empty
-default — all side effects are discarded. This makes execution transactional:
-either everything succeeds and all mutations apply, or nothing changes.
+**Transactional semantics**: in-state mutations (memory, timers, hooks, queue,
+history) happen directly on the clone. External effects (OS process spawn,
+message broadcast, child fork, SQLite pin) are deferred because they can't be
+un-done by dropping a clone. On error, the clone is discarded and externals
+never ran — original state untouched, no partial application.
+
+**Read-after-write works**: `register_hook()` pushes into `Mutex<Vec<Hook>>`;
+`list_hooks()` reads the same Mutex. `shell_exec()` adds a `ManagedProcess`
+entry to `Mutex<ProcessManager>`; `processes_list()` reads it same-turn. No
+snapshot/collector divergence.
 
 ## Namespace
 
@@ -82,8 +88,9 @@ injected into the system prompt (cached via `cache_control: ephemeral`):
 - `memory.get(k)` checks local first, then falls back to pinned
 - `k in memory` is true if in either tier
 
-Pins/unpins flow through `SideEffectCollector.memory_pins`/`memory_unpins` and
-`agent_loop.rs` writes them to SQLite via `db.save_pin()`/`db.delete_pin()`.
+Pins/unpins are external (SQLite, cross-agent) — they flow through
+`ExternalEffects.memory_pins`/`memory_unpins` and `agent_loop.rs` writes them
+to SQLite via `db.save_pin()`/`db.delete_pin()` on commit.
 
 ### WorkItem field access
 
@@ -96,41 +103,41 @@ Wrong-field access raises `AttributeError` listing available fields. See
 The convenience functions (`send_message`, `shell_exec`, etc.) are created
 by the preamble, which assigns `_harness.method_name` to top-level names.
 
-## Side Effect Collection
+## Clone-and-Mutate
 
-Every `#[pyclass]` object holds an `Arc<Mutex<SideEffectCollector>>`. When the
-agent calls a mutating method (e.g., `work_queue.pop_front()`, `memory["x"] = "y"`,
-`timers.add(...)`, `send_message(...)`), the method records the operation in
-the shared collector rather than modifying harness state directly.
+Each pyclass owns a `Mutex<T>` of cloned state. Mutations happen directly:
 
 ```
 Agent calls memory["key"] = "value"
-  → PyMemory.__setitem__ records ("key", "value") in collector.memory_sets
-  → Also updates the local dict so subsequent reads see the new value
+  → PyMemory.__setitem__ locks self.inner, inserts into the HashMap
+  → A subsequent memory["key"] read on the same turn sees it — same Mutex
 
 Agent calls timers.add(every=30, ...)
-  → PyTimerManager.add calls collector.id_gen.next() to get a new ID
-  → Records a TimerAddRequest in collector.timer_adds
-  → Returns the ID string to the agent synchronously
+  → Locks Arc<Mutex<IdGenerator>>, calls .next() for the ID
+  → Locks Mutex<TimerManager>, builds+inserts Timer directly
+  → Returns the ID string synchronously
 ```
 
-After execution, `core_loop::apply_side_effects()` processes the collector:
-memory sets/deletes, queue removes, timer adds/cancels, filter changes,
-history modifications, process starts/kills, outbound messages, and compaction.
+`ExternalEffects` (an `Arc<Mutex<>>` shared across pyclass instances) collects
+only operations that can't be rolled back: `process_starts` (OS spawn),
+`messages` (broadcast), `forks`, `agent_messages`, `child_kills`,
+`memory_pins`/`unpins` (SQLite, cross-agent), `view_requests`, plus
+lifecycle flags (`done_called`, `compact_called`, etc.).
+
+On commit, `apply_side_effects()` swaps in the extracted components
+(`self.state.memory = extracted.memory`), then applies externals. The
+replay loops for in-state ops are gone — ~120 LOC deleted.
 
 ## ID Assignment
 
-The `IdGenerator` is cloned from `HarnessState` into the `SideEffectCollector`
-before execution. When the agent calls `timers.add()` or `shell_exec()`,
-the `#[pyclass]` method calls `id_gen.next()` on the collector's generator
-and returns the hex ID string synchronously. After execution, the updated
-`IdGenerator` (with its advanced counter) is moved back into `HarnessState`.
+`IdGenerator` is wrapped in `Arc<Mutex<>>` and shared between `PyTimers` and
+`PyHarness` (both call `.next()`). When the script runs, IDs advance on the
+txn's generator. On commit, the advanced generator becomes `self.state.id_generator`.
+On error, the txn drops — IDs roll back.
 
-This means IDs for agent-created objects are assigned during Python execution,
-not deferred. History entry IDs, however, are generated AFTER
-`apply_side_effects()` returns the updated `IdGenerator`. This prevents
-collisions between history entry IDs and IDs assigned to timers, processes,
-or child agents during the same turn.
+History entry IDs are still generated AFTER commit (in agent_loop's post-turn
+code). This prevents collisions between history IDs and IDs assigned to
+timers/processes/children during the turn.
 
 ## Stdout Capture
 
@@ -165,8 +172,8 @@ If `py.run()` raises a Python exception:
 1. The traceback is formatted via `e.traceback(py).format()`
 2. The exception string is appended: `format!("{}{}", traceback, e)`
 3. An `ExecutionResult` is returned with `is_error: true` and
-   `side_effects: SideEffectCollector::default()` (empty — no mutations applied)
-4. The core loop records the error in event history but skips `apply_side_effects()`
+   `committed: None` — the cloned txn and ExternalEffects are both dropped
+4. The core loop records the error in event history; no state swap, no externals
 
 The agent sees the error in its history on the next turn and can fix its code.
 

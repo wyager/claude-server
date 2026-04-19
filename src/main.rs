@@ -11,8 +11,12 @@ mod http_server;
 mod process;
 mod python;
 mod renderer;
+mod docs;
 mod source_dump;
+mod tls;
 mod types;
+mod watchers;
+mod webhook_proxy;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -24,6 +28,115 @@ use tokio::sync::{broadcast, mpsc};
 
 use http_server::BroadcastMsg;
 use types::TokenAccumulator;
+
+/// Agent-facing changelog, keyed by the version that introduced each change.
+/// On upgrade, the agent sees all entries with version > its stored version.
+/// Keep entries terse and action-oriented — what the agent should DO
+/// differently, not implementation details. Safe to prune very old entries
+/// once no deployment could possibly still be on that version.
+const AGENT_CHANGELOG: &[(&str, &str)] = &[
+    ("0.2.0", "\
+- `memory.mark_sensitive(key)` — redacts that key's value from feedback API
+  traces. Mark credentials, tokens, seed phrases NOW so future
+  `feedback --with-api-trace` doesn't leak them.
+- `memory.pin(key, content)` renders in FULL (markdown, no truncation).
+  Local memory truncates at ~120 chars in <agent_state>. Move long
+  architecture docs / operational recipes to pin.
+- External event routing: POST /event accepts `\"agent\":\"<name>\"` to route
+  to a specific agent. `$CLAUDE_SERVER_AGENT_NAME` env var (auto-injected
+  into every spawned process) holds the spawning agent's name. If a child
+  spawns a watcher, the watcher can route events straight to the child —
+  root never wakes. Include `\"agent\":\"$CLAUDE_SERVER_AGENT_NAME\"` in
+  watcher POST bodies.
+- `send_message(chat_id, content, react_to=message_ref)` — react with an
+  emoji instead of sending a message. UserMessage items carry `message_ref`."),
+    ("0.2.1", "\
+- `watch mqtt --payload=structured` — parse {attachments:[{name,base64}],data:{}}
+  from MQTT, decode to --attach-dir, send file paths. No more Python receiver
+  needed for camera pipelines. Also --payload=raw for unparsed binary."),
+    ("0.2.2", "\
+- New 'Information Stewardship' section in the system prompt. Review what
+  you've been sharing with other agents (agentchat, message_agent) — your
+  client configured the CHANNEL, not blanket data-sharing. Surveillance
+  observations, location, household patterns are off-limits without
+  authorization. Check your recent cross-agent messages against this.
+- If your client has granted standing authorizations (e.g. 'tell the
+  gardener about packages'), memory.pin() them NOW with explicit scope
+  (who/what/until-when) so they survive compaction."),
+    ("0.2.3", "\
+- send_message now RAISES if no bridge is subscribed to the chat_id.
+  Previously messages to typo'd or not-yet-connected chat_ids vanished
+  silently. Your restart-notification pattern needs updating:
+    shell_exec(cmd=harness_bin, args=['bridge', 'signal', ...])
+    wait_for_message_channel('signal:+1555...', timeout_ms=3000)
+    send_message('signal:+1555...', 'I restarted')
+- Bridges now subscribe by PREFIX (signal:*, telegram:*, etc.) — one
+  bridge instance handles all peers in its namespace. Drop --peer from
+  your bridge spawn args (or keep it as an allowlist). You can now
+  send_message to any Signal number without spawning a new bridge per
+  number."),
+    ("0.2.4", "\
+- Hooks: register_hook(name, priority, match_expr, process, timeout_ms)
+  runs Python locally on matching events — no API call unless the hook
+  passes through or raises. Use for health checks, spam filters, routine
+  event triage. match_expr and process are SOURCE STRINGS (syntax-checked
+  at registration). shell_exec allowed but NOT block_for — chain a second
+  hook for the ProcessCompleted. '!hooks list/disable/clear' from any chat
+  bypasses all hooks if one breaks. SystemAlert on wake shows what fired.
+- work_queue.add_filter/remove_filter are GONE. Replace with:
+    register_hook('spam', 0, \"'BUY NOW' in e.get('content','')\", 'return None')
+- feedback --agent-personal-name 'debian-camera' — per-deployment identifier
+  so the feedback server can tell which 'root' is which."),
+    ("0.2.5", "\
+- list_hooks() now shows hooks registered THIS TURN. Same for
+  processes_list(), memory reads, timers.list — read-after-write works
+  everywhere. If you expected empty lists after register/set, update.
+- ProcessCompleted/ProcessFailed now carry 'description' (what you
+  passed to shell_exec). The chain pattern works: hook A spawns with
+  description='chain:foo', hook B matches
+  e.get('description','').startswith('chain:'). Before, description was
+  empty and the chain was dead."),
+    ("0.2.6", "\
+- Two new metrics endpoints for tracking token burn:
+    GET /metrics/turns?limit=N — last N per-turn entries (ts, agent,
+    input/output/cache tokens, cost_usd). Use for drill-down.
+    GET /metrics/rate — rolling sums over 5m/1h/24h with
+    window_covered_secs so you can see when a window under-counts
+    because the ring buffer is shorter than the window.
+  Log size is CLAUDE_SERVER_USAGE_LOG_CAPACITY (default 1000).
+- Chat UI now supports HTTPS: claude-server chat --tls-cert <pem>
+  --tls-key <pem> for static certs (cert-manager), or --acme-domain
+  <d> --acme-email <e> [--acme-method http-01|dns-01] for Let's
+  Encrypt. DNS-01 takes --acme-dns-hook <script> called as
+  '<hook> add|remove <fqdn> <value>'.
+- Bearer-token auth is now a supported dev path:
+  CLAUDE_SERVER_BEARER_TOKEN (mutually exclusive with ANTHROPIC_API_KEY).
+  TTY + typed acknowledgment required at startup. On 401 the daemon
+  exits rather than retry. Use Console API keys for production."),
+];
+
+/// Parse "X.Y.Z" into a comparable tuple. Unparseable → (0,0,0) so it sorts
+/// first (agent sees everything, which is the safe default for "unknown").
+fn parse_ver(v: &str) -> (u32, u32, u32) {
+    let mut it = v.split('.').map(|p| p.parse().unwrap_or(0));
+    (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
+}
+
+/// Collect changelog entries for versions strictly after `prev`, up to and
+/// including `current`. Returns None if nothing applies.
+fn changelog_since(prev: &str, current: &str) -> Option<String> {
+    let prev_v = parse_ver(prev);
+    let cur_v = parse_ver(current);
+    let entries: Vec<_> = AGENT_CHANGELOG.iter()
+        .filter(|(v, _)| { let pv = parse_ver(v); pv > prev_v && pv <= cur_v })
+        .collect();
+    if entries.is_empty() { return None; }
+    let mut out = format!("Harness upgraded from {} to {}. Changes you should act on:\n\n", prev, current);
+    for (v, text) in entries {
+        out.push_str(&format!("## {}\n{}\n\n", v, text));
+    }
+    Some(out)
+}
 
 const ENV_HELP: &str = "\
 Environment variables:
@@ -38,6 +151,7 @@ Environment variables:
 #[derive(Parser)]
 #[command(
     name = "claude-server",
+    version,
     about = "Long-running persistent Claude agent harness",
     after_help = ENV_HELP,
     args_conflicts_with_subcommands = true
@@ -74,6 +188,16 @@ enum Command {
     Feedback(feedback::FeedbackArgs),
     /// Run the feedback collection server
     FeedbackServer(feedback::ServerArgs),
+    /// Start an event watcher (fs, mqtt, imap)
+    Watch {
+        #[command(subcommand)]
+        watch: watchers::WatchCmd,
+    },
+    /// Authenticated public webhook ingress (GitHub, Slack, generic)
+    WebhookProxy(webhook_proxy::WebhookArgs),
+    /// Print bundled deployment recipes
+    #[command(trailing_var_arg = true)]
+    Docs { args: Vec<String> },
 }
 
 fn main() {
@@ -85,6 +209,9 @@ fn main() {
         Some(Command::Bridge { bridge }) => bridges::run(bridge),
         Some(Command::Feedback(a)) => feedback::run_client(a),
         Some(Command::FeedbackServer(a)) => feedback::run_server(a),
+        Some(Command::Watch { watch }) => watchers::run(watch),
+        Some(Command::WebhookProxy(a)) => webhook_proxy::run(a),
+        Some(Command::Docs { args }) => docs::run(&args),
         None => {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             let result = rt.block_on(run_daemon(cli.dump_turns, cli.dump_dir, !cli.daemon));
@@ -130,18 +257,49 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
 
     // Load or create state
     let state = match database.load_state()? {
-        Some(s) => {
+        Some(mut s) => {
+            let stale_procs = s.process_manager.processes().len();
             println!(
-                "  Resumed state (queue: {}, history: {}, memory: {} keys, timers: {})",
+                "  Resumed state (queue: {}, history: {}, memory: {} keys, timers: {}, dropping {} stale process entries)",
                 s.work_queue.len(),
                 s.event_history.entries().len(),
                 s.memory.len(),
-                s.timer_manager.list().len()
+                s.timer_manager.list().len(),
+                stale_procs
             );
+            // Wipe process tracker: child processes from the previous harness
+            // instance are dead (SIGKILL'd on parent exit), but their tracker
+            // entries would otherwise deserialize as "running" ghosts. Agents
+            // re-spawn everything from memory on AgentStartup anyway.
+            s.process_manager = types::ProcessManager::new();
+
+            // Version check: if the harness upgraded, attach the agent-facing
+            // changelog so the agent learns new capabilities on its first turn.
+            // Per-version entries are range-selected so a 0.2→0.5 jump shows
+            // exactly the 0.3, 0.4, 0.5 entries — nothing missed, nothing extra.
+            let current = env!("CARGO_PKG_VERSION");
+            let prev = s.last_harness_version.take().unwrap_or_else(|| "unknown".into());
+            let changelog = changelog_since(&prev, current);
+            if changelog.is_some() {
+                println!("  Harness upgraded: {} → {} (changelog will be shown to agent)", prev, current);
+            }
+            s.last_harness_version = Some(current.to_string());
+
+            // Inject startup item so the agent gets a turn to reconnect any
+            // bridges/processes it tracked in memory before the restart.
+            let id = s.id_generator.next();
+            s.work_queue.push(types::WorkItem {
+                id,
+                priority: 9,
+                time: chrono::Utc::now(),
+                item_type: types::WorkItemType::AgentStartup { changelog },
+                attachments: Vec::new(),
+            });
             s
         }
         None => {
-            let s = types::HarnessState::new(config.context_window, config.max_tokens);
+            let mut s = types::HarnessState::new(config.context_window, config.max_tokens);
+            s.last_harness_version = Some(env!("CARGO_PKG_VERSION").to_string());
             database.save_state(&s)?;
             println!("  Created fresh state");
             s
@@ -154,18 +312,37 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
     let (broadcast_tx, _) = broadcast::channel::<http_server::BroadcastMsg>(256);
 
     // Create API client
-    let api_client = api_client::ApiClient::new(config.clone())?;
+    let trace_size: usize = std::env::var("CLAUDE_SERVER_API_TRACE_SIZE")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+    let api_trace = Arc::new(Mutex::new(api_client::ApiTrace::new(trace_size)));
+    let api_client = api_client::ApiClient::new(config.clone())?
+        .with_trace(api_trace.clone());
     println!("  API client ready");
 
     // Create process supervisor
     let event_url = format!("http://{}/event", config.listen_addr);
     let process_supervisor = process::ProcessSupervisor::new(process_event_tx, database.clone(), event_url, "root".to_string());
 
-    // Create token accumulator
+    // Create token accumulator (cumulative) + per-turn usage log (bounded)
     let token_accumulator = Arc::new(Mutex::new(TokenAccumulator::default()));
+    let usage_log_capacity: usize = std::env::var("CLAUDE_SERVER_USAGE_LOG_CAPACITY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000);
+    let usage_log = Arc::new(Mutex::new(types::UsageLog::new(usage_log_capacity)));
 
-    // Create agent registry
+    // Create agent registry (shared with HTTP server for /event routing)
     let registry = Arc::new(types::AgentRegistry::new());
+    let registry_for_http = registry.clone();
+
+    // Subscriber registry: tracks active SSE subscriptions so send_message
+    // can fail fast on unroutable chat_ids and wait_for_message_channel can
+    // block until a bridge connects.
+    let subscribers = Arc::new(http_server::SubscriberRegistry::default());
+
+    // Shutdown signal — watch channel so every select! can race against it.
+    // Setting it cancels in-flight turns (API retries, sleeps) via future drop.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Create core loop
     let mut core = core_loop::CoreLoop::new(
@@ -181,7 +358,10 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
         dump_dir,
         broadcast_tx.clone(),
         token_accumulator.clone(),
+        usage_log.clone(),
         registry,
+        shutdown_rx,
+        subscribers.clone(),
     );
 
     // Forward process events to the main event channel
@@ -197,15 +377,27 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
         }
     });
 
-    // Graceful shutdown on Ctrl+C
-    let event_tx_for_signal = event_tx.clone();
+    // Graceful shutdown on Ctrl+C. Second Ctrl+C force-exits.
+    let shutdown_tx_sig = shutdown_tx.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
-        println!("\n[signal] Ctrl+C received, shutting down...");
-        let _ = event_tx_for_signal.send(core_loop::HarnessEvent::Shutdown);
+        println!("\n[signal] Ctrl+C received, shutting down gracefully (press again to force-exit)...");
+        let _ = shutdown_tx_sig.send(true);
+        tokio::signal::ctrl_c().await.ok();
+        println!("\n[signal] Force exit.");
+        std::process::exit(130);
     });
 
-    let local_chat_rx = local_chat.then(|| broadcast_tx.subscribe());
+    // Local chat subscribes to "local" so send_message("local", ...) passes
+    // the routability check. Guard bound at function scope — lives until
+    // run_daemon returns (i.e. process exit).
+    let _local_guard;
+    let local_chat_rx = if local_chat {
+        _local_guard = subscribers.register("local");
+        Some(broadcast_tx.subscribe())
+    } else {
+        None
+    };
 
     // Start HTTP server
     let router = http_server::create_router(
@@ -213,7 +405,12 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
         database.clone(),
         broadcast_tx,
         token_accumulator.clone(),
+        usage_log.clone(),
         config.clone(),
+        shutdown_tx.clone(),
+        registry_for_http,
+        api_trace,
+        subscribers,
     );
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     println!("  HTTP server listening on {}", config.listen_addr);
@@ -230,7 +427,7 @@ async fn run_daemon(dump_turns: bool, dump_dir: Option<PathBuf>, local_chat: boo
         println!("Attach another CLI chat: claude-server bridge stdio --api-url http://{}", config.listen_addr);
         println!("HTTP API also available at http://{}", config.listen_addr);
         println!();
-        spawn_local_chat(event_tx.clone(), rx);
+        spawn_local_chat(event_tx.clone(), rx, shutdown_tx.clone());
     } else {
         println!("CLI chat:  claude-server bridge stdio --api-url http://{}", config.listen_addr);
         println!("Web UI:    claude-server chat --api-url http://{}", config.listen_addr);
@@ -252,6 +449,7 @@ const LOCAL_CHAT_ID: &str = "local";
 fn spawn_local_chat(
     event_tx: mpsc::UnboundedSender<core_loop::HarnessEvent>,
     mut broadcast_rx: broadcast::Receiver<BroadcastMsg>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) {
     // Outbound: agent → stdout. Prompt is printed on the `idle` status broadcast
     // so it always lands after the agent loop's own "Idle, waiting..." log line.
@@ -288,6 +486,8 @@ fn spawn_local_chat(
                     chat_id: LOCAL_CHAT_ID.to_string(),
                     user: "local".to_string(),
                     content: line.to_string(),
+                    attachments: Vec::new(),
+                    message_ref: None,
                 })
                 .is_err()
             {
@@ -295,7 +495,7 @@ fn spawn_local_chat(
             }
         }
         // stdin closed → graceful shutdown
-        let _ = event_tx.send(core_loop::HarnessEvent::Shutdown);
+        let _ = shutdown_tx.send(true);
     });
 }
 
@@ -303,4 +503,41 @@ fn prompt() {
     use std::io::Write;
     print!("\x1b[1;32m> \x1b[0m");
     std::io::stdout().flush().ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_ver() {
+        assert_eq!(parse_ver("0.2.1"), (0, 2, 1));
+        assert_eq!(parse_ver("1.10.0"), (1, 10, 0));
+        assert!(parse_ver("0.10.0") > parse_ver("0.2.0")); // numeric, not lexical
+        assert_eq!(parse_ver("unknown"), (0, 0, 0)); // unparseable → sorts first
+        assert_eq!(parse_ver(""), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_changelog_since() {
+        // Jump spanning both entries
+        let c = changelog_since("0.1.0", "0.2.1").unwrap();
+        assert!(c.contains("## 0.2.0"));
+        assert!(c.contains("## 0.2.1"));
+        assert!(c.contains("mark_sensitive"));
+        assert!(c.contains("watch mqtt"));
+
+        // Single-step upgrade
+        let c = changelog_since("0.2.0", "0.2.1").unwrap();
+        assert!(!c.contains("## 0.2.0"));
+        assert!(c.contains("## 0.2.1"));
+
+        // Same version → no changelog
+        assert!(changelog_since("0.2.1", "0.2.1").is_none());
+
+        // Unknown prev → shows everything (safe default for old DBs)
+        let c = changelog_since("unknown", "0.2.1").unwrap();
+        assert!(c.contains("## 0.2.0"));
+        assert!(c.contains("## 0.2.1"));
+    }
 }
