@@ -1,13 +1,33 @@
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 
 use crate::types::RenderConfig;
 
+/// How the daemon authenticates to the Claude API.
+///
+/// `ApiKey` — standard Console API key, sent as `x-api-key`. Production path.
+/// `Bearer` — OAuth-style bearer token (e.g. from Claude Code). Dev-only: using
+/// subscription tokens outside Claude Code is against Anthropic's ToS. Guarded
+/// by a TTY check, a typed acknowledgment, and (when parseable) a JWT exp check.
+#[derive(Clone, Debug)]
+pub enum AuthCredential {
+    ApiKey(String),
+    Bearer { token: String },
+}
+
+impl AuthCredential {
+    pub fn is_bearer(&self) -> bool {
+        matches!(self, AuthCredential::Bearer { .. })
+    }
+}
+
 pub struct Config {
     pub model: String,
-    pub api_key: String,
+    pub auth: AuthCredential,
     pub api_base_url: String,
     pub max_tokens: u64,
     pub context_window: u64,
@@ -34,12 +54,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let api_key = std::env::var("ANTHROPIC_API_KEY")
-            .context("ANTHROPIC_API_KEY environment variable must be set")?;
-
-        if api_key.is_empty() {
-            bail!("ANTHROPIC_API_KEY must not be empty");
-        }
+        let auth = Self::auth_from_env()?;
 
         let model = std::env::var("CLAUDE_SERVER_MODEL")
             .unwrap_or_else(|_| "claude-opus-4-6".to_string());
@@ -112,7 +127,7 @@ impl Config {
 
         Ok(Self {
             model,
-            api_key,
+            auth,
             api_base_url,
             max_tokens,
             context_window,
@@ -143,4 +158,100 @@ impl Config {
             None => Ok(String::new()),
         }
     }
+
+    fn auth_from_env() -> Result<AuthCredential> {
+        let api_key = std::env::var("ANTHROPIC_API_KEY").ok().filter(|s| !s.is_empty());
+        let bearer = std::env::var("CLAUDE_SERVER_BEARER_TOKEN").ok().filter(|s| !s.is_empty());
+
+        match (api_key, bearer) {
+            (Some(_), Some(_)) => {
+                bail!("ANTHROPIC_API_KEY and CLAUDE_SERVER_BEARER_TOKEN are mutually exclusive")
+            }
+            (Some(key), None) => Ok(AuthCredential::ApiKey(key)),
+            (None, Some(token)) => {
+                enforce_bearer_guardrails(&token)?;
+                match parse_jwt_exp(&token) {
+                    Some(exp) => {
+                        let now = SystemTime::now();
+                        if exp <= now {
+                            bail!("bearer token is already expired (exp: {:?})", exp);
+                        }
+                        let remaining = exp.duration_since(now).unwrap_or(Duration::ZERO);
+                        eprintln!(
+                            "[auth] bearer token expires in {} min",
+                            remaining.as_secs() / 60
+                        );
+                    }
+                    None => {
+                        eprintln!("[auth] bearer token is opaque (not a JWT) — expiry unknown");
+                    }
+                }
+                Ok(AuthCredential::Bearer { token })
+            }
+            (None, None) => bail!(
+                "Either ANTHROPIC_API_KEY or CLAUDE_SERVER_BEARER_TOKEN must be set"
+            ),
+        }
+    }
+}
+
+/// Enforce the three dev-only guardrails on Bearer mode: TTY, acknowledgment,
+/// (JWT exp is checked by the caller). Skippable with `CLAUDE_SERVER_AUTH_ACK=1`
+/// for scripted test harnesses — the user opted into this by setting the var.
+fn enforce_bearer_guardrails(_token: &str) -> Result<()> {
+    let ack = std::env::var("CLAUDE_SERVER_AUTH_ACK")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if ack {
+        eprintln!("[auth] bearer mode, acknowledgment bypassed via CLAUDE_SERVER_AUTH_ACK=1");
+        return Ok(());
+    }
+
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "bearer mode requires an interactive TTY (stdin is not a terminal). \
+             Set CLAUDE_SERVER_AUTH_ACK=1 only if you understand the ToS implications."
+        );
+    }
+
+    eprintln!();
+    eprintln!("========================================================================");
+    eprintln!("  BEARER TOKEN AUTH — DEVELOPMENT USE ONLY");
+    eprintln!();
+    eprintln!("  You are authenticating with a bearer token. If this token came from");
+    eprintln!("  a Claude Pro/Max subscription (e.g. via `claude` / Claude Code), using");
+    eprintln!("  it from a custom harness is outside Anthropic's sanctioned use and may");
+    eprintln!("  violate the Consumer ToS. For production, switch to a Console API key");
+    eprintln!("  (ANTHROPIC_API_KEY) billed per token.");
+    eprintln!();
+    eprintln!("  Type 'I AGREE' (uppercase) and press Enter to continue, or Ctrl-C to abort:");
+    eprintln!("========================================================================");
+
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).context("read acknowledgment")?;
+    if line.trim() != "I AGREE" {
+        bail!("acknowledgment declined — aborting startup");
+    }
+    Ok(())
+}
+
+/// Best-effort JWT exp parsing. If the token is a JWT (`header.payload.sig`)
+/// and the payload contains an `exp` claim, return that as a SystemTime.
+/// Claude OAuth tokens are opaque strings, so this will typically return None.
+fn parse_jwt_exp(token: &str) -> Option<SystemTime> {
+    use base64::Engine;
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    let exp = json.get("exp")?.as_i64()?;
+    if exp < 0 {
+        return None;
+    }
+    Some(UNIX_EPOCH + Duration::from_secs(exp as u64))
 }

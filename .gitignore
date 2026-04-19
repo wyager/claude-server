@@ -4,4 +4,5 @@
 *.db-wal
 *.db-shm
 test-dumps/
-
+nohup.out
+/runtime/

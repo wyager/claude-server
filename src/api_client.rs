@@ -196,15 +196,22 @@ impl ApiClient {
 
         loop {
             attempt += 1;
-            let send_result = self
+            let mut req_builder = self
                 .client
                 .post(format!("{}/v1/messages", self.config.api_base_url))
-                .header("x-api-key", &self.config.api_key)
                 .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
-                .json(&request)
-                .send()
-                .await;
+                .header("content-type", "application/json");
+            match &self.config.auth {
+                crate::config::AuthCredential::ApiKey(k) => {
+                    req_builder = req_builder.header("x-api-key", k);
+                }
+                crate::config::AuthCredential::Bearer { token, .. } => {
+                    req_builder = req_builder
+                        .header("authorization", format!("Bearer {}", token))
+                        .header("anthropic-beta", "oauth-2025-04-20");
+                }
+            }
+            let send_result = req_builder.json(&request).send().await;
 
             let (kind, max, wait, detail) = match send_result {
                 Ok(resp) if resp.status().is_success() => {
@@ -258,6 +265,11 @@ impl ApiClient {
                         .map(Duration::from_secs);
                     let body = resp.text().await.unwrap_or_default();
                     match status {
+                        401 if self.config.auth.is_bearer() => bail!(
+                            "API returned 401 in bearer mode — token likely expired or revoked. \
+                             Restart with a fresh CLAUDE_SERVER_BEARER_TOKEN. Body: {}",
+                            body
+                        ),
                         529 => ("overloaded", 20, backoff(attempt, 60), body),
                         429 => ("rate-limited", 8, retry_after.unwrap_or_else(|| backoff(attempt, 60)), body),
                         500..=599 => ("server error", 5, backoff(attempt, 30), body),
