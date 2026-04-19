@@ -769,13 +769,39 @@ pub struct AgentPermissions {
 
 /// Tracks cumulative token usage across the daemon session.
 /// Shared between the core loop (writer) and the HTTP server (reader).
-#[derive(Debug, Default)]
+///
+/// `since` is the Unix timestamp at which this accumulator was created — exposed
+/// via `/cost` so callers can interpret the totals as "X tokens since <ts>"
+/// rather than mistaking them for a per-session or per-day figure. Counts persist
+/// across daemon restarts only if the accumulator does; today it's recreated
+/// fresh on each daemon start.
+#[derive(Debug)]
 pub struct TokenAccumulator {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
     pub turns: u32,
+    pub since: i64,
+}
+
+impl TokenAccumulator {
+    pub fn new() -> Self {
+        Self {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            turns: 0,
+            since: Utc::now().timestamp(),
+        }
+    }
+}
+
+impl Default for TokenAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ---- Agent Registry ----

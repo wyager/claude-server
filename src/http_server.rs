@@ -279,6 +279,10 @@ async fn handle_cost(
         "cache_creation_tokens": acc.cache_creation_tokens,
         "estimated_cost_usd": (cost * 100.0).round() / 100.0,
         "turns": acc.turns,
+        // Unix timestamp at which the accumulator started — counts above are the
+        // sum since this point. Today it resets on every daemon restart; document
+        // here so callers don't mistake "$X.XX" for a per-day or lifetime figure.
+        "since": acc.since,
     }))
 }
 
