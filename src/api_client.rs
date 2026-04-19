@@ -385,8 +385,10 @@ impl ApiClient {
             tools,
             messages,
             thinking: Some(ThinkingConfig {
-                thinking_type: "enabled".to_string(),
-                budget_tokens: 10_000,
+                thinking_type: "adaptive".to_string(),
+            }),
+            output_config: Some(OutputConfig {
+                effort: "high".to_string(),
             }),
         }
     }

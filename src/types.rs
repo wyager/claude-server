@@ -1107,13 +1107,19 @@ pub struct ApiRequest {
     pub messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ThinkingConfig {
     #[serde(rename = "type")]
     pub thinking_type: String,
-    pub budget_tokens: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OutputConfig {
+    pub effort: String,
 }
 
 #[derive(Debug, Serialize)]
