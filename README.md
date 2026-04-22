@@ -24,7 +24,7 @@ Even context compaction is done via python scripting!
 
 I came up with the initial spec for this
 (mostly consisting of example context windows and API calls I wrote out by hand)
-but then I had fennec actually write everything, so I cannot attest to the quality of the code.
+but then I had Claude actually write everything, so I cannot attest to the quality of the code.
 
 ## Quick Start
 
@@ -44,33 +44,46 @@ export ANTHROPIC_API_KEY=sk-ant-...
 ### Run
 
 ```bash
-# Terminal 1: start the agent daemon
 make
-
-# Terminal 2: open the chat UI in your browser
-make chat
 ```
 
-That's it. The daemon runs on port 3000 and the chat UI opens at http://127.0.0.1:8080.
+That's it — the daemon starts with a built-in terminal chat. Type at the
+`>` prompt and you're talking to the agent. The HTTP API runs on port 3000
+at the same time.
+
+To run headless (e.g. under systemd), pass `--daemon`:
+
+```bash
+claude-server --daemon
+```
+
+and connect a chat from elsewhere:
+
+```bash
+claude-server bridge stdio --api-url http://127.0.0.1:3000   # CLI chat
+make chat                                                    # browser UI at :8080
+```
+
+### Observability
+
+Open `http://127.0.0.1:3000/dashboard` in a browser for a live view of every
+agent (root + children): work queue, recent history, memory, timers, processes,
+hooks, and per-turn cost.
 
 ### Other commands
 
 ```bash
 make build               # build without running
 make run-dump            # run with full context/response dumps each turn (debugging)
-make chat CHAT_PORT=9090 # chat UI on a custom port
+claude-server --help     # all subcommands (bridge, watch, feedback, docs, ...)
 ```
 
 You can also talk to the daemon directly via its HTTP API:
 
 ```bash
-# Send a message
 curl -X POST http://127.0.0.1:3000/message \
   -H 'Content-Type: application/json' \
   -d '{"user":"you@example.com","content":"Hello Claude!"}'
-
-# Check for responses
-curl http://127.0.0.1:3000/messages/<chat_id>
 ```
 
 ## Architecture Overview
@@ -143,7 +156,7 @@ Each turn is a single API call. The harness constructs the request as follows:
 
 ```json
 {
-  "model": "claude-opus-4-7",
+  "model": "<model>",
   "max_tokens": 16384,
   "system": [
     {
@@ -177,7 +190,7 @@ Each turn is a single API call. The harness constructs the request as follows:
 }
 ```
 
-The model is configurable (default: `claude-opus-4-7`).
+The model is configurable via `CLAUDE_SERVER_MODEL`.
 
 ### Why tool_use Instead of Raw Text
 
@@ -385,11 +398,10 @@ Queue operations:
 work_queue.pop_front()     # Remove highest-priority item
 work_queue.remove(id)      # Remove item by ID
 len(work_queue)            # Number of items
-
-# Persistent filters (applied to incoming items before they enter the queue)
-work_queue.add_filter(name="spam_filter", regex=r"^spam:.*")
-work_queue.remove_filter(name="spam_filter")
 ```
+
+For filtering or locally handling events before they reach the queue, use
+hooks (`register_hook`) — see the system prompt for details.
 
 #### Memory
 
@@ -499,7 +511,7 @@ fork([
     ChildSettings(
         name="summarizer",                        # Globally unique name
         task="Summarize /tmp/api-docs.md",
-        model="claude-sonnet-4-5-20250929",       # Optional, inherits parent's model
+        model=None,                               # Optional; None inherits parent's model
         max_turns=20,
         attach=["/tmp/api-docs.md"],              # Files attached on child's first turn
     ),
@@ -516,14 +528,13 @@ Children call `done(**result)` to exit. The parent receives a `ChildAgentComplet
 work item with `child_name`, `result` (the kwargs dict passed to `done()`), `turns_used`,
 `success`, and `summary`.
 
-#### Attachments (images and large files)
+#### Viewing files (images and large files)
 
 ```python
-# Queue a file to appear in NEXT turn's context
-attach("/var/frigate/clips/front_door.jpg")
-# Image files (.jpg/.jpeg/.png/.gif/.webp) → vision blocks the model can see
-# Any other file → text block with file contents
-# Ephemeral: visible for exactly one turn, not saved to history
+# Push a View work item to the head of the queue — the file renders as a
+# content block on the NEXT turn (image → vision, anything else → text).
+# Visible until you pop the View item.
+view("/var/frigate/clips/front_door.jpg")
 
 # Standard output is captured and shown in history
 print("This appears in the history output")
@@ -901,14 +912,14 @@ Claude checks the camera:
   "id": "toolu_01E",
   "name": "execute",
   "input": {
-    "code": "path = camera_tool.get_interesting_frame(\n    camera=\"driveway\",\n    from_time=\"2026-02-01 08:35:41\",\n    to_time=\"2026-02-01 08:36:11\")\nattach(path)\nwork_queue.pop_front()"
+    "code": "path = camera_tool.get_interesting_frame(\n    camera=\"driveway\",\n    from_time=\"2026-02-01 08:35:41\",\n    to_time=\"2026-02-01 08:36:11\")\nview(path)\nwork_queue.pop_front()"
   }
 }
 ```
 
 This is executed. The deployment-specific `camera_tool.get_interesting_frame()` runs
-synchronously and returns a file path to the saved frame. `attach(path)` queues that
-image to appear as a vision content block on the **next** turn's API call.
+synchronously and returns a file path to the saved frame. `view(path)` pushes a
+View work item so the image appears as a vision content block on the **next** turn.
 Recorded as history entry `d7ea`.
 
 
@@ -969,7 +980,7 @@ code:
       camera="driveway",
       from_time="2026-02-01 08:35:41",
       to_time="2026-02-01 08:36:11")
-  attach(path)
+  view(path)
   work_queue.pop_front()
 output:
   Saved frame to /tmp/driveway-083542.jpg
@@ -1374,10 +1385,9 @@ Options: pip install support, pre-loaded deployment-specific packages,
 or a fixed set of standard library only.
 
 ### ~~Image handling~~
-**RESOLVED**: `attach(path)` queues a file for the next turn. Extension sniffing
-decides: image → base64 vision content block, anything else → text block. Text
-attachments are capped at 64KB. The rendered text context goes first, attachments
-second, to preserve KV cache prefix. No per-turn count limit.
+**RESOLVED**: `view(path)` pushes a `View` work item; when at queue head the
+file renders as a content block (image → vision, else text). Visible until
+popped. `ChildSettings.attach`/`prefix_attach` seed children's first turn.
 
 
 ## Implementation
@@ -1391,33 +1401,43 @@ claude-server/
   Makefile                -- make (run daemon), make chat (run chat UI), make build
   system_prompt.txt       -- System prompt sent to Claude on every API call
   src/
-    main.rs               -- CLI dispatch: default=daemon, chat=web UI
-    types.rs              -- Core types (WorkQueue, EventHistory, Timers, Processes, Memory, API types)
+    main.rs               -- CLI dispatch + built-in stdio chat
+    types.rs              -- Core types (WorkQueue, EventHistory, Timers, Processes, Memory, Hooks, API types)
     config.rs             -- Configuration from environment variables
-    core_loop.rs          -- Main event loop (drain events → render → API → execute → apply)
-    python.rs             -- PyO3 executor (#[pyclass] wrappers, SideEffectCollector, stdout capture)
-    renderer.rs           -- Serialize HarnessState into XML context text for the API call
+    core_loop.rs          -- Thin wrapper: creates root AgentLoop and runs it
+    agent_loop.rs         -- Unified agent loop (root + children); hook pipeline; dashboard snapshots
+    python.rs             -- PyO3 executor (pyclass wrappers owning Mutex<T> of cloned state; hook executor)
+    renderer.rs           -- Serialize HarnessState into context text for the API call
     api_client.rs         -- Claude Messages API client (reqwest, retry, tool_use extraction)
     db.rs                 -- SQLite persistence (state JSON blob, process output, messages)
     process.rs            -- Tokio process spawning/monitoring (output capture, completion events)
-    compaction.rs         -- Compaction state machine (trigger, script accumulation, execution)
-    agent_loop.rs         -- Unified agent loop (AgentLoop parameterized by AgentPermissions, used by parent + children)
-    http_server.rs        -- Axum HTTP API (POST /message, POST /event, GET /status, GET /messages/:chat_id, SSE stream)
-    chat.rs               -- Chat UI subcommand (serves embedded HTML)
-    chat.html             -- Single-file HTML/CSS/JS chat interface
+    compaction.rs         -- Compaction state machine
+    http_server.rs        -- Axum HTTP API (/message, /event, /status, SSE stream, /dashboard, ...)
+    chat.rs, chat.html    -- Browser chat UI subcommand + reverse-proxy to daemon API
+    dashboard.html        -- Live agent-state dashboard (embedded)
+    tls.rs                -- HTTPS for chat UI (static PEM or ACME)
+    bridges/              -- Messaging relays (stdio, signal, telegram, slack, discord, email, agentchat)
+    watchers/             -- One-directional event sources (fs, mqtt, imap)
+    feedback.rs           -- Bug-report client/server + cross-deployment agent chat WS
+    webhook_proxy.rs      -- HMAC-validated public ingress → /event
+    docs.rs, source_dump.rs -- Bundled recipes; embedded source tarball
 ```
 
 ### Key Implementation Details
 
-**Side effect collection**: Python scripts don't execute side effects directly.
-All mutations (memory writes, timer creates, message sends, process spawns) are
-collected into a `SideEffectCollector` during execution. If the script crashes,
-nothing is applied. On success, the core loop applies them atomically.
+**Clone-and-mutate**: Each turn, the harness clones `HarnessState` and moves
+components into pyclass `Mutex<T>` fields. The script mutates the clone directly
+— `memory[k]=v` locks and inserts, `list_hooks()` reads the same Mutex
+`register_hook()` wrote to, so read-after-write just works. On success the
+mutated components are extracted back into state; on error the clone drops and
+nothing changes. Irreversible operations (OS process spawn, message broadcast,
+child fork, SQLite pin) are deferred via `ExternalEffects` and applied only
+after commit.
 
-**Synchronous ID assignment**: The `SideEffectCollector` owns the `IdGenerator`
-during Python execution. When Claude calls `timers.add()` or `shell_exec()`,
-the `#[pyclass]` method calls `id_gen.next()` synchronously and returns the hex
-ID string. After execution, the updated generator is moved back into state.
+**Synchronous ID assignment**: `IdGenerator` is wrapped in `Arc<Mutex<>>` and
+shared across pyclass instances. `timers.add()` / `shell_exec()` call `.next()`
+synchronously and return the hex ID. On commit the advanced generator swaps in;
+on error it rolls back with the clone.
 
 **Fresh Python namespace per turn**: PyO3 initializes the interpreter once at
 startup. Each turn creates a fresh `PyDict` as globals/locals. No state leaks
@@ -1429,33 +1449,31 @@ synchronously inside `Python::with_gil`.
 
 ### Chat UI
 
-The `chat` subcommand starts a lightweight web server serving an embedded HTML
-chat interface:
+The default launch includes a terminal chat. For a browser UI, the `chat`
+subcommand serves an embedded HTML page that reverse-proxies `/api/*` to the
+daemon (so same-origin works even with TLS):
 
 ```bash
 claude-server chat                    # default: port 8080, API at localhost:3000
-claude-server chat --port 9090        # custom port
-claude-server chat --api-url http://myhost:4000  # custom API URL
+claude-server chat --port 9090
+claude-server chat --api-url http://myhost:4000
 ```
 
-The chat UI:
-- Generates a stable UUID chat_id per browser session
-- Sends messages via POST /message to the daemon API
-- Streams agent responses in real time via SSE (`GET /messages/:chat_id/stream`)
-- Shows typing indicators (thinking.../executing...) during agent turns
-- Displays session cost and turn count in header (`$X.XX | N turns`)
-- Auto-scrolls on new messages
+The browser UI streams responses via SSE, shows thinking/executing status,
+and displays session cost + turn count in the header.
 
 ### HTTP API
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/message` | POST | Send a user message `{ chat_id?, user, content }` |
-| `/event` | POST | Send an external event `{ source, type, data, priority? }` — enqueued as `ExternalEvent` work item |
+| `/event` | POST | Send an external event `{ source, type, data, agent?, priority? }` — enqueued as `ExternalEvent` work item |
 | `/status` | GET | Health check `{ status, model }` |
 | `/messages/:chat_id` | GET | Get agent responses for a chat `{ messages: [...] }` |
-| `/messages/:chat_id/stream` | GET | SSE stream of `message` and `status` events |
-| `/cost` | GET | Token usage + estimated USD cost `{ input_tokens, output_tokens, ..., estimated_cost_usd }` |
+| `/messages/:chat_id/stream` | GET | SSE stream (`*` suffix = prefix match) |
+| `/dashboard` | GET | Live HTML view of all agents |
+| `/dashboard/state` | GET | JSON snapshots of all agents |
+| `/cost` | GET | Token usage + estimated USD cost |
 | `/shutdown` | POST | Graceful shutdown |
 
 All endpoints have CORS enabled (permissive).
@@ -1465,7 +1483,7 @@ All endpoints have CORS enabled (permissive).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ANTHROPIC_API_KEY` | (required) | Anthropic API key |
-| `CLAUDE_SERVER_MODEL` | `claude-opus-4-7` | Model to use |
+| `CLAUDE_SERVER_MODEL` | (see `--help`) | Claude model to use |
 | `CLAUDE_SERVER_LISTEN` | `127.0.0.1:3000` | API listen address |
 | `CLAUDE_SERVER_DB` | `claude-server.db` | SQLite database path |
 | `CLAUDE_SERVER_SYSTEM_PROMPT` | `system_prompt.txt` | System prompt file |
