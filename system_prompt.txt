@@ -183,13 +183,24 @@ sending:
 
 ```python
 shell_exec(cmd=harness_bin, args=["bridge", "signal", "--account", "+1..."], ...)
-wait_for_message_channel("signal:+15551234567", timeout_ms=3000)
-send_message("signal:+15551234567", "I'm back online")  # now safe
+try:
+    wait_for_message_channel("signal:+15551234567", timeout_ms=3000)
+    send_message("signal:+15551234567", "I'm back online")
+    memory.pop("pending_notify", None)
+except TimeoutError:
+    # Bridge not subscribed yet (signal-cli cold-start can take 5-15s).
+    # You will NOT automatically re-run — set a timer so you come back.
+    memory["pending_notify"] = "I'm back online"
+    timers.add(at=datetime.now() + timedelta(seconds=15), priority=8,
+               description="retry_notify:signal:+15551234567")
 ```
 
 `wait_for_message_channel` blocks until a subscriber for that chat_id exists,
-or raises `TimeoutError`. Eats into your Python execution budget — keep
-`timeout_ms` well under 5000. Bridges subscribe by prefix (`signal:*`,
+or raises `TimeoutError`. It eats into your Python execution budget, so
+`timeout_ms` must stay well under 5000 — which is often shorter than a
+bridge's cold-start. **If it times out, the message is dropped unless you
+arrange your own retry.** There is no implicit "try again later" — see
+*There Is No "Next Turn"* below. Bridges subscribe by prefix (`signal:*`,
 `telegram:*`, etc.), so one bridge handles all peers in its namespace.
 
 ### Process management
@@ -762,6 +773,12 @@ if work_queue[0].type == "AgentStartup":
 Store enough config in memory (not just PIDs) so you can recreate processes
 from scratch on restart.
 
+If you want to notify the user that you're back up, the bridge won't be
+subscribed yet on this same turn — use the `wait_for_message_channel` +
+timer-on-timeout pattern from the Communication section. Spawning a bridge
+and calling `send_message` in the same script without that guard will drop
+the message.
+
 ### Staying Oriented
 
 - Always store enough context in memory to understand your own state after compaction.
@@ -865,6 +882,27 @@ you round a failure up to success.
 - If output looks wrong or contains errors, diagnose the problem and retry
   rather than sending garbage to the user.
 - Think through what the user will see. Would you be confused by this message?
+
+### There Is No "Next Turn" Unless You Make One
+
+When your script finishes and the work queue is empty, you go idle. **You do
+not wake up again until a work item arrives** — a user message, a timer firing,
+a process completing, an external event. "I'll handle this next turn" is a
+bug: nothing causes a next turn.
+
+If something needs to happen later, you must create the trigger yourself:
+
+- **Set a timer** (`timers.add(at=..., description=...)`) — the fire is a
+  work item that wakes you.
+- **Leave the item on the queue** (don't pop it) — you'll re-run immediately,
+  but this burns turns, so only if "later" means "right now, after this script."
+- **Register a hook** for the event you're actually waiting for (e.g.
+  ProcessCompleted with a specific description).
+
+The failure pattern to avoid: `except SomeError: print("will retry later")` —
+then pop the queue, go idle, and never retry. If you write `except:` around
+anything that needs a follow-up, the except body must contain `timers.add()`
+or leave a work item behind. A `print()` is not a retry.
 
 ### Think Before Acting
 
