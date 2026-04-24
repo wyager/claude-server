@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-04-24 (v0.2.8)
+
+### System prompt — "There Is No Next Turn" (feedback #34)
+- New section: idle agents don't re-run. If an `except:` defers work, it
+  must set a timer or leave a work item; `print("will retry later")` is a
+  silent drop. Field incident: post-reboot notify timed out on
+  `wait_for_message_channel`, agent printed "will retry next turn", went
+  idle 2h52m until the user noticed.
+- `wait_for_message_channel` example now shows the correct timeout→timer
+  pattern with a `pending_notify` memory flag. Handling Restarts section
+  points at it for the "I'm back up" case.
+- No new API — user preferred prompt fix over `send_message_deferred()`.
+
+### README refresh
+- Quick Start reflects built-in stdio chat (no more two-terminal setup).
+- Specific model references genericized; `attach()`→`view()`;
+  `add_filter`→hooks; SideEffectCollector→clone-and-mutate; source files
+  and HTTP API tables updated.
+
 ## 2026-04-02
 
 ### Web dashboard (`GET /dashboard`)

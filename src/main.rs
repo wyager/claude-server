@@ -130,6 +130,15 @@ const AGENT_CHANGELOG: &[(&str, &str)] = &[
   models still work but you're leaving capability + price on the
   table. If you have ChildSettings or memory.pin'd configs referencing
   older point releases (4.5, 4.1, 3.5), update them now."),
+    ("0.2.8", "\
+- 'There is no next turn unless you make one': when your script ends and
+  the queue is empty, you go IDLE. You do not re-run. If an except: block
+  defers work ('will retry later'), that block MUST set timers.add() or
+  leave a work item — a print() is not a retry. Audit your
+  wait_for_message_channel handlers and post-restart notify flows NOW.
+- wait_for_message_channel timeout < bridge cold-start is normal (signal-cli
+  can take 5-15s). The except TimeoutError path must set a retry timer;
+  see the Communication section for the correct pattern."),
 ];
 
 /// Parse "X.Y.Z" into a comparable tuple. Unparseable → (0,0,0) so it sorts
