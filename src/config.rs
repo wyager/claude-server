@@ -60,10 +60,10 @@ impl Config {
         let auth = Self::auth_from_env()?;
 
         let model = std::env::var("CLAUDE_SERVER_MODEL")
-            .unwrap_or_else(|_| "claude-sonnet-5".to_string());
+            .unwrap_or_else(|_| "claude-opus-4-8".to_string());
 
         let effort = std::env::var("CLAUDE_SERVER_EFFORT")
-            .unwrap_or_else(|_| "low".to_string());
+            .unwrap_or_else(|_| "high".to_string());
         const VALID_EFFORT: &[&str] = &["low", "medium", "high", "xhigh", "max"];
         if !VALID_EFFORT.contains(&effort.as_str()) {
             bail!(

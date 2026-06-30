@@ -140,18 +140,15 @@ const AGENT_CHANGELOG: &[(&str, &str)] = &[
   can take 5-15s). The except TimeoutError path must set a retry timer;
   see the Communication section for the correct pattern."),
     ("0.2.9", "\
-- Default model is now claude-sonnet-5 (near-Opus coding/agentic capability
-  at Sonnet pricing). Frontier as of this release:
-    Opus   → claude-opus-4-8  (hardest long-horizon work)
-    Sonnet → claude-sonnet-5  (default; near-Opus, much cheaper)
+- Default model is now claude-opus-4-8. Frontier as of this release:
+    Opus   → claude-opus-4-8  (default; reasoning, agentic, long-horizon)
+    Sonnet → claude-sonnet-5  (cheap near-Opus coding/agentic; good for children)
     Haiku  → claude-haiku-4-5 (fast, cheap, simple classification)
-  If you have ChildSettings or memory.pin'd configs referencing sonnet-4-x,
-  update them to claude-sonnet-5.
+  If you have ChildSettings or memory.pin'd configs referencing sonnet-4-x
+  or opus-4-7, update them.
 - Reasoning effort is now configurable via CLAUDE_SERVER_EFFORT
-  (low|medium|high|xhigh|max). Default changed from high to low — on
-  Sonnet 5 even low effort performs strongly, and it cuts cost/latency.
-  Operators running reasoning-heavy deployments should set
-  CLAUDE_SERVER_EFFORT=high explicitly."),
+  (low|medium|high|xhigh|max). Default remains high. Lower it for
+  cost/latency-sensitive deployments."),
 ];
 
 /// Parse "X.Y.Z" into a comparable tuple. Unparseable → (0,0,0) so it sorts
@@ -180,8 +177,8 @@ fn changelog_since(prev: &str, current: &str) -> Option<String> {
 const ENV_HELP: &str = "\
 Environment variables:
   ANTHROPIC_API_KEY                 API key (required for daemon)
-  CLAUDE_SERVER_MODEL               Model name (default: claude-sonnet-5)
-  CLAUDE_SERVER_EFFORT              Reasoning effort: low|medium|high|xhigh|max (default: low)
+  CLAUDE_SERVER_MODEL               Model name (default: claude-opus-4-8)
+  CLAUDE_SERVER_EFFORT              Reasoning effort: low|medium|high|xhigh|max (default: high)
   CLAUDE_SERVER_LISTEN              API listen address (default: 127.0.0.1:3000)
   CLAUDE_SERVER_DB                  SQLite path (default: claude-server.db)
   CLAUDE_SERVER_SYSTEM_PROMPT       System prompt file (default: system_prompt.txt)
