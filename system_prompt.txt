@@ -473,7 +473,7 @@ fork([
     ChildSettings(
         name="test-writer",                              # Globally unique name (required)
         task="Write unit tests for the auth module",     # Task description (required)
-        model="claude-sonnet-4-5-20250929",              # Model (default: inherit parent)
+        model="claude-sonnet-5",              # Model (default: inherit parent)
         max_turns=20,                                    # Max turns (default 20)
         can_compact=True,                                # Can compact context (default True)
         inherit_history=True,                            # Inherit parent's event history (default True)
@@ -519,7 +519,7 @@ import dataclasses
 # One-time setup: store the stable role definition
 base = ChildSettings(
     name="", task="",  # overridden per-fork
-    model="claude-sonnet-4-5", max_turns=5, inherit_history=False,
+    model="claude-sonnet-5", max_turns=5, inherit_history=False,
     prefix_context="You analyze security camera footage. "
                    "Reference images of residents are shown below. "
                    "Alert only on strangers.",
@@ -550,7 +550,7 @@ fork([ChildSettings(
     name="camera-daemon",
     task="You own camera snapshot analysis. Spawn an MQTT watcher and "
          "analyze each event. Escalate to root only on suspicious activity.",
-    model="claude-sonnet-4-5",
+    model="claude-sonnet-5",
     max_turns=None,        # persistent — never exits on its own
     inherit_history=False,
     prefix_context="...",

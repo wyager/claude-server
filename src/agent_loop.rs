@@ -1423,6 +1423,7 @@ impl AgentLoop {
                 // Create child API client
                 let child_config = Arc::new(Config {
                     model: model.clone(),
+                    effort: self.config.effort.clone(),
                     auth: self.config.auth.clone(),
                     api_base_url: self.config.api_base_url.clone(),
                     max_tokens: self.config.max_tokens,

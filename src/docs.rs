@@ -74,7 +74,7 @@ fork([ChildSettings(
     name="cam-daemon",
     task="Monitor cameras. Start the MQTT watcher. view() each photo, "
          "analyze, log, escalate unknowns to root.",
-    model="claude-sonnet-4-5",
+    model="claude-sonnet-5",
     max_turns=None,
     inherit_history=False,
     prefix_context="<role instructions + known-person descriptions>",

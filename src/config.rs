@@ -27,6 +27,9 @@ impl AuthCredential {
 
 pub struct Config {
     pub model: String,
+    /// Reasoning effort sent as `output_config.effort` when the model
+    /// supports it (low | medium | high | xhigh | max)
+    pub effort: String,
     pub auth: AuthCredential,
     pub api_base_url: String,
     pub max_tokens: u64,
@@ -57,7 +60,18 @@ impl Config {
         let auth = Self::auth_from_env()?;
 
         let model = std::env::var("CLAUDE_SERVER_MODEL")
-            .unwrap_or_else(|_| "claude-opus-4-7".to_string());
+            .unwrap_or_else(|_| "claude-sonnet-5".to_string());
+
+        let effort = std::env::var("CLAUDE_SERVER_EFFORT")
+            .unwrap_or_else(|_| "low".to_string());
+        const VALID_EFFORT: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+        if !VALID_EFFORT.contains(&effort.as_str()) {
+            bail!(
+                "CLAUDE_SERVER_EFFORT must be one of {:?}, got {:?}",
+                VALID_EFFORT,
+                effort
+            );
+        }
 
         let api_base_url = std::env::var("CLAUDE_SERVER_API_URL")
             .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
@@ -127,6 +141,7 @@ impl Config {
 
         Ok(Self {
             model,
+            effort,
             auth,
             api_base_url,
             max_tokens,

@@ -235,7 +235,8 @@ All endpoints have CORS enabled (permissive). The chat UI uses these directly.
 | `CLAUDE_SERVER_BEARER_TOKEN` | (one of these required) | OAuth bearer token — dev-only, `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20`. Mutually exclusive with `ANTHROPIC_API_KEY`. Requires TTY + typed "I AGREE" at startup unless `CLAUDE_SERVER_AUTH_ACK=1`. On 401 the daemon exits rather than retry (assumes token expired). |
 | `CLAUDE_SERVER_AUTH_ACK` | (unset) | Set to `1` to bypass the Bearer-mode TTY + acknowledgment prompt (for scripted test harnesses only). |
 | `CLAUDE_SERVER_USAGE_LOG_CAPACITY` | `1000` | Ring buffer size for per-turn usage entries exposed via `/metrics/turns` and `/metrics/rate`. |
-| `CLAUDE_SERVER_MODEL` | `claude-opus-4-7` | Model to use |
+| `CLAUDE_SERVER_MODEL` | `claude-sonnet-5` | Model to use |
+| `CLAUDE_SERVER_EFFORT` | `low` | Reasoning effort (`low`\|`medium`\|`high`\|`xhigh`\|`max`); sent as `output_config.effort` when the model supports it |
 | `CLAUDE_SERVER_LISTEN` | `127.0.0.1:3000` | API listen address |
 | `CLAUDE_SERVER_DB` | `claude-server.db` | SQLite database path |
 | `CLAUDE_SERVER_SYSTEM_PROMPT` | `system_prompt.txt` | System prompt file |

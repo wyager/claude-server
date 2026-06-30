@@ -407,7 +407,9 @@ impl ApiClient {
         };
         // effort is only valid when thinking is on and the model supports it.
         let output_config = match (caps.thinking, caps.supports_effort) {
-            (ThinkingMode::Adaptive, true) => Some(OutputConfig { effort: "high".to_string() }),
+            (ThinkingMode::Adaptive, true) => {
+                Some(OutputConfig { effort: self.config.effort.clone() })
+            }
             _ => None,
         };
 
