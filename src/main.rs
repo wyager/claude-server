@@ -148,7 +148,14 @@ const AGENT_CHANGELOG: &[(&str, &str)] = &[
   or opus-4-7, update them.
 - Reasoning effort is now configurable via CLAUDE_SERVER_EFFORT
   (low|medium|high|xhigh|max). Default remains high. Lower it for
-  cost/latency-sensitive deployments."),
+  cost/latency-sensitive deployments.
+- Signal bridge now watches signal-cli's stderr and posts a
+  'receive_degraded' event (source: signal-bridge, priority 7) when
+  envelope-processing exceptions appear — previously these were silent
+  and inbound could break invisibly (e.g. the sealed-sender getServerGuid
+  NPE, fixed upstream in signal-cli 0.14.5). Alerts are rate-limited to
+  one per 10 min with a running error count. If you receive one: inbound
+  Signal delivery is likely broken; check signal-cli version first."),
 ];
 
 /// Parse "X.Y.Z" into a comparable tuple. Unparseable → (0,0,0) so it sorts
